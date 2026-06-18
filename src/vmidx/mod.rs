@@ -19,6 +19,8 @@
 //!   encode/parse とサイズ計算（破棄しても正しさには影響しない）
 //! - [`check_fingerprint`] / [`SourceStat`]: ソース ZIP との指紋照合
 //!   （stat 段階から CD ハッシュ段階へ進む段階的判定）
+//! - [`Vmidx`] / [`VmidxBuilder`]: 完全な vmidx 像の組み立てと、
+//!   mmap した像のゼロコピー parse・領域境界検証
 //!
 //! 全整数はリトルエンディアン、全オフセットはファイル先頭からのバイト
 //! オフセット。設計: docs `ZIP_Virtual_Memory_Manager_vmidx_Index_Spec`。
@@ -26,6 +28,7 @@
 mod advisory;
 mod checkpoint;
 mod entry;
+mod file;
 mod fingerprint;
 mod header;
 mod table;
@@ -35,6 +38,7 @@ pub use checkpoint::{
     CHUNK_HEADER_SIZE, Checkpoint, CheckpointChunk, nearest_checkpoint,
 };
 pub use entry::{EntryRecord, ProviderType};
+pub use file::{Vmidx, VmidxBuilder};
 pub use fingerprint::{
     CD_HASH_SIZE, FingerprintVerdict, SourceStat, check_fingerprint, hash_cd_block, refresh_header,
 };
@@ -72,6 +76,11 @@ pub mod entry_flags {
 /// 「vmidx を破棄して再構築」だが、診断のため原因を区別する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    /// 像が FILE HEADER（128 バイト）より小さい。
+    FileTooSmall,
+    /// 領域（entry table / name heap / advisory）が像の範囲外、または
+    /// 順序・整合性が崩れている（Section 7 step 4）。
+    RegionOutOfBounds,
     /// FILE HEADER のマジックが一致しない。
     BadMagic,
     /// 未サポートの `format_version`。
@@ -96,6 +105,8 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DecodeError::FileTooSmall => write!(f, "vmidx: file smaller than 128-byte header"),
+            DecodeError::RegionOutOfBounds => write!(f, "vmidx: region out of bounds"),
             DecodeError::BadMagic => write!(f, "vmidx: bad magic"),
             DecodeError::UnsupportedVersion(v) => {
                 write!(f, "vmidx: unsupported format_version {v}")
