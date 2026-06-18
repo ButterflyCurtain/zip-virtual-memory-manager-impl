@@ -13,6 +13,8 @@
 //!   （`vmidx::hash_cd_block` に渡す対象）
 //! - [`Archive::data_offset`] / [`Archive::entry_data`]: ローカルヘッダを読んで
 //!   圧縮データ先頭オフセットを確定し、圧縮データバイト列を取り出す
+//! - Zip64 対応: EOCD の番兵を検出したら Zip64 EOCD ロケータ/レコードを辿り、
+//!   CD エントリの実サイズ・オフセットは Zip64 extra field（ID 0x0001）から読む
 //!
 //! 全整数はリトルエンディアン。設計: docs `ZIP_Virtual_Memory_Manager`
 //! および `..._Diff_Layer_Pressure_Integrity_Detection`（cd_hash の定義）。
@@ -26,6 +28,14 @@ const EOCD_SIG: u32 = 0x0605_4b50;
 const CDFH_SIG: u32 = 0x0201_4b50;
 /// ローカルファイルヘッダのシグネチャ。
 const LFH_SIG: u32 = 0x0403_4b50;
+/// Zip64 End Of Central Directory レコードのシグネチャ。
+const EOCD64_SIG: u32 = 0x0606_4b50;
+/// Zip64 EOCD ロケータのシグネチャ。
+const EOCD64_LOCATOR_SIG: u32 = 0x0706_4b50;
+/// Zip64 EOCD ロケータの固定長。
+const EOCD64_LOCATOR_SIZE: usize = 20;
+/// Zip64 拡張情報 extra field のヘッダ ID（0x0001）。
+const ZIP64_EXTRA_ID: u16 = 0x0001;
 
 /// EOCD レコードの最小長（可変長コメントを除く固定部）。
 const EOCD_MIN_SIZE: usize = 22;
@@ -113,22 +123,27 @@ impl<'a> Archive<'a> {
         let disk = rd_u16(e, 4)?;
         let cd_start_disk = rd_u16(e, 6)?;
         let entries_this_disk = rd_u16(e, 8)?;
-        let total_entries = rd_u16(e, 10)?;
-        let cd_size = rd_u32(e, 12)?;
-        let cd_offset = rd_u32(e, 16)?;
+        let total16 = rd_u16(e, 10)?;
+        let cd_size32 = rd_u32(e, 12)?;
+        let cd_offset32 = rd_u32(e, 16)?;
 
-        if disk != 0 || cd_start_disk != 0 || entries_this_disk != total_entries {
-            return Err(ZipError::Unsupported("multi-disk archive"));
-        }
-        if cd_size == ZIP64_U32_SENTINEL
-            || cd_offset == ZIP64_U32_SENTINEL
-            || total_entries == ZIP64_U16_SENTINEL
-        {
-            return Err(ZipError::Unsupported("zip64"));
-        }
+        // いずれかのフィールドが番兵なら実値は Zip64 EOCD レコードにある。
+        let needs_zip64 = cd_size32 == ZIP64_U32_SENTINEL
+            || cd_offset32 == ZIP64_U32_SENTINEL
+            || total16 == ZIP64_U16_SENTINEL
+            || disk == ZIP64_U16_SENTINEL
+            || cd_start_disk == ZIP64_U16_SENTINEL
+            || entries_this_disk == ZIP64_U16_SENTINEL;
 
-        let cd_offset = cd_offset as u64;
-        let cd_size = cd_size as u64;
+        let (cd_offset, cd_size, total_entries) = if needs_zip64 {
+            read_zip64_eocd(data, eocd_off)?
+        } else {
+            if disk != 0 || cd_start_disk != 0 || entries_this_disk != total16 {
+                return Err(ZipError::Unsupported("multi-disk archive"));
+            }
+            (cd_offset32 as u64, cd_size32 as u64, total16 as u64)
+        };
+
         let cd_end = cd_offset
             .checked_add(cd_size)
             .ok_or(ZipError::Truncated)?;
@@ -219,7 +234,9 @@ fn parse_cd(
 ) -> Result<Vec<CdEntry>, ZipError> {
     let end = start + size;
     let mut pos = start;
-    let mut entries = Vec::with_capacity(count);
+    // count はアーカイブ申告値。過大値での過剰確保を避けて上限を設ける
+    // （実体が無ければループ内の境界チェックで早期に Truncated になる）。
+    let mut entries = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         if pos + CDFH_FIXED_SIZE > end {
             return Err(ZipError::Truncated);
@@ -230,39 +247,122 @@ fn parse_cd(
         }
         let method = rd_u16(h, 10)?;
         let crc32 = rd_u32(h, 16)?;
-        let compressed_size = rd_u32(h, 20)?;
-        let uncompressed_size = rd_u32(h, 24)?;
+        let comp32 = rd_u32(h, 20)?;
+        let uncomp32 = rd_u32(h, 24)?;
         let name_len = rd_u16(h, 28)? as usize;
         let extra_len = rd_u16(h, 30)? as usize;
         let comment_len = rd_u16(h, 32)? as usize;
-        let local_header_offset = rd_u32(h, 42)?;
+        let lho32 = rd_u32(h, 42)?;
 
         let var_start = pos + CDFH_FIXED_SIZE;
-        let var_end = var_start + name_len + extra_len + comment_len;
+        let name_end = var_start + name_len;
+        let extra_end = name_end + extra_len;
+        let var_end = extra_end + comment_len;
         if var_end > end {
             return Err(ZipError::Truncated);
         }
 
-        if compressed_size == ZIP64_U32_SENTINEL
-            || uncompressed_size == ZIP64_U32_SENTINEL
-            || local_header_offset == ZIP64_U32_SENTINEL
-        {
-            return Err(ZipError::Unsupported("zip64"));
+        let mut compressed_size = comp32 as u64;
+        let mut uncompressed_size = uncomp32 as u64;
+        let mut local_header_offset = lho32 as u64;
+        let need_uncomp = uncomp32 == ZIP64_U32_SENTINEL;
+        let need_comp = comp32 == ZIP64_U32_SENTINEL;
+        let need_lho = lho32 == ZIP64_U32_SENTINEL;
+        if need_uncomp || need_comp || need_lho {
+            // 番兵が立っているフィールドの実値を Zip64 extra field から読む。
+            // 順序は uncompressed → compressed → local_header_offset で固定。
+            let extra = &data[name_end..extra_end];
+            parse_zip64_extra(
+                extra,
+                (need_uncomp, &mut uncompressed_size),
+                (need_comp, &mut compressed_size),
+                (need_lho, &mut local_header_offset),
+            )?;
         }
 
-        let name = data[var_start..var_start + name_len].to_vec();
+        let name = data[var_start..name_end].to_vec();
         entries.push(CdEntry {
             name,
             method_code: method,
             crc32,
-            compressed_size: compressed_size as u64,
-            uncompressed_size: uncompressed_size as u64,
-            local_header_offset: local_header_offset as u64,
+            compressed_size,
+            uncompressed_size,
+            local_header_offset,
             provider_type: provider_for_method(method),
         });
         pos = var_end;
     }
     Ok(entries)
+}
+
+/// Zip64 EOCD ロケータ（EOCD の直前 20 バイト）と Zip64 EOCD レコードを
+/// 読み、(cd_offset, cd_size, total_entries) を返す。
+fn read_zip64_eocd(data: &[u8], eocd_off: usize) -> Result<(u64, u64, u64), ZipError> {
+    let loc_off = eocd_off
+        .checked_sub(EOCD64_LOCATOR_SIZE)
+        .ok_or(ZipError::Truncated)?;
+    let l = &data[loc_off..];
+    if rd_u32(l, 0)? != EOCD64_LOCATOR_SIG {
+        return Err(ZipError::Unsupported("zip64 locator missing"));
+    }
+    let z64_off = rd_u64(l, 8)? as usize;
+    let z = data.get(z64_off..).ok_or(ZipError::Truncated)?;
+    if rd_u32(z, 0)? != EOCD64_SIG {
+        return Err(ZipError::BadSignature);
+    }
+    let disk = rd_u32(z, 16)?;
+    let cd_start_disk = rd_u32(z, 20)?;
+    let entries_this_disk = rd_u64(z, 24)?;
+    let total_entries = rd_u64(z, 32)?;
+    let cd_size = rd_u64(z, 40)?;
+    let cd_offset = rd_u64(z, 48)?;
+    if disk != 0 || cd_start_disk != 0 || entries_this_disk != total_entries {
+        return Err(ZipError::Unsupported("multi-disk archive"));
+    }
+    Ok((cd_offset, cd_size, total_entries))
+}
+
+/// CD エントリの Zip64 拡張情報 extra field（ID 0x0001）を解釈し、番兵が
+/// 立っていたフィールドの 64 ビット実値を書き込む。実値は
+/// uncompressed → compressed → local_header_offset の順に、番兵が立った
+/// ものだけが並ぶ。
+fn parse_zip64_extra(
+    extra: &[u8],
+    uncomp: (bool, &mut u64),
+    comp: (bool, &mut u64),
+    lho: (bool, &mut u64),
+) -> Result<(), ZipError> {
+    let mut p = 0;
+    while p + 4 <= extra.len() {
+        let id = rd_u16(extra, p)?;
+        let len = rd_u16(extra, p + 2)? as usize;
+        let body_start = p + 4;
+        let body_end = body_start + len;
+        if body_end > extra.len() {
+            return Err(ZipError::Truncated);
+        }
+        if id == ZIP64_EXTRA_ID {
+            let body = &extra[body_start..body_end];
+            let mut q = 0usize;
+            if uncomp.0 {
+                *uncomp.1 = rd_u64(body, q)?;
+                q += 8;
+            }
+            if comp.0 {
+                *comp.1 = rd_u64(body, q)?;
+                q += 8;
+            }
+            if lho.0 {
+                *lho.1 = rd_u64(body, q)?;
+                q += 8;
+            }
+            let _ = q;
+            return Ok(());
+        }
+        p = body_end;
+    }
+    // 番兵は立っているのに Zip64 extra が無い ＝ 壊れている。
+    Err(ZipError::Truncated)
 }
 
 #[inline]
@@ -276,6 +376,13 @@ fn rd_u16(b: &[u8], off: usize) -> Result<u16, ZipError> {
 fn rd_u32(b: &[u8], off: usize) -> Result<u32, ZipError> {
     b.get(off..off + 4)
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        .ok_or(ZipError::Truncated)
+}
+
+#[inline]
+fn rd_u64(b: &[u8], off: usize) -> Result<u64, ZipError> {
+    b.get(off..off + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
         .ok_or(ZipError::Truncated)
 }
 
@@ -448,6 +555,120 @@ mod tests {
         // 足した 30+5+6=41。
         assert_eq!(ar.data_offset(&e[0]).unwrap(), 41);
         assert_eq!(ar.entry_data(&e[0]).unwrap(), b"DATA");
+    }
+
+    /// 1 エントリの Zip64 アーカイブを手組みする。CD レコードはサイズと
+    /// local_header_offset を番兵にし、実値を Zip64 extra field に置く。EOCD は
+    /// 番兵を立て、Zip64 EOCD レコード/ロケータを経由させる。
+    fn build_zip64_single() -> Vec<u8> {
+        let name: &[u8] = b"z64.bin";
+        let data: &[u8] = b"Z64";
+        let mut b = Vec::new();
+
+        // ローカルファイルヘッダ（サイズは u32 に収まるので番兵にしない）。
+        push_u32(&mut b, LFH_SIG);
+        push_u16(&mut b, 45);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 0); // method = STORE
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 0);
+        push_u32(&mut b, 0); // crc
+        push_u32(&mut b, data.len() as u32);
+        push_u32(&mut b, data.len() as u32);
+        push_u16(&mut b, name.len() as u16);
+        push_u16(&mut b, 0); // extra len
+        b.extend_from_slice(name);
+        b.extend_from_slice(data);
+
+        // Zip64 extra field: uncompressed → compressed → local_header_offset。
+        let mut z64extra = Vec::new();
+        push_u16(&mut z64extra, ZIP64_EXTRA_ID);
+        push_u16(&mut z64extra, 24); // body len = 3 × u64
+        z64extra.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        z64extra.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        z64extra.extend_from_slice(&0u64.to_le_bytes()); // lho = 0
+
+        let cd_offset = b.len() as u64;
+        push_u32(&mut b, CDFH_SIG);
+        push_u16(&mut b, 45);
+        push_u16(&mut b, 45);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 0); // method
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 0);
+        push_u32(&mut b, 0); // crc
+        push_u32(&mut b, ZIP64_U32_SENTINEL); // comp size 番兵
+        push_u32(&mut b, ZIP64_U32_SENTINEL); // uncomp size 番兵
+        push_u16(&mut b, name.len() as u16);
+        push_u16(&mut b, z64extra.len() as u16);
+        push_u16(&mut b, 0); // comment len
+        push_u16(&mut b, 0); // disk start
+        push_u16(&mut b, 0); // internal attrs
+        push_u32(&mut b, 0); // external attrs
+        push_u32(&mut b, ZIP64_U32_SENTINEL); // lho 番兵
+        b.extend_from_slice(name);
+        b.extend_from_slice(&z64extra);
+        let cd_size = b.len() as u64 - cd_offset;
+
+        // Zip64 EOCD レコード。
+        let z64_eocd_off = b.len() as u64;
+        push_u32(&mut b, EOCD64_SIG);
+        b.extend_from_slice(&44u64.to_le_bytes()); // size of record（未検証）
+        push_u16(&mut b, 45);
+        push_u16(&mut b, 45);
+        push_u32(&mut b, 0); // disk
+        push_u32(&mut b, 0); // cd start disk
+        b.extend_from_slice(&1u64.to_le_bytes()); // entries this disk
+        b.extend_from_slice(&1u64.to_le_bytes()); // total entries
+        b.extend_from_slice(&cd_size.to_le_bytes());
+        b.extend_from_slice(&cd_offset.to_le_bytes());
+
+        // Zip64 EOCD ロケータ。
+        push_u32(&mut b, EOCD64_LOCATOR_SIG);
+        push_u32(&mut b, 0); // disk of zip64 eocd
+        b.extend_from_slice(&z64_eocd_off.to_le_bytes());
+        push_u32(&mut b, 1); // total disks
+
+        // EOCD（番兵）。
+        push_u32(&mut b, EOCD_SIG);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, ZIP64_U16_SENTINEL); // entries this disk
+        push_u16(&mut b, ZIP64_U16_SENTINEL); // total
+        push_u32(&mut b, ZIP64_U32_SENTINEL); // cd size
+        push_u32(&mut b, ZIP64_U32_SENTINEL); // cd offset
+        push_u16(&mut b, 0); // comment len
+        b
+    }
+
+    #[test]
+    fn parses_zip64_via_eocd_and_extra_field() {
+        let zip = build_zip64_single();
+        let ar = Archive::parse(&zip).expect("zip64 archive parses");
+        let e = ar.entries();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].name, b"z64.bin");
+        // 実値は Zip64 extra field 由来（番兵ではない）。
+        assert_eq!(e[0].compressed_size, 3);
+        assert_eq!(e[0].uncompressed_size, 3);
+        assert_eq!(e[0].local_header_offset, 0);
+        // data_offset 解決とペイロード読みも通る。
+        assert_eq!(ar.data_offset(&e[0].clone()).unwrap(), 30 + 7);
+        assert_eq!(ar.entry_data(&e[0].clone()).unwrap(), b"Z64");
+    }
+
+    #[test]
+    fn zip64_sentinel_without_extra_is_truncated() {
+        // CD の comp サイズだけ番兵にし、Zip64 extra を付けない壊れたケース。
+        let mut f = ZipFixture::new();
+        f.add_store("broken", b"abc");
+        let mut zip = f.finish(b"");
+        // finish 後の CD レコード内 comp size（CDFH 先頭 +20）を番兵に潰す。
+        // CD は LFH(30+6) + data(3) = 39 から始まる。
+        let cd_start = 30 + 6 + 3;
+        let comp_field = cd_start + 20;
+        zip[comp_field..comp_field + 4].copy_from_slice(&ZIP64_U32_SENTINEL.to_le_bytes());
+        assert!(matches!(Archive::parse(&zip), Err(ZipError::Truncated)));
     }
 
     #[test]
