@@ -68,6 +68,10 @@ pub enum ReadError {
     Provider(ProviderError),
     /// レコードの `data_offset` / `compressed_size` がソース ZIP の範囲外。
     DataOutOfRange,
+    /// open 後にソース archive.zip が外部から変更された（設計 SNAPSHOT
+    /// CONSISTENCY の ESTALE）。検出後マウントは STALE になり、以降の read は
+    /// 一律これを返す（close + reopen が必要）。
+    Stale,
 }
 
 impl fmt::Display for ReadError {
@@ -78,6 +82,7 @@ impl fmt::Display for ReadError {
             ReadError::Vmidx(e) => write!(f, "read: {e}"),
             ReadError::Provider(e) => write!(f, "read: {e}"),
             ReadError::DataOutOfRange => write!(f, "read: entry data outside archive"),
+            ReadError::Stale => write!(f, "read: archive changed since mount (ESTALE)"),
         }
     }
 }
@@ -141,6 +146,7 @@ impl<'a> Mount<'a> {
     /// ページキャッシュ経由（ミス時のみ展開 + read-ahead 充填）。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
         let mut cache = self.cache.borrow_mut();
+        // メモリ上マウントには再 stat 対象のファイルが無いので鮮度チェックは no-op。
         read_cached(
             self.archive,
             &self.vmidx_image,
@@ -149,6 +155,7 @@ impl<'a> Mount<'a> {
             path,
             offset,
             len,
+            || Ok(()),
         )
     }
 }
@@ -225,7 +232,13 @@ pub fn read_entry(
 /// 要求範囲がまたぐ各ページについて、常駐していればキャッシュから、ミスなら
 /// [`fill_run`] で目標ページ + read-ahead 分を展開・充填してから取り出す。
 /// `cache` の `page_size` がページ境界を決める。
-pub fn read_cached(
+///
+/// `on_miss` はキャッシュミスのたびに、ソースアーカイブへ触れる**前**に呼ばれる
+/// （設計 SNAPSHOT CONSISTENCY: ミス時の ESTALE チェック点）。`Err` を返すと
+/// その時点で読み取りを中断する。ディスク層はここで archive.zip を再 stat し、
+/// 変更を検知したら [`ReadError::Stale`] を返す。ファイルを持たないメモリ上の
+/// マウントは no-op（`|| Ok(())`）を渡す。
+pub fn read_cached<F>(
     archive: &[u8],
     vmidx_image: &[u8],
     cache: &mut PageCache,
@@ -233,7 +246,11 @@ pub fn read_cached(
     path: &str,
     offset: u64,
     len: usize,
-) -> Result<Vec<u8>, ReadError> {
+    mut on_miss: F,
+) -> Result<Vec<u8>, ReadError>
+where
+    F: FnMut() -> Result<(), ReadError>,
+{
     let vmidx = Vmidx::parse(vmidx_image).map_err(ReadError::Vmidx)?;
     let (entry, record) = vmidx
         .lookup(path)
@@ -266,10 +283,13 @@ pub fn read_cached(
             continue;
         }
 
-        // ミス（直前の get が None を返した時点で計上済み）。目標ページ +
-        // read-ahead 分を 1 回で展開し（ラン）、キャッシュへ充填する。当該ページは
-        // ランの先頭なので、退避方針に依らず確実に取れる戻り値バイト列から直接
-        // 切り出す（ラン > キャッシュ容量でも前進できる）。
+        // ミス（直前の get が None を返した時点で計上済み）。アーカイブへ触れる
+        // 前に鮮度チェック（ESTALE 検出点）。STALE なら以降を読まずに中断する。
+        on_miss()?;
+
+        // 目標ページ + read-ahead 分を 1 回で展開し（ラン）、キャッシュへ充填する。
+        // 当該ページはランの先頭なので、退避方針に依らず確実に取れる戻り値
+        // バイト列から直接切り出す（ラン > キャッシュ容量でも前進できる）。
         let (bytes, run_start) =
             fill_run(archive, &vmidx, cache, cfg, &record, entry, page, total_pages)?;
         debug_assert_eq!(run_start, page_start);

@@ -2,9 +2,11 @@
 //! 読み書きする薄いファイル I/O 層（設計 SIDECAR FILES / FIRST-OPEN）。
 //!
 //! [`FileMount`] は実ファイルを read-only で mmap し、その `&[u8]` を
-//! [`mount`](crate::mount) のロジック（`resolve_index` / `read_entry`）に渡す。
+//! [`mount`](crate::mount) のロジック（`resolve_index` / `read_cached`）に渡す。
 //! 設計方針「mmap は外から渡す」に沿い、mmap の所有はこの層に閉じ、`mount` /
-//! `vmidx` / `archive` はバイトスライスだけを見る。
+//! `vmidx` / `archive` はバイトスライスだけを見る。読み取りのたびに（ミス時に）
+//! archive.zip を再 stat して外部変更を検出する（ESTALE、設計 SNAPSHOT
+//! CONSISTENCY）。
 //!
 //! open() の流れ:
 //! 1. `archive.zip` を mmap、stat（size / inode 相当 / mtime）から [`BuildParams`]。
@@ -19,7 +21,7 @@ use crate::index_build::BuildParams;
 use crate::mount::{read_cached, resolve_index, OpenError, ReadError};
 use crate::page::{PageCache, PageConfig};
 use memmap2::Mmap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::fs::{self, File, Metadata};
 use std::io;
@@ -65,17 +67,46 @@ impl From<OpenError> for FileMountError {
     }
 }
 
+/// open 時に記録する archive.zip の指紋（ESTALE 検出の比較対象）。cd_hash は
+/// fingerprint レイヤが持つので、ランタイムの軽量チェックには stat 3 値のみ使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatFingerprint {
+    size: u64,
+    inode: u64,
+    mtime_ns: u64,
+}
+
+impl StatFingerprint {
+    fn of(md: &Metadata) -> StatFingerprint {
+        StatFingerprint {
+            size: md.len(),
+            inode: file_id(md),
+            mtime_ns: mtime_ns(md),
+        }
+    }
+}
+
 /// ディスク上の `archive.zip` に対する読み取り専用マウント。
 pub struct FileMount {
     archive: Mmap,
     vmidx_image: Vec<u8>,
     cfg: PageConfig,
     cache: RefCell<PageCache>,
+    /// 再 stat 用のパスと open 時指紋（ESTALE 検出、設計 SNAPSHOT CONSISTENCY）。
+    archive_path: PathBuf,
+    fingerprint: StatFingerprint,
+    /// ESTALE チェック間隔（ページキャッシュミス N 回ごと。0 = 無効。既定 1）。
+    estale_interval: u32,
+    /// ミスチェックの呼び出し回数（間隔の判定用）。
+    miss_tick: Cell<u32>,
+    /// 一度 STALE になったら以降の read は一律 ESTALE（スティッキー）。
+    stale: Cell<bool>,
 }
 
 impl FileMount {
     /// `archive_path` の ZIP を開く。サイドカー vmidx を検証し、無効・不在なら
-    /// EAGER で再構築して `archive.zip.vmm/vmidx` に書き戻す。ページ設定は既定。
+    /// EAGER で再構築して `archive.zip.vmm/vmidx` に書き戻す。ページ設定は既定、
+    /// ESTALE チェックは毎ミス（間隔 1）。
     pub fn open(archive_path: impl AsRef<Path>) -> Result<FileMount, FileMountError> {
         FileMount::open_with_page_config(archive_path, PageConfig::default())
     }
@@ -88,10 +119,11 @@ impl FileMount {
         let archive_path = archive_path.as_ref();
         let file = File::open(archive_path)?;
         let md = file.metadata()?;
+        let fingerprint = StatFingerprint::of(&md);
         let params = BuildParams {
-            source_file_size: md.len(),
-            source_inode: file_id(&md),
-            source_mtime_ns: mtime_ns(&md),
+            source_file_size: fingerprint.size,
+            source_inode: fingerprint.inode,
+            source_mtime_ns: fingerprint.mtime_ns,
             ..BuildParams::default()
         };
 
@@ -118,12 +150,35 @@ impl FileMount {
             vmidx_image: image,
             cfg,
             cache,
+            archive_path: archive_path.to_path_buf(),
+            fingerprint,
+            estale_interval: 1,
+            miss_tick: Cell::new(0),
+            stale: Cell::new(false),
         })
     }
 
+    /// ESTALE チェック間隔を設定する（ページキャッシュミス N 回ごとに再 stat。
+    /// 0 = チェック無効。設計 `--estale-check-interval`）。
+    pub fn with_estale_interval(mut self, n: u32) -> FileMount {
+        self.estale_interval = n;
+        self
+    }
+
+    /// マウントが STALE 状態か（外部変更を検出済みか）。
+    pub fn is_stale(&self) -> bool {
+        self.stale.get()
+    }
+
     /// エントリ `path` の展開ストリーム `[offset, offset + len)` を読む。
-    /// ページキャッシュ経由（[`read_cached`]）。
+    /// ページキャッシュ経由（[`read_cached`]）。一度 STALE になると以降は
+    /// 一律 [`ReadError::Stale`]。キャッシュミスのたびに archive.zip を再 stat し、
+    /// 変更を検知したら STALE へ遷移する（設計 SNAPSHOT CONSISTENCY）。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
+        // STALE はスティッキー: キャッシュヒットで賄える read も含め一律拒否。
+        if self.stale.get() {
+            return Err(ReadError::Stale);
+        }
         let mut cache = self.cache.borrow_mut();
         read_cached(
             &self.archive,
@@ -133,7 +188,32 @@ impl FileMount {
             path,
             offset,
             len,
+            || self.check_fresh(),
         )
+    }
+
+    /// キャッシュミス時の鮮度チェック（ソースへ触れる前）。間隔判定を通過したら
+    /// archive.zip を再 stat し、open 時指紋と size/inode/mtime を比較する。差異
+    /// （またはファイル消失）で STALE へ遷移し [`ReadError::Stale`]。mtime は同
+    /// サイズ in-place 編集を捕捉するトリガとして含める（設計どおりゲートではない
+    /// が、ここでは差異検出に使う）。
+    fn check_fresh(&self) -> Result<(), ReadError> {
+        if self.estale_interval == 0 {
+            return Ok(());
+        }
+        let tick = self.miss_tick.get().wrapping_add(1);
+        self.miss_tick.set(tick);
+        if tick % self.estale_interval != 0 {
+            return Ok(());
+        }
+        match fs::metadata(&self.archive_path) {
+            Ok(md) if StatFingerprint::of(&md) == self.fingerprint => Ok(()),
+            // 差異あり、または stat 失敗（消失・差し替え途中など）→ STALE。
+            _ => {
+                self.stale.set(true);
+                Err(ReadError::Stale)
+            }
+        }
     }
 
     /// 採用中の vmidx 像。
@@ -338,5 +418,95 @@ mod tests {
         // 書き戻された vmidx は妥当（再 open で再利用できる）。
         let m2 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m2.read("only.txt", 0, 6).unwrap(), b"abcdef");
+    }
+
+    /// 小さいページ・read-ahead 無しで開く（各ページが個別のミス＝鮮度チェック点
+    /// になるようにする）フィクスチャ。
+    fn open_paged(zip_path: &Path) -> FileMount {
+        let cfg = PageConfig {
+            page_size: 8,
+            read_ahead_pages: 0,
+            cache_bytes: 16 << 20,
+            ..PageConfig::default()
+        };
+        FileMount::open_with_page_config(zip_path, cfg).expect("open")
+    }
+
+    /// 外部からの「アーカイブ差し替え」を模す。Windows では mmap 保持中のファイルを
+    /// 切り詰め上書き（`fs::write`）できない（エラー 1224）ので、別名に書いてから
+    /// rename で置き換える（= 新しい inode。旧マッピングは旧内容のまま生き残る）。
+    /// これは設計が想定する典型的な外部変更（rename 差し替え）でもある。
+    fn replace_archive(zip_path: &Path, content: Vec<u8>) {
+        let tmp = zip_path.with_extension("new");
+        fs::write(&tmp, content).unwrap();
+        fs::rename(&tmp, zip_path).unwrap();
+    }
+
+    #[test]
+    fn external_change_triggers_estale_and_is_sticky() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("e.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[("data.bin", b"0123456789abcdef0123456789abcdef")]),
+        )
+        .unwrap();
+
+        let m = open_paged(&zip_path);
+        // ページ 0 は通る（未変更）。
+        assert_eq!(m.read("data.bin", 0, 4).unwrap(), b"0123");
+        assert!(!m.is_stale());
+
+        // 外部からサイズの違う内容に差し替える（mmap 保持下での書き換え）。
+        replace_archive(&zip_path, store_zip(&[("data.bin", b"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXYYYYYYYY")]));
+
+        // 未キャッシュページ（offset 16）の読みはミス → 再 stat でサイズ差 → STALE。
+        assert_eq!(m.read("data.bin", 16, 4), Err(ReadError::Stale));
+        assert!(m.is_stale());
+
+        // スティッキー: キャッシュ済みページ 0 の再読も一律 STALE。
+        assert_eq!(m.read("data.bin", 0, 4), Err(ReadError::Stale));
+    }
+
+    #[test]
+    fn estale_interval_zero_disables_check() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("f.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[("data.bin", b"0123456789abcdef0123456789abcdef")]),
+        )
+        .unwrap();
+
+        let m = open_paged(&zip_path).with_estale_interval(0);
+        assert_eq!(m.read("data.bin", 0, 4).unwrap(), b"0123");
+
+        // サイズを変えて差し替えても、チェック無効なので STALE にならない。
+        replace_archive(&zip_path, store_zip(&[("data.bin", b"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXYYYYYYYY")]));
+        // 未キャッシュページの読みでもチェックは走らず、STALE を返さない。
+        assert_ne!(m.read("data.bin", 0, 4), Err(ReadError::Stale));
+        assert!(!m.is_stale());
+    }
+
+    #[test]
+    fn estale_interval_throttles_checks() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("g.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[("data.bin", b"0123456789abcdef0123456789abcdef")]),
+        )
+        .unwrap();
+
+        // 間隔 2 = ミス 2 回ごとに stat。
+        let m = open_paged(&zip_path).with_estale_interval(2);
+        // ミス 1 回目（ページ 0）: stat しない。
+        assert_eq!(m.read("data.bin", 0, 4).unwrap(), b"0123");
+
+        replace_archive(&zip_path, store_zip(&[("data.bin", b"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXYYYYYYYY")]));
+
+        // ミス 2 回目（ページ 2 = offset16）: ここで stat → サイズ差 → STALE。
+        assert_eq!(m.read("data.bin", 16, 4), Err(ReadError::Stale));
+        assert!(m.is_stale());
     }
 }
