@@ -1,26 +1,38 @@
 //! マウント / 読み取り経路（設計 READ PATH と FIRST-OPEN の最小核）。
 //!
 //! [`Mount`] は archive.zip のバイト列（呼び出し側が mmap 済み）と、それに対応
-//! する vmidx 像を束ね、`read(path, offset, len)` を提供する。設計のレイヤのうち
-//! Diff Layer / Page Cache はまだ無く、シーク索引 + ソース ZIP の経路だけを
-//! 繋ぐ:
+//! する vmidx 像、[`PageCache`] を束ね、`read(path, offset, len)` を提供する。
+//! 設計のレイヤのうち Diff Layer はまだ無く、読み取りは「ページキャッシュ →
+//! シーク索引 + ソース ZIP」の 2 段:
 //!
-//! 1. vmidx を `lookup(path)` してエントリを引く
-//! 2. `provider_type` から [`provider`](crate::provider) を選ぶ
-//! 3. `nearest_checkpoint(record, offset)` を引く（無ければ先頭から）
-//! 4. レコードの `data_offset` / `compressed_size` でソース ZIP の圧縮バイト列を
-//!    切り出し、`provider.read_range` で展開オフセット範囲を得る
+//! - [`read_cached`]: 要求範囲の各ページをキャッシュから取り、ミスしたら
+//!   [`fill_run`] で目標ページ + read-ahead ページ分をまとめて展開・充填する。
+//! - [`fill_run`]（キャッシュミス時）:
+//!   1. vmidx を `lookup(path)` してエントリを引く（呼び出し側で済ませて渡す）
+//!   2. `provider_type` から [`provider`](crate::provider) を選ぶ
+//!   3. 目標ページから連続する未常駐ページのランを決める（read-ahead）
+//!   4. `nearest_checkpoint(record, run_start)` を起点に `provider.read_range` で
+//!      ラン全体を 1 回で展開し、ページに切ってキャッシュへ入れる
+//!
+//! ラン一括展開により、read-ahead は「目標 + N ページ」を 1 回の checkpoint 復元
+//! + 前進デコードで賄う（設計 READ PATH の read-ahead 償却。デコーダ状態を跨いで
+//! 持ち回る最適化はさらに後段）。[`read_entry`] は索引だけを使う無キャッシュの
+//! 下位プリミティブとして残す。
 //!
 //! vmidx 像は所有し（`Vec<u8>`）、`read` のたびに [`Vmidx::parse`] で軽量ビューを
 //! 作る（自己参照構造を避けるため。parse はヘッダ 128 バイトの decode と領域境界
-//! 検査のみで安価）。
+//! 検査のみで安価）。[`Mount`] はページキャッシュを `RefCell` で内部可変に持つ
+//! ため、`read(&self)` のまま使えるが `Sync` ではない（並行アクセスは lock 層
+//! ＝後段の担当）。
 
 use crate::archive::{Archive, ZipError};
 use crate::index_build::{build_vmidx_eager, BuildError, BuildParams};
-use crate::provider::{builtin_provider, ProviderError};
+use crate::page::{page_count, page_extent, PageCache, PageConfig, PageKey};
+use crate::provider::{builtin_provider, check_range, ProviderError};
 use crate::vmidx::{
-    hash_cd_block, DecodeError, FingerprintVerdict, ProviderType, SourceStat, Vmidx,
+    hash_cd_block, DecodeError, EntryRecord, FingerprintVerdict, ProviderType, SourceStat, Vmidx,
 };
+use std::cell::RefCell;
 use std::fmt;
 
 /// マウントを開く際の失敗。
@@ -76,17 +88,26 @@ impl std::error::Error for ReadError {}
 pub struct Mount<'a> {
     archive: &'a [u8],
     vmidx_image: Vec<u8>,
+    cfg: PageConfig,
+    cache: RefCell<PageCache>,
 }
 
 impl<'a> Mount<'a> {
     /// archive バイト列から EAGER 索引を構築して開く（vmidx が無い「コールド
-    /// オープン」相当）。`params` の stat 値が fingerprint に入る。
+    /// オープン」相当）。`params` の stat 値が fingerprint に入る。ページ設定は
+    /// 既定（[`PageConfig::default`]）。
     pub fn open(archive: &'a [u8], params: &BuildParams) -> Result<Mount<'a>, OpenError> {
+        Mount::open_with_page_config(archive, params, PageConfig::default())
+    }
+
+    /// [`Mount::open`] にページ設定を指定する版。
+    pub fn open_with_page_config(
+        archive: &'a [u8],
+        params: &BuildParams,
+        cfg: PageConfig,
+    ) -> Result<Mount<'a>, OpenError> {
         let (vmidx_image, _) = resolve_index(archive, None, params)?;
-        Ok(Mount {
-            archive,
-            vmidx_image,
-        })
+        Ok(Mount::assemble(archive, vmidx_image, cfg))
     }
 
     /// 既存の vmidx 像を検証して開く（設計 Section 7 の open() カスケード）。
@@ -98,10 +119,17 @@ impl<'a> Mount<'a> {
         params: &BuildParams,
     ) -> Result<Mount<'a>, OpenError> {
         let (vmidx_image, _) = resolve_index(archive, Some(vmidx_image), params)?;
-        Ok(Mount {
+        Ok(Mount::assemble(archive, vmidx_image, PageConfig::default()))
+    }
+
+    fn assemble(archive: &'a [u8], vmidx_image: Vec<u8>, cfg: PageConfig) -> Mount<'a> {
+        let cache = RefCell::new(PageCache::from_config(&cfg));
+        Mount {
             archive,
             vmidx_image,
-        })
+            cfg,
+            cache,
+        }
     }
 
     /// 構築済みの vmidx 像（ファイル I/O 層が vmidx.tmp として書き出す対象）。
@@ -110,8 +138,18 @@ impl<'a> Mount<'a> {
     }
 
     /// エントリ `path` の展開ストリーム `[offset, offset + len)` を読む。
+    /// ページキャッシュ経由（ミス時のみ展開 + read-ahead 充填）。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
-        read_entry(self.archive, &self.vmidx_image, path, offset, len)
+        let mut cache = self.cache.borrow_mut();
+        read_cached(
+            self.archive,
+            &self.vmidx_image,
+            &mut cache,
+            &self.cfg,
+            path,
+            offset,
+            len,
+        )
     }
 }
 
@@ -181,6 +219,137 @@ pub fn read_entry(
             record.uncompressed_size,
         )
         .map_err(ReadError::Provider)
+}
+
+/// ページキャッシュ経由で 1 エントリの `[offset, offset + len)` を読む。
+/// 要求範囲がまたぐ各ページについて、常駐していればキャッシュから、ミスなら
+/// [`fill_run`] で目標ページ + read-ahead 分を展開・充填してから取り出す。
+/// `cache` の `page_size` がページ境界を決める。
+pub fn read_cached(
+    archive: &[u8],
+    vmidx_image: &[u8],
+    cache: &mut PageCache,
+    cfg: &PageConfig,
+    path: &str,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, ReadError> {
+    let vmidx = Vmidx::parse(vmidx_image).map_err(ReadError::Vmidx)?;
+    let (entry, record) = vmidx
+        .lookup(path)
+        .map_err(ReadError::Vmidx)?
+        .ok_or(ReadError::NotFound)?;
+
+    // 範囲検査はプロバイダと同じ判定（エントリサイズ超は OutOfRange）。
+    check_range(offset, len, record.uncompressed_size).map_err(ReadError::Provider)?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let page_size = cache.page_size();
+    let total_pages = page_count(record.uncompressed_size, page_size);
+    let end = offset + len as u64;
+
+    let mut out = Vec::with_capacity(len);
+    let mut pos = offset;
+    while pos < end {
+        let page = pos / page_size;
+        let key = PageKey { entry, page };
+        let page_start = page * page_size;
+        let in_page = (pos - page_start) as usize;
+
+        if let Some(data) = cache.get(key) {
+            // ヒット。末尾ページは短く、data.len() が当該ページの実長。
+            let take = (data.len() - in_page).min((end - pos) as usize);
+            out.extend_from_slice(&data[in_page..in_page + take]);
+            pos += take as u64;
+            continue;
+        }
+
+        // ミス（直前の get が None を返した時点で計上済み）。目標ページ +
+        // read-ahead 分を 1 回で展開し（ラン）、キャッシュへ充填する。当該ページは
+        // ランの先頭なので、退避方針に依らず確実に取れる戻り値バイト列から直接
+        // 切り出す（ラン > キャッシュ容量でも前進できる）。
+        let (bytes, run_start) =
+            fill_run(archive, &vmidx, cache, cfg, &record, entry, page, total_pages)?;
+        debug_assert_eq!(run_start, page_start);
+        let page_len = page_extent(record.uncompressed_size, page, page_size).1;
+        let take = (page_len - in_page).min((end - pos) as usize);
+        out.extend_from_slice(&bytes[in_page..in_page + take]);
+        pos += take as u64;
+    }
+    Ok(out)
+}
+
+/// 目標ページ `target_page` を含む「連続する未常駐ページのラン」を 1 回の
+/// `read_range` で展開し、ページに切ってキャッシュへ入れる。戻り値は
+/// (ラン展開バイト列, ラン先頭の展開オフセット = `target_page * page_size`)。
+/// ランは `[target_page, last]` で、`last` は read-ahead 上限
+/// （`cfg.read_ahead_pages`）かエントリ末尾、あるいは最初に常駐していた先読み
+/// ページの手前で止まる（設計 READ PATH: read-ahead はエントリ境界で止まり、
+/// 常駐ページは再展開しない）。
+///
+/// キャッシュへの充填と独立に戻り値でランを返すのは、ランがキャッシュ容量を
+/// 超えるとき目標ページ自身が充填中に退避されうるため。呼び出し側は戻り値から
+/// 目標ページを取り出し、キャッシュは将来のヒット用に充填する。
+#[allow(clippy::too_many_arguments)]
+fn fill_run(
+    archive: &[u8],
+    vmidx: &Vmidx,
+    cache: &mut PageCache,
+    cfg: &PageConfig,
+    record: &EntryRecord,
+    entry: usize,
+    target_page: u64,
+    total_pages: u64,
+) -> Result<(Vec<u8>, u64), ReadError> {
+    let provider = builtin_provider(record.provider_type)
+        .ok_or(ReadError::Unsupported(record.provider_type))?;
+    let page_size = cache.page_size();
+
+    // 先読みランの末尾を決める（目標ページ自身は呼び出し側でミス確定）。
+    let read_ahead = cfg.read_ahead_pages as u64;
+    let last_limit = target_page
+        .saturating_add(read_ahead)
+        .min(total_pages - 1);
+    let mut last = target_page;
+    while last < last_limit && !cache.contains(PageKey { entry, page: last + 1 }) {
+        last += 1;
+    }
+
+    // ラン全域を 1 回で展開する（checkpoint 復元 + 前進デコードを read-ahead 分で
+    // 償却）。
+    let (run_start, _) = page_extent(record.uncompressed_size, target_page, page_size);
+    let (last_start, last_len) = page_extent(record.uncompressed_size, last, page_size);
+    let run_len = (last_start - run_start) as usize + last_len;
+
+    let nearest = vmidx
+        .nearest_checkpoint(record, run_start)
+        .map_err(ReadError::Vmidx)?;
+    let start = record.data_offset as usize;
+    let aend = start
+        .checked_add(record.compressed_size as usize)
+        .filter(|&e| e <= archive.len())
+        .ok_or(ReadError::DataOutOfRange)?;
+    let compressed = &archive[start..aend];
+
+    let bytes = provider
+        .read_range(
+            compressed,
+            nearest.as_ref(),
+            run_start,
+            run_len,
+            record.uncompressed_size,
+        )
+        .map_err(ReadError::Provider)?;
+
+    // ランをページに切って充填する。
+    for page in target_page..=last {
+        let (ps, plen) = page_extent(record.uncompressed_size, page, page_size);
+        let from = (ps - run_start) as usize;
+        cache.insert(PageKey { entry, page }, bytes[from..from + plen].to_vec());
+    }
+    Ok((bytes, run_start))
 }
 
 #[cfg(test)]
@@ -409,5 +578,146 @@ mod tests {
         // 正しいアーカイブの内容が読める＝再構築された。
         assert_eq!(mount.read("a.txt", 0, 6).unwrap(), b"abcdef");
         assert_eq!(mount.read("zzz.bin", 0, 1), Err(ReadError::NotFound));
+    }
+
+    /// `big.bin` 1 エントリ（DEFLATE）だけの ZIP を組む共通フィクスチャ。
+    fn deflate_zip(data: &[u8]) -> Vec<u8> {
+        let comp = raw_deflate(data);
+        let mut zb = ZipBuilder::new();
+        zb.add("big.bin", 8, &comp, data.len() as u32);
+        zb.finish()
+    }
+
+    #[test]
+    fn read_ahead_populates_neighbor_pages() {
+        let data = sample_data(180_000);
+        let cfg = PageConfig {
+            page_size: 4096,
+            read_ahead_pages: 8,
+            cache_bytes: 16 << 20,
+            ..PageConfig::default()
+        };
+        let zip = deflate_zip(&data);
+        let params = BuildParams {
+            checkpoint_interval: 16 * 1024,
+            ..BuildParams::default()
+        };
+        let mount = Mount::open_with_page_config(&zip, &params, cfg).expect("open");
+
+        // ページ 0 の途中を 1 バイト読むだけで、ページ 0..=8 が充填される。
+        let got = mount.read("big.bin", 100, 1).unwrap();
+        assert_eq!(got, &data[100..101]);
+        {
+            let cache = mount.cache.borrow();
+            assert_eq!(cache.len(), 9, "target + 8 read-ahead pages");
+            for p in 0..=8u64 {
+                assert!(cache.contains(PageKey { entry: 0, page: p }), "page {p}");
+            }
+            assert!(!cache.contains(PageKey { entry: 0, page: 9 }));
+            assert_eq!(cache.misses(), 1, "single miss drove the whole run");
+        }
+
+        // 先読み済みページ（ページ 5）の読みはミスを増やさない（ヒット）。
+        let off = 5 * 4096 + 17;
+        let got = mount.read("big.bin", off as u64, 50).unwrap();
+        assert_eq!(got, &data[off..off + 50]);
+        assert_eq!(mount.cache.borrow().misses(), 1, "served from cache");
+    }
+
+    #[test]
+    fn read_ahead_disabled_loads_only_target_page() {
+        let data = sample_data(50_000);
+        let cfg = PageConfig {
+            page_size: 4096,
+            read_ahead_pages: 0,
+            cache_bytes: 16 << 20,
+            ..PageConfig::default()
+        };
+        let zip = deflate_zip(&data);
+        let params = BuildParams {
+            checkpoint_interval: 16 * 1024,
+            ..BuildParams::default()
+        };
+        let mount = Mount::open_with_page_config(&zip, &params, cfg).expect("open");
+        mount.read("big.bin", 0, 1).unwrap();
+        assert_eq!(mount.cache.borrow().len(), 1);
+    }
+
+    #[test]
+    fn multi_page_read_spans_pages_and_short_tail() {
+        // 末尾が短いページになるサイズ（4096*N にしない）。
+        let data = sample_data(10_000); // 4096,4096,1808 の 3 ページ
+        let cfg = PageConfig {
+            page_size: 4096,
+            read_ahead_pages: 8,
+            cache_bytes: 16 << 20,
+            ..PageConfig::default()
+        };
+        let zip = deflate_zip(&data);
+        let params = BuildParams::default();
+        let mount = Mount::open_with_page_config(&zip, &params, cfg).expect("open");
+
+        // 3 ページ全域を 1 回で（複数ページ跨ぎ + 短い末尾）。
+        assert_eq!(mount.read("big.bin", 0, data.len()).unwrap(), data);
+        // ページ境界をまたぐ部分読み。
+        assert_eq!(
+            mount.read("big.bin", 4090, 20).unwrap(),
+            &data[4090..4110]
+        );
+        // 末尾ぴったり（短い末尾ページ）。
+        assert_eq!(
+            mount.read("big.bin", 9_990, 10).unwrap(),
+            &data[9_990..10_000]
+        );
+        // 末尾超過は OutOfRange。
+        assert!(matches!(
+            mount.read("big.bin", 9_990, 20),
+            Err(ReadError::Provider(ProviderError::OutOfRange { .. }))
+        ));
+    }
+
+    #[test]
+    fn small_cache_evicts_but_stays_correct() {
+        let data = sample_data(120_000);
+        // ページ 2 枚分しか持てないキャッシュ。read-ahead 分は退避される。
+        let cfg = PageConfig {
+            page_size: 4096,
+            read_ahead_pages: 8,
+            cache_bytes: 2 * 4096,
+            ..PageConfig::default()
+        };
+        let zip = deflate_zip(&data);
+        let params = BuildParams {
+            checkpoint_interval: 16 * 1024,
+            ..BuildParams::default()
+        };
+        let mount = Mount::open_with_page_config(&zip, &params, cfg).expect("open");
+
+        // あちこち読んでも常に原データと一致し、常駐は 2 ページに収まる。
+        for &off in &[0u64, 70_000, 5_000, 119_000, 40_000, 100] {
+            let len = ((data.len() as u64 - off).min(900)) as usize;
+            let got = mount.read("big.bin", off, len).unwrap();
+            assert_eq!(got, &data[off as usize..off as usize + len], "at {off}");
+            assert!(mount.cache.borrow().len() <= 2, "cache bounded");
+        }
+    }
+
+    #[test]
+    fn store_entry_reads_through_cache() {
+        let store = b"hello, stored world, with several pages worth of bytes here.";
+        let mut zb = ZipBuilder::new();
+        zb.add("notes.txt", 0, store, store.len() as u32);
+        let zip = zb.finish();
+        let cfg = PageConfig {
+            page_size: 16,
+            read_ahead_pages: 2,
+            cache_bytes: 16 << 20,
+            ..PageConfig::default()
+        };
+        let mount = Mount::open_with_page_config(&zip, &BuildParams::default(), cfg).expect("open");
+        assert_eq!(mount.read("notes.txt", 0, store.len()).unwrap(), store);
+        assert_eq!(mount.read("notes.txt", 7, 6).unwrap(), b"stored");
+        // STORE もページキャッシュ経由（隣接ページが充填される）。
+        assert!(mount.cache.borrow().len() >= 2);
     }
 }

@@ -16,8 +16,10 @@
 //! 失われても再構築できる）。クラッシュ安全な durability は後段（M3）。
 
 use crate::index_build::BuildParams;
-use crate::mount::{read_entry, resolve_index, OpenError, ReadError};
+use crate::mount::{read_cached, resolve_index, OpenError, ReadError};
+use crate::page::{PageCache, PageConfig};
 use memmap2::Mmap;
+use std::cell::RefCell;
 use std::fmt;
 use std::fs::{self, File, Metadata};
 use std::io;
@@ -67,12 +69,22 @@ impl From<OpenError> for FileMountError {
 pub struct FileMount {
     archive: Mmap,
     vmidx_image: Vec<u8>,
+    cfg: PageConfig,
+    cache: RefCell<PageCache>,
 }
 
 impl FileMount {
     /// `archive_path` の ZIP を開く。サイドカー vmidx を検証し、無効・不在なら
-    /// EAGER で再構築して `archive.zip.vmm/vmidx` に書き戻す。
+    /// EAGER で再構築して `archive.zip.vmm/vmidx` に書き戻す。ページ設定は既定。
     pub fn open(archive_path: impl AsRef<Path>) -> Result<FileMount, FileMountError> {
+        FileMount::open_with_page_config(archive_path, PageConfig::default())
+    }
+
+    /// [`FileMount::open`] にページ設定を指定する版。
+    pub fn open_with_page_config(
+        archive_path: impl AsRef<Path>,
+        cfg: PageConfig,
+    ) -> Result<FileMount, FileMountError> {
         let archive_path = archive_path.as_ref();
         let file = File::open(archive_path)?;
         let md = file.metadata()?;
@@ -100,15 +112,28 @@ impl FileMount {
         if rebuilt {
             write_sidecar_index(&sidecar, &vmidx_path, &image)?;
         }
+        let cache = RefCell::new(PageCache::from_config(&cfg));
         Ok(FileMount {
             archive,
             vmidx_image: image,
+            cfg,
+            cache,
         })
     }
 
     /// エントリ `path` の展開ストリーム `[offset, offset + len)` を読む。
+    /// ページキャッシュ経由（[`read_cached`]）。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
-        read_entry(&self.archive, &self.vmidx_image, path, offset, len)
+        let mut cache = self.cache.borrow_mut();
+        read_cached(
+            &self.archive,
+            &self.vmidx_image,
+            &mut cache,
+            &self.cfg,
+            path,
+            offset,
+            len,
+        )
     }
 
     /// 採用中の vmidx 像。
