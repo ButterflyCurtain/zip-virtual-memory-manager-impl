@@ -166,3 +166,43 @@ C zlib と同一に書ける。C ツールチェーン不要でどこでもビ�
   巨大な標準 DEFLATE 索引向け）は後段の最適化。
 - Windows の安定 inode（`MetadataExt::file_index`）は nightly 限定のため、stable
   では inode を 0 とする。fingerprint の確定要因は cd_hash なので影響しない。
+
+---
+
+## 0006. M3（durability）を vmdirty 形式 + 回復読み取りから着手する
+
+- 日付: 2026-06-19
+- ステータス: 採用
+- 選択肢: (a) vmdirty バイナリ形式 + 回復 walk を先に純データ構造として固める
+  / (b) Tier 2 spill の I/O 配線（O_DSYNC / fdatasync / spill ポリシー）から着手
+
+### 決定
+
+M3 の最初の増分を **vmdirty のバイナリ形式（FILE HEADER / DATA RECORD /
+COMMIT MARKER / METADATA RECORD の encode）と回復読み取り walk（`read_vmdirty`
+→ `RecoveryResult`）** とし、`vmdirty.rs` に純データ構造として実装する。実ファイル
+I/O・spill ポリシー・generation_id 生成・compaction は後続に分ける。
+
+### 理由
+
+- vmidx を「形式と CRC をバイト列で先に固める→後で I/O 配線」の順で作った実績が
+  あり（`vmidx/` 各モジュール）、同じ流儀が `&[u8]` 上で完結してテストしやすい。
+  本リポの方針「mmap/バイト列は外から渡す」とも一致する（回復 walk も `&[u8]`）。
+- M3 は設計上いちばん正しさが宿る所で、IMPLEMENTATION_NOTES が
+  「`fdatasync` の順序こそ設計」「回復 walk は最初の失敗で止まりそれ以降を信用
+  しない」と釘を刺す。**回復 walk の分類ロジック**（torn write の切り捨て、
+  COMMIT MARKER 境界、generation_id 不一致での停止）はディスクを触らずに
+  クラッシュシナリオを再現してテストできる。耐久性配線（次の増分）の前に、ここを
+  テストオラクルとして固める価値が高い。
+
+### 備考
+
+- **CRC は全フィールド CRC-32C（Castagnoli）**。commit のエントリ CRC は ZIP 標準の
+  ISO-HDLC で、別物（混同が IMPLEMENTATION_NOTES の罠として明記されている）。
+  vmidx の各構造体と同じ `crc32c` クレート（0002）を流用する。
+- 不正 UTF-8 のエントリ名は設計どおり置換（U+FFFD）でデコードする。
+- LE 読み取りヘルパは `vmidx` の `pub(crate)` 版に依存させず `vmdirty` 内に閉じた
+  ものを持つ（モジュール独立を優先）。
+- 残り（後続増分）: `VmdirtyWriter`（O_DSYNC / 単一 write / fdatasync）、Tier 1↔
+  Tier 2 の FIFO spill と `dirty_limit`、generation_id の CSPRNG 生成（getrandom
+  等、依存追加時に 0007 で記録）、回復決定木の mount/disk 配線、compaction。
