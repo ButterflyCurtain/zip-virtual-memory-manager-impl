@@ -26,6 +26,8 @@
 //! ＝後段の担当）。
 
 use crate::archive::{Archive, ZipError};
+use crate::commit::{build_full, CommitError};
+use crate::difflayer::DiffLayer;
 use crate::index_build::{build_vmidx_eager, BuildError, BuildParams};
 use crate::page::{page_count, page_extent, PageCache, PageConfig, PageKey};
 use crate::provider::{builtin_provider, check_range, ProviderError};
@@ -89,12 +91,43 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// 1 つのアーカイブに対するマウント。読み取り専用。
+/// `write()` の失敗（設計 WRITE PATH）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    /// 指定の `path` がアーカイブに無い（M2 は既存エントリの変更のみ。create は M2+）。
+    NotFound,
+    /// COW で書けない圧縮種別（STORE / 標準 DEFLATE 以外）。
+    Unsupported(ProviderType),
+    /// vmidx の decode 失敗。
+    Vmidx(DecodeError),
+    /// COW の元ページをソースから読む段で失敗した。
+    Read(Box<ReadError>),
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteError::NotFound => write!(f, "write: entry not found"),
+            WriteError::Unsupported(p) => write!(f, "write: unsupported provider {p:?}"),
+            WriteError::Vmidx(e) => write!(f, "write: {e}"),
+            WriteError::Read(e) => write!(f, "write: copy-on-write read failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// 1 つのアーカイブに対するマウント。読み取りに加え、Diff Layer Tier 1 を介した
+/// 書き込み（[`write`](Mount::write)）と FULL [`commit`](Mount::commit) を提供する
+/// （設計 WRITE PATH / commit() FLOW の M2 最小形）。ソース ZIP は commit まで
+/// 一切書き換えない。
 pub struct Mount<'a> {
     archive: &'a [u8],
     vmidx_image: Vec<u8>,
     cfg: PageConfig,
     cache: RefCell<PageCache>,
+    /// 未コミットの dirty ページ（Tier 1）。read は Diff Layer を最優先で見る。
+    diff: RefCell<DiffLayer>,
 }
 
 impl<'a> Mount<'a> {
@@ -129,11 +162,13 @@ impl<'a> Mount<'a> {
 
     fn assemble(archive: &'a [u8], vmidx_image: Vec<u8>, cfg: PageConfig) -> Mount<'a> {
         let cache = RefCell::new(PageCache::from_config(&cfg));
+        let diff = RefCell::new(DiffLayer::new(cfg.page_size));
         Mount {
             archive,
             vmidx_image,
             cfg,
             cache,
+            diff,
         }
     }
 
@@ -143,8 +178,19 @@ impl<'a> Mount<'a> {
     }
 
     /// エントリ `path` の展開ストリーム `[offset, offset + len)` を読む。
-    /// ページキャッシュ経由（ミス時のみ展開 + read-ahead 充填）。
+    /// dirty なエントリは Diff Layer から（設計 READ PATH の Tier 1 最優先）、
+    /// それ以外はページキャッシュ経由（ミス時のみ展開 + read-ahead 充填）。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
+        if self.diff.borrow().is_dirty(path) {
+            return read_dirty(
+                self.archive,
+                &self.vmidx_image,
+                &self.diff.borrow(),
+                path,
+                offset,
+                len,
+            );
+        }
         let mut cache = self.cache.borrow_mut();
         // メモリ上マウントには再 stat 対象のファイルが無いので鮮度チェックは no-op。
         read_cached(
@@ -157,6 +203,33 @@ impl<'a> Mount<'a> {
             len,
             || Ok(()),
         )
+    }
+
+    /// エントリ `path` の `[offset, offset + data.len())` を書く（設計 WRITE PATH）。
+    /// ソース ZIP は触らず、Diff Layer Tier 1 に COW で取り込む。末尾を超える
+    /// 書き込みはエントリを伸ばし（implicit extension）、間のページはゼロ埋めされる
+    /// （commit で materialise）。`dirty_limit` は M2 では無制限（spill なし）。
+    pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), WriteError> {
+        write_into(
+            self.archive,
+            &self.vmidx_image,
+            &mut self.diff.borrow_mut(),
+            path,
+            offset,
+            data,
+        )
+    }
+
+    /// dirty なエントリがあるか（commit が実体を持つか）。
+    pub fn is_dirty(&self) -> bool {
+        !self.diff.borrow().is_empty()
+    }
+
+    /// 全 dirty 変更を反映した新しい ZIP バイト列を返す（FULL commit。設計
+    /// commit() FLOW の FULL path）。マウントを消費する: 呼び出し側は返った
+    /// バイト列で開き直す（ディスクでは `archive.new.zip` に書いて `rename`）。
+    pub fn commit(self) -> Result<Vec<u8>, CommitError> {
+        build_full(self.archive, &self.vmidx_image, &self.diff.borrow())
     }
 }
 
@@ -226,6 +299,126 @@ pub fn read_entry(
             record.uncompressed_size,
         )
         .map_err(ReadError::Provider)
+}
+
+/// エントリ `path` の `[offset, offset + data.len())` を Diff Layer に COW で書く
+/// （設計 WRITE PATH）。触れる各ページは、未取り込みならソース（キャッシュなしの
+/// [`read_entry`]）から元内容を読み込み、`page_size` バイトに右ゼロ埋めしてから
+/// 書き込みを適用する。末尾超過はエントリを伸ばす（`logical_size` 更新）。
+pub fn write_into(
+    archive: &[u8],
+    vmidx_image: &[u8],
+    diff: &mut DiffLayer,
+    path: &str,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), WriteError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    // エントリの存在と元サイズ・種別を確認する（M2 は既存エントリの変更のみ）。
+    let (original_size, provider_type) = {
+        let vmidx = Vmidx::parse(vmidx_image).map_err(WriteError::Vmidx)?;
+        let (_, record) = vmidx
+            .lookup(path)
+            .map_err(WriteError::Vmidx)?
+            .ok_or(WriteError::NotFound)?;
+        (record.uncompressed_size, record.provider_type)
+    };
+    if builtin_provider(provider_type).is_none() {
+        return Err(WriteError::Unsupported(provider_type));
+    }
+
+    let page_size = diff.page_size();
+    diff.ensure_entry(path, original_size);
+    let end = offset + data.len() as u64;
+    let new_logical = diff.logical_size(path).unwrap_or(original_size).max(end);
+
+    let first = offset / page_size;
+    let last = (end - 1) / page_size; // data 非空なので end >= 1
+    for page in first..=last {
+        let page_start = page * page_size;
+        if !diff.has_page(path, page) {
+            // COW: ページサイズ分のゼロバッファに元内容を載せる。
+            let mut buf = vec![0u8; page_size as usize];
+            if page_start < original_size {
+                let avail = ((original_size - page_start).min(page_size)) as usize;
+                let orig = read_entry(archive, vmidx_image, path, page_start, avail)
+                    .map_err(|e| WriteError::Read(Box::new(e)))?;
+                buf[..avail].copy_from_slice(&orig);
+            }
+            diff.insert_page(path, page, buf);
+        }
+        // このページに重なる書き込み範囲を適用する。
+        let buf = diff.page_mut(path, page).expect("just inserted");
+        let w_lo = offset.max(page_start);
+        let w_hi = end.min(page_start + page_size);
+        let dst_lo = (w_lo - page_start) as usize;
+        let dst_hi = (w_hi - page_start) as usize;
+        let src_lo = (w_lo - offset) as usize;
+        let src_hi = (w_hi - offset) as usize;
+        buf[dst_lo..dst_hi].copy_from_slice(&data[src_lo..src_hi]);
+    }
+    diff.set_logical_size(path, new_logical);
+    Ok(())
+}
+
+/// dirty なエントリの `[offset, offset + len)` を Diff Layer から読む（設計
+/// READ PATH の Tier 1 経路）。ページごとに Diff Layer 優先、無ければソースの
+/// 未変更ページ、ソース範囲も超えていればゼロ（implicit extension の gap）。
+/// `logical_size` を超える読みは短く返す（EOF セマンティクス）。
+pub fn read_dirty(
+    archive: &[u8],
+    vmidx_image: &[u8],
+    diff: &DiffLayer,
+    path: &str,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, ReadError> {
+    let original_size = {
+        let vmidx = Vmidx::parse(vmidx_image).map_err(ReadError::Vmidx)?;
+        let (_, record) = vmidx
+            .lookup(path)
+            .map_err(ReadError::Vmidx)?
+            .ok_or(ReadError::NotFound)?;
+        record.uncompressed_size
+    };
+    let logical = diff.logical_size(path).ok_or(ReadError::NotFound)?;
+    let page_size = diff.page_size();
+
+    if len == 0 || offset >= logical {
+        return Ok(Vec::new());
+    }
+    let end = (offset + len as u64).min(logical);
+
+    let mut out = Vec::with_capacity((end - offset) as usize);
+    let mut pos = offset;
+    while pos < end {
+        let page = pos / page_size;
+        let page_start = page * page_size;
+        let chunk_end = end.min(page_start + page_size);
+        let take = (chunk_end - pos) as usize;
+
+        if let Some(p) = diff.page(path, page) {
+            let in_page = (pos - page_start) as usize;
+            out.extend_from_slice(&p[in_page..in_page + take]);
+        } else {
+            // 未変更ページ。ソース範囲内は読み、超える分はゼロ（gap）。
+            let orig_end = chunk_end.min(original_size);
+            if pos < orig_end {
+                let n = (orig_end - pos) as usize;
+                let chunk = read_entry(archive, vmidx_image, path, pos, n)?;
+                out.extend_from_slice(&chunk);
+                if n < take {
+                    out.resize(out.len() + (take - n), 0);
+                }
+            } else {
+                out.resize(out.len() + take, 0);
+            }
+        }
+        pos = chunk_end;
+    }
+    Ok(out)
 }
 
 /// ページキャッシュ経由で 1 エントリの `[offset, offset + len)` を読む。
@@ -739,5 +932,173 @@ mod tests {
         assert_eq!(mount.read("notes.txt", 7, 6).unwrap(), b"stored");
         // STORE もページキャッシュ経由（隣接ページが充填される）。
         assert!(mount.cache.borrow().len() >= 2);
+    }
+
+    // ───────────────────────── M2: 書き込み + FULL commit ─────────────────────
+
+    #[test]
+    fn write_to_missing_entry_is_not_found() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"x", 1);
+        let zip = zb.finish();
+        let mount = Mount::open(&zip, &BuildParams::default()).expect("open");
+        assert_eq!(mount.write("absent", 0, b"y"), Err(WriteError::NotFound));
+    }
+
+    #[test]
+    fn empty_write_is_noop() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"hello", 5);
+        let zip = zb.finish();
+        let mount = Mount::open(&zip, &BuildParams::default()).expect("open");
+        mount.write("a.txt", 2, b"").unwrap();
+        assert!(!mount.is_dirty(), "zero-length write must not dirty the entry");
+    }
+
+    #[test]
+    fn write_then_read_and_commit_store_entry() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"hello world", 11);
+        zb.add("b.txt", 0, b"unchanged", 9);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        // "hello world" の 6..11 ("world") を上書きする。
+        mount.write("a.txt", 6, b"rust!").unwrap();
+        assert!(mount.is_dirty());
+        assert_eq!(mount.read("a.txt", 0, 11).unwrap(), b"hello rust!");
+        // 部分読み（dirty ページから）。
+        assert_eq!(mount.read("a.txt", 6, 5).unwrap(), b"rust!");
+        // 未変更エントリは元のまま。
+        assert_eq!(mount.read("b.txt", 0, 9).unwrap(), b"unchanged");
+
+        // FULL commit → 新 ZIP を開き直して反映を確認。
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
+        assert_eq!(m2.read("a.txt", 0, 11).unwrap(), b"hello rust!");
+        assert_eq!(m2.read("b.txt", 0, 9).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn write_past_end_extends_with_zero_fill() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"abc", 3);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        // offset 5 に書く: [3,5) は gap（ゼロ）、論理サイズは 7 に伸びる。
+        mount.write("a.txt", 5, b"XY").unwrap();
+        let expect = b"abc\x00\x00XY";
+        assert_eq!(mount.read("a.txt", 0, 7).unwrap(), expect);
+        // EOF セマンティクス: 末尾跨ぎは短く、末尾以降は空。
+        assert_eq!(mount.read("a.txt", 6, 10).unwrap(), b"Y");
+        assert_eq!(mount.read("a.txt", 7, 5).unwrap(), b"");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
+        assert_eq!(m2.read("a.txt", 0, 7).unwrap(), expect);
+    }
+
+    #[test]
+    fn write_spanning_two_pages() {
+        let store = vec![b'.'; 20];
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, &store, store.len() as u32);
+        let zip = zb.finish();
+        // ページ 8 バイト: 書き込み [6,12) はページ 0 と 1 を跨ぐ。
+        let cfg = PageConfig {
+            page_size: 8,
+            read_ahead_pages: 0,
+            cache_bytes: 16 << 20,
+        };
+        let params = BuildParams::default();
+        let mount = Mount::open_with_page_config(&zip, &params, cfg).expect("open");
+        mount.write("a.txt", 6, b"ABCDEF").unwrap();
+        let mut expect = store.clone();
+        expect[6..12].copy_from_slice(b"ABCDEF");
+        assert_eq!(mount.read("a.txt", 0, 20).unwrap(), expect);
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open_with_page_config(&new_zip, &params, cfg).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 20).unwrap(), expect);
+    }
+
+    #[test]
+    fn write_and_commit_deflate_entry() {
+        let data = sample_data(180_000);
+        let comp = raw_deflate(&data);
+        let mut zb = ZipBuilder::new();
+        zb.add("big.bin", 8, &comp, data.len() as u32);
+        zb.add("note.txt", 0, b"sidecar", 7);
+        let zip = zb.finish();
+        let params = BuildParams {
+            checkpoint_interval: 16 * 1024,
+            ..BuildParams::default()
+        };
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        // 深い位置を 100 バイト上書きする（COW は当該ページのみ元から読む）。
+        let patch = vec![0xABu8; 100];
+        mount.write("big.bin", 90_000, &patch).unwrap();
+        assert_eq!(mount.read("big.bin", 90_000, 100).unwrap(), patch);
+        // 同じ dirty ページ内の前後は元データのまま。
+        assert_eq!(
+            mount.read("big.bin", 89_900, 100).unwrap(),
+            &data[89_900..90_000]
+        );
+        // 別ページ（未変更）はソースから読める。
+        assert_eq!(mount.read("big.bin", 0, 100).unwrap(), &data[..100]);
+        assert_eq!(
+            mount.read("big.bin", 179_000, 500).unwrap(),
+            &data[179_000..179_500]
+        );
+
+        // FULL commit: big.bin は再圧縮、note.txt は verbatim コピー。
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
+        let mut expect = data.clone();
+        expect[90_000..90_100].copy_from_slice(&patch);
+        assert_eq!(m2.read("big.bin", 0, expect.len()).unwrap(), expect);
+        assert_eq!(m2.read("note.txt", 0, 7).unwrap(), b"sidecar");
+        // 再圧縮後の深いシークも通る（新索引のチェックポイント経由）。
+        assert_eq!(
+            m2.read("big.bin", 120_000, 200).unwrap(),
+            &expect[120_000..120_200]
+        );
+    }
+
+    #[test]
+    fn commit_without_writes_round_trips() {
+        let data = sample_data(50_000);
+        let comp = raw_deflate(&data);
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"hello", 5);
+        zb.add("big.bin", 8, &comp, data.len() as u32);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+        assert!(!mount.is_dirty());
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
+        assert_eq!(m2.read("a.txt", 0, 5).unwrap(), b"hello");
+        assert_eq!(m2.read("big.bin", 0, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn multiple_writes_to_same_entry_accumulate() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"0123456789", 10);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+        mount.write("a.txt", 0, b"AB").unwrap();
+        mount.write("a.txt", 8, b"YZ").unwrap();
+        assert_eq!(mount.read("a.txt", 0, 10).unwrap(), b"AB234567YZ");
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 10).unwrap(), b"AB234567YZ");
     }
 }

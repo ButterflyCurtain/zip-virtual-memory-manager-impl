@@ -17,8 +17,10 @@
 //! 既定プロファイルでは fsync しない（Section 6.3 c。vmidx はキャッシュで、
 //! 失われても再構築できる）。クラッシュ安全な durability は後段（M3）。
 
+use crate::commit::{build_full, CommitError};
+use crate::difflayer::DiffLayer;
 use crate::index_build::BuildParams;
-use crate::mount::{read_cached, resolve_index, OpenError, ReadError};
+use crate::mount::{read_cached, read_dirty, resolve_index, write_into, OpenError, ReadError, WriteError};
 use crate::page::{PageCache, PageConfig};
 use memmap2::Mmap;
 use std::cell::{Cell, RefCell};
@@ -35,6 +37,8 @@ pub enum FileMountError {
     Io(io::Error),
     /// マウントを開く処理（parse / 索引構築）の失敗。
     Open(OpenError),
+    /// commit の新 ZIP 組み立ての失敗。
+    Commit(CommitError),
 }
 
 impl fmt::Display for FileMountError {
@@ -42,6 +46,7 @@ impl fmt::Display for FileMountError {
         match self {
             FileMountError::Io(e) => write!(f, "file mount: {e}"),
             FileMountError::Open(e) => write!(f, "file mount: {e}"),
+            FileMountError::Commit(e) => write!(f, "file mount: {e}"),
         }
     }
 }
@@ -51,7 +56,14 @@ impl std::error::Error for FileMountError {
         match self {
             FileMountError::Io(e) => Some(e),
             FileMountError::Open(e) => Some(e),
+            FileMountError::Commit(e) => Some(e),
         }
+    }
+}
+
+impl From<CommitError> for FileMountError {
+    fn from(e: CommitError) -> FileMountError {
+        FileMountError::Commit(e)
     }
 }
 
@@ -86,12 +98,15 @@ impl StatFingerprint {
     }
 }
 
-/// ディスク上の `archive.zip` に対する読み取り専用マウント。
+/// ディスク上の `archive.zip` に対するマウント。読み取りに加え、Diff Layer
+/// Tier 1 を介した書き込みと FULL commit（`archive.new.zip` → `rename`）を提供する。
 pub struct FileMount {
     archive: Mmap,
     vmidx_image: Vec<u8>,
     cfg: PageConfig,
     cache: RefCell<PageCache>,
+    /// 未コミットの dirty ページ（Tier 1）。commit で `archive.zip` に反映する。
+    diff: RefCell<DiffLayer>,
     /// 再 stat 用のパスと open 時指紋（ESTALE 検出、設計 SNAPSHOT CONSISTENCY）。
     archive_path: PathBuf,
     fingerprint: StatFingerprint,
@@ -145,11 +160,13 @@ impl FileMount {
             write_sidecar_index(&sidecar, &vmidx_path, &image)?;
         }
         let cache = RefCell::new(PageCache::from_config(&cfg));
+        let diff = RefCell::new(DiffLayer::new(cfg.page_size));
         Ok(FileMount {
             archive,
             vmidx_image: image,
             cfg,
             cache,
+            diff,
             archive_path: archive_path.to_path_buf(),
             fingerprint,
             estale_interval: 1,
@@ -179,6 +196,17 @@ impl FileMount {
         if self.stale.get() {
             return Err(ReadError::Stale);
         }
+        // dirty なエントリは Diff Layer から（設計 READ PATH の Tier 1 最優先）。
+        if self.diff.borrow().is_dirty(path) {
+            return read_dirty(
+                &self.archive,
+                &self.vmidx_image,
+                &self.diff.borrow(),
+                path,
+                offset,
+                len,
+            );
+        }
         let mut cache = self.cache.borrow_mut();
         read_cached(
             &self.archive,
@@ -190,6 +218,48 @@ impl FileMount {
             len,
             || self.check_fresh(),
         )
+    }
+
+    /// エントリ `path` の `[offset, offset + data.len())` を書く（設計 WRITE PATH）。
+    /// `archive.zip` は触らず Diff Layer Tier 1 に COW で取り込む。反映は
+    /// [`commit`](FileMount::commit) まで遅延する。STALE 後は書けない。
+    pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), WriteError> {
+        write_into(
+            &self.archive,
+            &self.vmidx_image,
+            &mut self.diff.borrow_mut(),
+            path,
+            offset,
+            data,
+        )
+    }
+
+    /// dirty な変更があるか。
+    pub fn is_dirty(&self) -> bool {
+        !self.diff.borrow().is_empty()
+    }
+
+    /// FULL commit（設計 commit() FLOW の FULL path）。Diff Layer を反映した新しい
+    /// 完全な ZIP を `archive.new.zip` に書き、`archive.zip` へ `rename` で原子的に
+    /// 差し替える。マウントを消費する（mmap を解放）。クラッシュ前は元の
+    /// `archive.zip` が無傷で残り、後は新 ZIP が有効（POSIX rename の原子性）。
+    ///
+    /// 既定プロファイルでは fsync しない（M2。durability は M3）。サイドカー
+    /// vmidx は更新せず残すが、次回 open 時に fingerprint 不一致で再構築される
+    /// （vmidx はキャッシュ）。
+    pub fn commit(self) -> Result<(), FileMountError> {
+        if self.diff.borrow().is_empty() {
+            return Ok(());
+        }
+        let new_zip = build_full(&self.archive, &self.vmidx_image, &self.diff.borrow())?;
+
+        // archive.new.zip に書いてから rename で差し替える。Windows では mmap 保持中の
+        // ファイルを切り詰め上書きできないが、別名 write → rename は通る（新 inode、
+        // 旧マッピングは旧内容のまま生存。設計が想定する典型的な置き換え）。
+        let tmp = commit_tmp(&self.archive_path);
+        fs::write(&tmp, &new_zip)?;
+        fs::rename(&tmp, &self.archive_path)?;
+        Ok(())
     }
 
     /// キャッシュミス時の鮮度チェック（ソースへ触れる前）。間隔判定を通過したら
@@ -229,6 +299,17 @@ fn sidecar_dir(archive_path: &Path) -> PathBuf {
         .unwrap_or_default()
         .to_os_string();
     name.push(".vmm");
+    archive_path.with_file_name(name)
+}
+
+/// commit 用の一時ファイルパス（`archive.zip` の隣に `archive.zip.new`）。
+/// 書いてから `archive.zip` へ rename する。
+fn commit_tmp(archive_path: &Path) -> PathBuf {
+    let mut name = archive_path
+        .file_name()
+        .unwrap_or_default()
+        .to_os_string();
+    name.push(".new");
     archive_path.with_file_name(name)
 }
 
@@ -486,6 +567,47 @@ mod tests {
         // 未キャッシュページの読みでもチェックは走らず、STALE を返さない。
         assert_ne!(m.read("data.bin", 0, 4), Err(ReadError::Stale));
         assert!(!m.is_stale());
+    }
+
+    #[test]
+    fn write_then_commit_persists_and_reopens() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("w.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[("a.txt", b"hello world"), ("b.txt", b"unchanged")]),
+        )
+        .unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        m.write("a.txt", 6, b"rust!").unwrap();
+        assert!(m.is_dirty());
+        // dirty な読みは Diff Layer から。
+        assert_eq!(m.read("a.txt", 0, 11).unwrap(), b"hello rust!");
+        // FULL commit → archive.zip を差し替え、マウントを消費。
+        m.commit().expect("commit");
+
+        // 一時ファイルは残っていない。
+        assert!(!dir.path().join("w.zip.new").exists());
+
+        // 開き直すと反映済み（vmidx は fingerprint 不一致で再構築される）。
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 11).unwrap(), b"hello rust!");
+        assert_eq!(m2.read("b.txt", 0, 9).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn commit_without_writes_is_noop() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("n.zip");
+        let original = store_zip(&[("a.txt", b"abc")]);
+        fs::write(&zip_path, &original).unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        assert!(!m.is_dirty());
+        m.commit().expect("noop commit");
+        // ファイルは書き換えられていない。
+        assert_eq!(fs::read(&zip_path).unwrap(), original);
     }
 
     #[test]
