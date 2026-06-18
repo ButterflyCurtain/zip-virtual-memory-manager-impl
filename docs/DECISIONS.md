@@ -246,3 +246,46 @@ vmdirty の `VmdirtyWriter`（Section 7）を実装するにあたり:
   commit の原子性 durability）はまだ。Unix 限定の後続課題として残す。
 - 依存連番: 0001 Rust / 0002 crc32c / 0003 xxhash-rust / 0004 libz-rs-sys /
   0005 memmap2 / **0007 getrandom**。
+
+---
+
+## 0008. Tier 2 スピルのポリシー核を Diff Layer に「victim 返却型」で置く
+
+- 日付: 2026-06-19
+- ステータス: 採用
+- 選択肢: (a) `DiffLayer` に dirty_limit と FIFO victim 選択だけ持たせ、退避ページを
+  返して **I/O は呼び出し側**（mount/disk が `VmdirtyWriter` へ）/ (b) 設計の
+  `Tier1DirtyStore` を新設し、Tier 1 + vmdirty 書き出し + Tier 2 索引を 1 つに束ねる
+
+### 決定
+
+`DiffLayer` に `dirty_limit` / `dirty_bytes` 会計 / FIFO の victim 選択
+（`take_spill_victims` が退避すべき `SpilledPage` を古い順に返す）を持たせる。
+**vmdirty への実書き込みと Tier 2 読み戻しは持ち込まない**（(a)）。既定は無制限
+（`UNLIMITED`）で M2 互換（spill しない）。
+
+### 理由
+
+- `difflayer.rs` は「I/O も圧縮も持たない純データ構造」という確立した役割があり
+  （M2）、これを保つと spill ポリシー（どのページを退かすか）をディスク無しで
+  ユニットテストできる。設計 Section 5.1 のスピル選択はまさにこの純ロジック。
+- 設計の `Tier1DirtyStore` は vmdirty 書き出しまで束ねるが、**vmdirty ファイルの
+  ライフサイクル（生成・generation_id・header 指紋・close 時の扱い）は回復読み取り
+  （open 時の `read_vmdirty` → 決定木）と同じ場所＝ mount/disk に宿る**。スピル
+  書き出しと回復読み取りは同じ vmdirty ハンドル/Tier 2 索引を共有するので、両者を
+  同じ配線増分（③）で入れる方が、durability の順序（IMPLEMENTATION_NOTES の
+  crash-before/after）を 1 箇所で見切れて安全。先に I/O を difflayer へ散らすと
+  half-wired になる。
+
+### 備考
+
+- FIFO は**挿入順**（最古に書かれたページから退避、設計 5.1 既定）。write hit による
+  「最新へ再スタンプ」（5.1 の write amplification 軽減）は正しさに無関係な最適化で、
+  spill を実 I/O に繋ぐ③で write 経路に置く。
+- **未配線ゆえの注意（③で対応）**: spill 後のページへの write hit は、現状の
+  `mount::write_into` が `has_page=false` を見てソースから COW 復元してしまう
+  （Tier 2 の変更を取りこぼす）。Tier 2 索引と write-through（設計 4.1「Tier 2
+  ページへの write hit は新 DATA RECORD を追記」）は③で入れるまで、mount/disk の
+  `dirty_limit` は無制限のまま（spill を起こさない）に保つ。
+- `take_spill_victims` の返り値は呼び出し側が `append_data_record` で vmdirty へ
+  書き、(entry,page)→offset を Tier 2 索引（設計 `VmdirtyIndex`）に積む。

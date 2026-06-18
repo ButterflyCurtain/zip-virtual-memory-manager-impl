@@ -15,8 +15,24 @@
 //! このモジュールは I/O も圧縮も持たない純データ構造。COW の元ページ取得
 //! （キャッシュ/ソース ZIP からの読み出し）と commit の再圧縮は呼び出し側
 //! （[`mount`](crate::mount) / [`commit`](crate::commit)）の責務。
+//!
+//! **Tier 2 spill のポリシー核（M3）**: `dirty_limit`（Tier 1 に保持してよい
+//! dirty バイト上限）と FIFO victim 選択（設計 Section 5.1）を持つ。上限超過時に
+//! 最古から退避すべきページ（[`SpilledPage`]）を [`take_spill_victims`] が返す。
+//! ここは「どのページを退かすか」の決定だけで、退避先 vmdirty への **書き出しは
+//! 行わない**（I/O は呼び出し側 = `VmdirtyWriter` 委譲）。既定は無制限
+//! （[`UNLIMITED`]、M2 互換: spill なし）。
+//!
+//! FIFO は挿入順（＝最古に*書かれた*ページから退避、設計 5.1 既定）。write hit に
+//! よる「最新へ再スタンプ」（write amplification 軽減、5.1 既知ケース）は正しさに
+//! 影響しない最適化なので、spill を実 I/O に繋ぐ増分へ回す。
+//!
+//! [`take_spill_victims`]: DiffLayer::take_spill_victims
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// `dirty_limit` の無制限値（spill を起こさない。M2 既定）。
+pub const UNLIMITED: u64 = u64::MAX;
 
 /// 1 エントリ分の dirty 状態。
 struct DirtyEntry {
@@ -27,17 +43,47 @@ struct DirtyEntry {
     logical_size: u64,
 }
 
+/// `dirty_limit` 超過で Tier 1 から退避すべき 1 ページ。呼び出し側がこれを
+/// `VmdirtyWriter::append_data_record` で vmdirty へ書き、(entry,page)→offset を
+/// Tier 2 索引に記録する（設計 Section 4.1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpilledPage {
+    pub entry_name: String,
+    pub page_index: u64,
+    /// 退避するページの完全バイト列（`page_size` バイト）。
+    pub data: Vec<u8>,
+}
+
 /// Diff Layer Tier 1。エントリ名（`path`）で dirty 状態を引く。
 pub struct DiffLayer {
     page_size: u64,
+    /// Tier 1 に保持してよい dirty バイト上限。超過分は spill 候補になる。
+    dirty_limit: u64,
+    /// 現在 Tier 1 が保持する dirty バイト数（= 常駐ページ数 × `page_size`）。
+    dirty_current: u64,
+    /// 次に割り当てる FIFO スタンプ（単調増加）。
+    next_stamp: u64,
+    /// FIFO 並び: スタンプ → (エントリ名, ページ番号)。最小キー = 最古。
+    order: BTreeMap<u64, (String, u64)>,
     entries: HashMap<String, DirtyEntry>,
 }
 
 impl DiffLayer {
     /// 空の Diff Layer を作る。`page_size` はマウントのページ設定に一致させる。
+    /// `dirty_limit` は無制限（spill なし、M2 互換）。
     pub fn new(page_size: u64) -> DiffLayer {
+        DiffLayer::with_dirty_limit(page_size, UNLIMITED)
+    }
+
+    /// `dirty_limit`（Tier 1 の dirty バイト上限）を指定して作る。`0` は
+    /// SPILL_ONLY（書いたページを即 spill 候補にする）。
+    pub fn with_dirty_limit(page_size: u64, dirty_limit: u64) -> DiffLayer {
         DiffLayer {
             page_size: page_size.max(1),
+            dirty_limit,
+            dirty_current: 0,
+            next_stamp: 0,
+            order: BTreeMap::new(),
             entries: HashMap::new(),
         }
     }
@@ -45,6 +91,21 @@ impl DiffLayer {
     /// ページサイズ。
     pub fn page_size(&self) -> u64 {
         self.page_size
+    }
+
+    /// Tier 1 の dirty バイト上限。
+    pub fn dirty_limit(&self) -> u64 {
+        self.dirty_limit
+    }
+
+    /// 現在 Tier 1 が保持している dirty バイト数。
+    pub fn dirty_bytes(&self) -> u64 {
+        self.dirty_current
+    }
+
+    /// dirty バイトが上限を超えているか（spill が要るか）。
+    pub fn over_limit(&self) -> bool {
+        self.dirty_current > self.dirty_limit
     }
 
     /// dirty なエントリが 1 つも無いか（CLEAN なら commit は no-op にできる）。
@@ -103,9 +164,21 @@ impl DiffLayer {
 
     /// ページ `page` を挿入/置換する。`bytes` は `page_size` バイトであること。
     /// エントリが未作成なら何もしない（先に [`ensure_entry`](Self::ensure_entry)）。
+    /// 新規ページは FIFO 末尾（最新）に並び、`dirty_bytes` を `page_size` 増やす。
+    /// 既存ページの置換はデータだけ差し替え、並び順・会計は変えない。
     pub fn insert_page(&mut self, path: &str, page: u64, bytes: Vec<u8>) {
-        if let Some(e) = self.entries.get_mut(path) {
-            e.pages.insert(page, bytes);
+        let stamp = self.next_stamp;
+        let Some(e) = self.entries.get_mut(path) else {
+            return;
+        };
+        match e.pages.get_mut(&page) {
+            Some(existing) => *existing = bytes,
+            None => {
+                e.pages.insert(page, bytes);
+                self.order.insert(stamp, (path.to_owned(), page));
+                self.next_stamp += 1;
+                self.dirty_current += self.page_size;
+            }
         }
     }
 
@@ -114,9 +187,36 @@ impl DiffLayer {
         self.entries.get_mut(path).and_then(|e| e.pages.get_mut(&page))
     }
 
+    /// `dirty_limit` を超えている間、最古（FIFO 先頭）のページを Tier 1 から外し、
+    /// 退避すべきページを古い順に返す（設計 Section 5.1 のスピル選択）。返したページは
+    /// もう Tier 1 に無い（呼び出し側が vmdirty へ書く責務）。ページが全部抜けても
+    /// エントリ自体（`logical_size`）は残す。無制限なら常に空を返す。
+    pub fn take_spill_victims(&mut self) -> Vec<SpilledPage> {
+        let mut victims = Vec::new();
+        while self.dirty_current > self.dirty_limit {
+            let Some((_, (entry_name, page_index))) = self.order.pop_first() else {
+                break; // Tier 1 が空（dirty_limit < page_size でもここで止まる）
+            };
+            if let Some(e) = self.entries.get_mut(&entry_name) {
+                if let Some(data) = e.pages.remove(&page_index) {
+                    self.dirty_current -= self.page_size;
+                    victims.push(SpilledPage {
+                        entry_name,
+                        page_index,
+                        data,
+                    });
+                }
+            }
+        }
+        victims
+    }
+
     /// 全 dirty 状態を捨てる（commit 完了後）。
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.order.clear();
+        self.dirty_current = 0;
+        self.next_stamp = 0;
     }
 }
 
@@ -164,5 +264,107 @@ mod tests {
         d.clear();
         assert!(d.is_empty());
         assert!(!d.is_dirty("a"));
+        assert_eq!(d.dirty_bytes(), 0);
+    }
+
+    /// `path` の `page` を 1 枚挿入するヘルパ（中身は識別用にページ番号で埋める）。
+    fn put(d: &mut DiffLayer, path: &str, page: u64) {
+        d.ensure_entry(path, 0);
+        d.insert_page(path, page, vec![page as u8; d.page_size() as usize]);
+    }
+
+    #[test]
+    fn unlimited_never_spills() {
+        let mut d = DiffLayer::new(8); // 既定 = 無制限
+        assert_eq!(d.dirty_limit(), UNLIMITED);
+        for p in 0..100 {
+            put(&mut d, "a", p);
+        }
+        assert_eq!(d.dirty_bytes(), 100 * 8);
+        assert!(!d.over_limit());
+        assert!(d.take_spill_victims().is_empty());
+        assert_eq!(d.dirty_bytes(), 100 * 8);
+    }
+
+    #[test]
+    fn accounting_tracks_resident_bytes() {
+        let mut d = DiffLayer::with_dirty_limit(8, UNLIMITED);
+        put(&mut d, "a", 0);
+        put(&mut d, "a", 1);
+        assert_eq!(d.dirty_bytes(), 16);
+        // 既存ページの置換は会計を増やさない。
+        d.insert_page("a", 0, vec![9u8; 8]);
+        assert_eq!(d.dirty_bytes(), 16);
+        assert_eq!(d.page("a", 0).unwrap()[0], 9);
+    }
+
+    #[test]
+    fn fifo_evicts_oldest_first_across_entries() {
+        // 上限 = 3 ページ。5 ページ入れたら最古 2 枚が退避される。
+        let mut d = DiffLayer::with_dirty_limit(8, 3 * 8);
+        put(&mut d, "a", 0); // 最古
+        put(&mut d, "b", 7);
+        put(&mut d, "a", 1);
+        put(&mut d, "c", 0);
+        put(&mut d, "b", 8); // 最新
+        assert!(d.over_limit());
+
+        let victims = d.take_spill_victims();
+        // 古い順 = 挿入順に 2 枚。
+        assert_eq!(victims.len(), 2);
+        assert_eq!(
+            (victims[0].entry_name.as_str(), victims[0].page_index),
+            ("a", 0)
+        );
+        assert_eq!(
+            (victims[1].entry_name.as_str(), victims[1].page_index),
+            ("b", 7)
+        );
+        // 退避ページのデータも持って出る。
+        assert_eq!(victims[0].data, vec![0u8; 8]);
+        assert_eq!(victims[1].data, vec![7u8; 8]);
+
+        // Tier 1 は上限ちょうどに収まり、退避ページはもう無い。
+        assert_eq!(d.dirty_bytes(), 3 * 8);
+        assert!(!d.over_limit());
+        assert!(!d.has_page("a", 0));
+        assert!(!d.has_page("b", 7));
+        assert!(d.has_page("a", 1));
+        assert!(d.has_page("c", 0));
+        assert!(d.has_page("b", 8));
+        // 2 回目の呼び出しは何も退避しない。
+        assert!(d.take_spill_victims().is_empty());
+    }
+
+    #[test]
+    fn spilling_all_pages_keeps_entry_and_logical_size() {
+        // SPILL_ONLY（上限 0）: 入れたページは即 spill 候補。
+        let mut d = DiffLayer::with_dirty_limit(8, 0);
+        d.ensure_entry("a", 100); // 論理サイズ 100
+        d.insert_page("a", 0, vec![1u8; 8]);
+        d.insert_page("a", 1, vec![2u8; 8]);
+        let victims = d.take_spill_victims();
+        assert_eq!(victims.len(), 2);
+        assert_eq!(d.dirty_bytes(), 0);
+        // ページは全部抜けたが、エントリと論理サイズは残る（commit/read が要る）。
+        assert!(d.is_dirty("a"));
+        assert_eq!(d.logical_size("a"), Some(100));
+        assert!(!d.has_page("a", 0));
+        assert!(!d.has_page("a", 1));
+    }
+
+    #[test]
+    fn clear_resets_spill_accounting() {
+        let mut d = DiffLayer::with_dirty_limit(8, 0);
+        put(&mut d, "a", 0);
+        d.clear();
+        assert_eq!(d.dirty_bytes(), 0);
+        assert!(!d.over_limit());
+        // クリア後に入れ直しても FIFO/会計が壊れていない。
+        put(&mut d, "b", 0);
+        assert_eq!(d.dirty_bytes(), 8);
+        let victims = d.take_spill_victims();
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].entry_name, "b");
     }
 }
