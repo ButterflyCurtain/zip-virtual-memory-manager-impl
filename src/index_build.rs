@@ -21,7 +21,8 @@
 //!   ここではメソッドコード由来の [`ProviderType`](crate::vmidx::ProviderType)
 //!   （標準 DEFLATE は `Deflate`）をそのまま記録する。
 
-use crate::archive::{Archive, ZipError};
+use crate::archive::{Archive, CdEntry, ZipError};
+use crate::provider::{builtin_provider, ProviderError};
 use crate::vmidx::{hash_cd_block, EntryRecord, VmidxBuilder, CD_HASH_SIZE};
 use std::fmt;
 
@@ -61,6 +62,8 @@ pub enum BuildError {
     /// エントリ名が UTF-8 でない。NAME HEAP は UTF-8 を前提とし、ルックアップも
     /// `&str` で行うため、現状は非 UTF-8 名を索引化できない（既知の制約）。
     NonUtf8Name(Vec<u8>),
+    /// EAGER 索引でチェックポイント生成（プロバイダの解凍走査）に失敗した。
+    Provider(ProviderError),
 }
 
 impl fmt::Display for BuildError {
@@ -70,6 +73,7 @@ impl fmt::Display for BuildError {
             BuildError::NonUtf8Name(name) => {
                 write!(f, "index build: non-UTF-8 entry name ({} bytes)", name.len())
             }
+            BuildError::Provider(e) => write!(f, "index build: {e}"),
         }
     }
 }
@@ -79,6 +83,7 @@ impl std::error::Error for BuildError {
         match self {
             BuildError::Zip(e) => Some(e),
             BuildError::NonUtf8Name(_) => None,
+            BuildError::Provider(e) => Some(e),
         }
     }
 }
@@ -89,47 +94,85 @@ impl From<ZipError> for BuildError {
     }
 }
 
-/// archive の Central Directory から完全な vmidx 像を組み立てて返す。
+/// archive の Central Directory から vmidx 像を組み立てて返す（チェックポイント
+/// 無し＝メタデータのみ）。チェックポイントをこの場で生成しないケース
+/// （構造的書き直し Section 6.3、LAZY の初期像など）に使う。EAGER 索引は
+/// [`build_vmidx_eager`]。
 ///
 /// 各 CD エントリにつき、メソッド・サイズ・`local_header_offset` をそのまま写し、
-/// 圧縮データ先頭は [`Archive::data_offset`]（必ずローカルヘッダを読む）で確定して
-/// `data_offset` に入れる。`name_hash` / `name_offset` / `name_len` /
-/// `chunk_head_offset` は [`VmidxBuilder::serialize`] がレイアウト確定時に計算する。
+/// 圧縮データ先頭は [`Archive::data_offset`]（必ずローカルヘッダを読む）で確定する。
 pub fn build_vmidx_image(archive: &Archive, params: &BuildParams) -> Result<Vec<u8>, BuildError> {
+    let mut builder = new_builder(archive, params);
+    for entry in archive.entries() {
+        let (name, record) = map_record(archive, entry)?;
+        builder.push(name, record, Vec::new());
+    }
+    Ok(builder.serialize())
+}
+
+/// EAGER 索引（設計 FIRST-OPEN の EAGER 戦略、IMPLEMENTATION_NOTES の M1）。
+/// 各エントリの圧縮ストリームを [`provider`](crate::provider) で走査して
+/// チェックポイントを生成し、像に含めて返す。プロバイダを持たない種別
+/// （STORE / 未対応）はチェックポイント無しで入る。
+///
+/// 1 エントリでもチェックポイント生成に失敗すると索引構築全体を
+/// [`BuildError::Provider`] で失敗させる（壊れエントリの単離＝当該のみ
+/// UNSUPPORTED 化は後段の改良）。
+pub fn build_vmidx_eager(archive: &Archive, params: &BuildParams) -> Result<Vec<u8>, BuildError> {
+    let mut builder = new_builder(archive, params);
+    for entry in archive.entries() {
+        let (name, record) = map_record(archive, entry)?;
+        let checkpoints = match builtin_provider(entry.provider_type) {
+            Some(provider) => {
+                let compressed = archive.entry_data(entry)?;
+                provider
+                    .build_checkpoints(compressed, entry.uncompressed_size, params.checkpoint_interval)
+                    .map_err(BuildError::Provider)?
+            }
+            None => Vec::new(),
+        };
+        builder.push(name, record, checkpoints);
+    }
+    Ok(builder.serialize())
+}
+
+/// fingerprint とレイアウトパラメータを設定した空のビルダ。
+fn new_builder(archive: &Archive, params: &BuildParams) -> VmidxBuilder {
     let mut builder = VmidxBuilder::new();
-    builder.flags = 0; // VMM_GENERATED は立てない（上のモジュールコメント参照）。
+    builder.flags = 0; // VMM_GENERATED は立てない（モジュールコメント参照）。
     builder.page_size = params.page_size;
     builder.checkpoint_interval = params.checkpoint_interval;
     builder.source_file_size = params.source_file_size;
     builder.source_inode = params.source_inode;
     builder.source_mtime_ns = params.source_mtime_ns;
     builder.source_cd_hash[..CD_HASH_SIZE].copy_from_slice(&hash_cd_block(archive.cd_block()));
+    builder
+}
 
-    for entry in archive.entries() {
-        let name = std::str::from_utf8(&entry.name)
-            .map_err(|_| BuildError::NonUtf8Name(entry.name.clone()))?;
-        let data_offset = archive.data_offset(entry)?;
-        let record = EntryRecord {
-            // serialize() が計算・確定する 4 フィールドは 0 のまま渡す。
-            name_hash: 0,
-            name_offset: 0,
-            name_len: 0,
-            chunk_head_offset: 0,
-            provider_type: entry.provider_type,
-            entry_flags: 0,
-            method_code: entry.method_code,
-            local_header_offset: entry.local_header_offset,
-            data_offset,
-            compressed_size: entry.compressed_size,
-            uncompressed_size: entry.uncompressed_size,
-            // 初回ビルドではチェックポイント無し。セッション中に蓄積される。
-            checkpoint_count: 0,
-            commit_count_for_entry: 0,
-        };
-        builder.push(name.to_owned(), record, Vec::new());
-    }
-
-    Ok(builder.serialize())
+/// 1 つの CD エントリを (name, EntryRecord) に写す（チェックポイント以外）。
+/// `name_hash` / `name_offset` / `name_len` / `chunk_head_offset` は
+/// [`VmidxBuilder::serialize`] がレイアウト確定時に設定するので 0 のまま。
+fn map_record(archive: &Archive, entry: &CdEntry) -> Result<(String, EntryRecord), BuildError> {
+    let name = std::str::from_utf8(&entry.name)
+        .map_err(|_| BuildError::NonUtf8Name(entry.name.clone()))?
+        .to_owned();
+    let data_offset = archive.data_offset(entry)?;
+    let record = EntryRecord {
+        name_hash: 0,
+        name_offset: 0,
+        name_len: 0,
+        chunk_head_offset: 0,
+        provider_type: entry.provider_type,
+        entry_flags: 0,
+        method_code: entry.method_code,
+        local_header_offset: entry.local_header_offset,
+        data_offset,
+        compressed_size: entry.compressed_size,
+        uncompressed_size: entry.uncompressed_size,
+        checkpoint_count: 0,
+        commit_count_for_entry: 0,
+    };
+    Ok((name, record))
 }
 
 #[cfg(test)]
