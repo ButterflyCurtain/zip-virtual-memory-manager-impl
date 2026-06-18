@@ -64,3 +64,29 @@ CRC-32C（Castagnoli）の実装として **`crc32c` クレート**を用いる�
 - fingerprint（`source_cd_hash`）と `name_hash` に必要な XXH3-128 / XXH3-64 は、
   該当処理を実装する段階で別途クレートを選定し、`0003` 以降で記録する。
 - 圧縮（zstd / DEFLATE）のクレート選定も同様に、archive レイヤ着手時に記録する。
+
+---
+
+## 0003. XXH3 実装に xxhash-rust クレートを採用
+
+- 日付: 2026-06-18
+- ステータス: 採用
+- 選択肢: xxhash-rust / twox-hash
+
+### 決定
+
+`name_hash`（XXH3-64）および将来の fingerprint `source_cd_hash`（XXH3-128）の
+実装として **`xxhash-rust` クレート（`xxh3` フィーチャ）**を用いる。
+
+### 理由
+
+- vmidx 仕様が `name_hash` に XXH3-64、`source_cd_hash` に XXH3-128 を指定。
+  両者を 1 クレートで賄える。
+- `xxhash-rust` は純 Rust 実装で C 依存がなく、`const`/ワンショット関数
+  （`xxh3_64` / `xxh3_128`）を提供しルックアップ経路から呼びやすい。
+- フィーチャゲートで XXH3 のみを有効化でき、依存範囲を絞れる。
+
+### 備考
+
+- 現状は `name_hash` 用に `xxh3_64` のみを使用。`xxh3_128`（fingerprint）は
+  open() の検証カスケードを実装する段階で使う。
