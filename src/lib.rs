@@ -11,5 +11,6 @@ pub mod archive;
 pub mod index_build;
 pub mod lock;
 pub mod page;
+pub mod provider;
 pub mod vmdirty;
 pub mod vmidx;
