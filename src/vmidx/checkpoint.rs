@@ -22,9 +22,12 @@ pub const CHUNK_HEADER_SIZE: usize = 32;
 const CHUNK_CRC_SIZE: usize = 4;
 
 /// DEFLATE のスライディングウィンドウスナップショット長。
-const DEFLATE_WINDOW_SIZE: usize = 32_768;
+pub const DEFLATE_WINDOW_SIZE: usize = 32_768;
 /// DEFLATE チェックポイント記録長（非圧縮ウィンドウ形式）。
-const DEFLATE_RECORD_SIZE: usize = 8 + 8 + DEFLATE_WINDOW_SIZE;
+/// offsets(16) + bits(1) + window(32768) = 32785。任意ビット境界からの再開
+/// （zran 方式）には端数ビット数が要るため、本実装は設計仕様の 32784B に
+/// `bits` を 1 バイト足した 32785B を用いる（設計仕様にも反映予定）。
+const DEFLATE_RECORD_SIZE: usize = 8 + 8 + 1 + DEFLATE_WINDOW_SIZE;
 /// DEFLATE_VMM チェックポイント記録長。
 const VMM_RECORD_SIZE: usize = 24;
 /// ZSTD チェックポイント記録長。
@@ -47,9 +50,16 @@ fn record_size(provider: ProviderType) -> Option<usize> {
 pub enum Checkpoint {
     /// 標準サードパーティ DEFLATE ストリーム。
     Deflate {
+        /// DEFLATE ストリーム内のバイト位置（端数ビットの「次」のバイト＝
+        /// zran の `here->in`）。`bits > 0` のとき実データは `compressed_offset - 1`
+        /// から prime して再開する。
         compressed_offset: u64,
         uncompressed_offset: u64,
-        /// スライディングウィンドウスナップショット（32 768 バイト）。
+        /// 再開地点の符号が始まる端数ビット数（0–7）。`inflatePrime` で直前
+        /// バイトの下位 `bits` ビットを再注入する（zran と同じ）。
+        bits: u8,
+        /// 直前の展開出力 32 768 バイト。`inflateSetDictionary` に渡す辞書で、
+        /// 圧縮ストリームの一部ではない。先頭が不足する場合は右詰めでゼロ埋め。
         window: Box<[u8; DEFLATE_WINDOW_SIZE]>,
     },
     /// VMM ネイティブ DEFLATE ブロック。ブロックごとに 1 チェックポイントで、
@@ -101,11 +111,13 @@ impl Checkpoint {
             Checkpoint::Deflate {
                 compressed_offset,
                 uncompressed_offset,
+                bits,
                 window,
             } => {
                 dst[0..8].copy_from_slice(&compressed_offset.to_le_bytes());
                 dst[8..16].copy_from_slice(&uncompressed_offset.to_le_bytes());
-                dst[16..16 + DEFLATE_WINDOW_SIZE].copy_from_slice(&window[..]);
+                dst[16] = *bits;
+                dst[17..17 + DEFLATE_WINDOW_SIZE].copy_from_slice(&window[..]);
             }
             Checkpoint::DeflateVmm {
                 compressed_offset,
@@ -132,10 +144,11 @@ impl Checkpoint {
         match provider {
             ProviderType::Deflate => {
                 let mut window = Box::new([0u8; DEFLATE_WINDOW_SIZE]);
-                window.copy_from_slice(&b[16..16 + DEFLATE_WINDOW_SIZE]);
+                window.copy_from_slice(&b[17..17 + DEFLATE_WINDOW_SIZE]);
                 Checkpoint::Deflate {
                     compressed_offset: rd_u64(b, 0),
                     uncompressed_offset: rd_u64(b, 8),
+                    bits: b[16],
                     window,
                 }
             }
@@ -327,6 +340,7 @@ mod tests {
         Checkpoint::Deflate {
             compressed_offset: uncompressed_offset / 2,
             uncompressed_offset,
+            bits: (uncompressed_offset % 8) as u8,
             window: Box::new([fill; DEFLATE_WINDOW_SIZE]),
         }
     }
@@ -334,7 +348,7 @@ mod tests {
     #[test]
     fn record_sizes_match_spec() {
         assert_eq!(CHUNK_HEADER_SIZE, 32);
-        assert_eq!(DEFLATE_RECORD_SIZE, 32_784);
+        assert_eq!(DEFLATE_RECORD_SIZE, 32_785);
         assert_eq!(VMM_RECORD_SIZE, 24);
         assert_eq!(ZSTD_RECORD_SIZE, 16);
     }

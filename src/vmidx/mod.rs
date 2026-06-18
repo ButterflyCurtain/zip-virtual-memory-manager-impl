@@ -35,7 +35,7 @@ mod table;
 
 pub use advisory::{Advisory, BLOCK_STATE_SIZE, BlockState, advisory_size, block_state_flags};
 pub use checkpoint::{
-    CHUNK_HEADER_SIZE, Checkpoint, CheckpointChunk, nearest_checkpoint,
+    CHUNK_HEADER_SIZE, Checkpoint, CheckpointChunk, DEFLATE_WINDOW_SIZE, nearest_checkpoint,
 };
 pub use entry::{EntryRecord, ProviderType};
 pub use file::{Vmidx, VmidxBuilder};
