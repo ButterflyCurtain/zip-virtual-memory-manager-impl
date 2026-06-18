@@ -17,6 +17,8 @@
 //!   目標オフセット以下で最も近いチェックポイントの探索
 //! - [`Advisory`] / [`BlockState`]: 性能ヒントの ADVISORY 領域の
 //!   encode/parse とサイズ計算（破棄しても正しさには影響しない）
+//! - [`check_fingerprint`] / [`SourceStat`]: ソース ZIP との指紋照合
+//!   （stat 段階から CD ハッシュ段階へ進む段階的判定）
 //!
 //! 全整数はリトルエンディアン、全オフセットはファイル先頭からのバイト
 //! オフセット。設計: docs `ZIP_Virtual_Memory_Manager_vmidx_Index_Spec`。
@@ -24,6 +26,7 @@
 mod advisory;
 mod checkpoint;
 mod entry;
+mod fingerprint;
 mod header;
 mod table;
 
@@ -32,6 +35,9 @@ pub use checkpoint::{
     CHUNK_HEADER_SIZE, Checkpoint, CheckpointChunk, nearest_checkpoint,
 };
 pub use entry::{EntryRecord, ProviderType};
+pub use fingerprint::{
+    CD_HASH_SIZE, FingerprintVerdict, SourceStat, check_fingerprint, hash_cd_block, refresh_header,
+};
 pub use header::Header;
 pub use table::{EntryIndex, EntryIndexBuilder, hash_name};
 
