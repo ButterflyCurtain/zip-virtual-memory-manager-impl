@@ -8,6 +8,7 @@
 //! 他は役割を示すスタブ。
 
 pub mod archive;
+pub mod commit;
 pub mod difflayer;
 pub mod disk;
 pub mod index_build;
