@@ -82,8 +82,7 @@ impl<'a> Mount<'a> {
     /// archive バイト列から EAGER 索引を構築して開く（vmidx が無い「コールド
     /// オープン」相当）。`params` の stat 値が fingerprint に入る。
     pub fn open(archive: &'a [u8], params: &BuildParams) -> Result<Mount<'a>, OpenError> {
-        let ar = Archive::parse(archive).map_err(OpenError::Zip)?;
-        let vmidx_image = build_vmidx_eager(&ar, params).map_err(OpenError::Build)?;
+        let (vmidx_image, _) = resolve_index(archive, None, params)?;
         Ok(Mount {
             archive,
             vmidx_image,
@@ -91,35 +90,17 @@ impl<'a> Mount<'a> {
     }
 
     /// 既存の vmidx 像を検証して開く（設計 Section 7 の open() カスケード）。
-    /// 構造（parse）と fingerprint を照合し、`Valid` / `ValidStale` ならその像を
-    /// 使い、`Invalid` または parse 失敗なら EAGER で再構築する（「どの失敗でも
-    /// 応答は破棄して再構築」）。
+    /// `Valid` / `ValidStale` ならその像を使い、`Invalid` または parse 失敗なら
+    /// EAGER で再構築する（「どの失敗でも応答は破棄して再構築」）。
     pub fn open_with_index(
         archive: &'a [u8],
         vmidx_image: Vec<u8>,
         params: &BuildParams,
     ) -> Result<Mount<'a>, OpenError> {
-        let ar = Archive::parse(archive).map_err(OpenError::Zip)?;
-        let live = SourceStat {
-            file_size: params.source_file_size,
-            inode: params.source_inode,
-            mtime_ns: params.source_mtime_ns,
-            cd_hash: hash_cd_block(ar.cd_block()),
-        };
-        let usable = match Vmidx::parse(&vmidx_image) {
-            Ok(v) => !matches!(v.check_fingerprint(&live), FingerprintVerdict::Invalid),
-            Err(_) => false,
-        };
-        if usable {
-            return Ok(Mount {
-                archive,
-                vmidx_image,
-            });
-        }
-        let rebuilt = build_vmidx_eager(&ar, params).map_err(OpenError::Build)?;
+        let (vmidx_image, _) = resolve_index(archive, Some(vmidx_image), params)?;
         Ok(Mount {
             archive,
-            vmidx_image: rebuilt,
+            vmidx_image,
         })
     }
 
@@ -130,34 +111,76 @@ impl<'a> Mount<'a> {
 
     /// エントリ `path` の展開ストリーム `[offset, offset + len)` を読む。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
-        let vmidx = Vmidx::parse(&self.vmidx_image).map_err(ReadError::Vmidx)?;
-        let (_, record) = vmidx
-            .lookup(path)
-            .map_err(ReadError::Vmidx)?
-            .ok_or(ReadError::NotFound)?;
-        let provider =
-            builtin_provider(record.provider_type).ok_or(ReadError::Unsupported(record.provider_type))?;
-        let nearest = vmidx
-            .nearest_checkpoint(&record, offset)
-            .map_err(ReadError::Vmidx)?;
-
-        let start = record.data_offset as usize;
-        let end = start
-            .checked_add(record.compressed_size as usize)
-            .filter(|&e| e <= self.archive.len())
-            .ok_or(ReadError::DataOutOfRange)?;
-        let compressed = &self.archive[start..end];
-
-        provider
-            .read_range(
-                compressed,
-                nearest.as_ref(),
-                offset,
-                len,
-                record.uncompressed_size,
-            )
-            .map_err(ReadError::Provider)
+        read_entry(self.archive, &self.vmidx_image, path, offset, len)
     }
+}
+
+/// open カスケード本体（設計 Section 7）。既存 vmidx 像があれば parse +
+/// fingerprint を照合し、使えるならそのまま、`Invalid` / parse 失敗なら EAGER で
+/// 再構築する。戻り値は (採用する像, 再構築したか)。ファイル I/O 層は再構築フラグ
+/// を見て vmidx.tmp 書き出しの要否を決める。
+pub fn resolve_index(
+    archive: &[u8],
+    existing: Option<Vec<u8>>,
+    params: &BuildParams,
+) -> Result<(Vec<u8>, bool), OpenError> {
+    let ar = Archive::parse(archive).map_err(OpenError::Zip)?;
+    if let Some(bytes) = existing {
+        let live = SourceStat {
+            file_size: params.source_file_size,
+            inode: params.source_inode,
+            mtime_ns: params.source_mtime_ns,
+            cd_hash: hash_cd_block(ar.cd_block()),
+        };
+        let usable = match Vmidx::parse(&bytes) {
+            Ok(v) => !matches!(v.check_fingerprint(&live), FingerprintVerdict::Invalid),
+            Err(_) => false,
+        };
+        if usable {
+            return Ok((bytes, false));
+        }
+    }
+    let rebuilt = build_vmidx_eager(&ar, params).map_err(OpenError::Build)?;
+    Ok((rebuilt, true))
+}
+
+/// vmidx 像とソース ZIP バイト列から 1 エントリの `[offset, offset + len)` を読む。
+/// `archive` と `vmidx_image` はそれぞれ呼び出し側が所有（mmap / Vec）し、ここでは
+/// 借用するだけ。
+pub fn read_entry(
+    archive: &[u8],
+    vmidx_image: &[u8],
+    path: &str,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, ReadError> {
+    let vmidx = Vmidx::parse(vmidx_image).map_err(ReadError::Vmidx)?;
+    let (_, record) = vmidx
+        .lookup(path)
+        .map_err(ReadError::Vmidx)?
+        .ok_or(ReadError::NotFound)?;
+    let provider =
+        builtin_provider(record.provider_type).ok_or(ReadError::Unsupported(record.provider_type))?;
+    let nearest = vmidx
+        .nearest_checkpoint(&record, offset)
+        .map_err(ReadError::Vmidx)?;
+
+    let start = record.data_offset as usize;
+    let end = start
+        .checked_add(record.compressed_size as usize)
+        .filter(|&e| e <= archive.len())
+        .ok_or(ReadError::DataOutOfRange)?;
+    let compressed = &archive[start..end];
+
+    provider
+        .read_range(
+            compressed,
+            nearest.as_ref(),
+            offset,
+            len,
+            record.uncompressed_size,
+        )
+        .map_err(ReadError::Provider)
 }
 
 #[cfg(test)]
