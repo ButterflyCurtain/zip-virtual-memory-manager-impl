@@ -8,6 +8,7 @@
 //! 他は役割を示すスタブ。
 
 pub mod archive;
+pub mod disk;
 pub mod index_build;
 pub mod lock;
 pub mod mount;

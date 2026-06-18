@@ -133,3 +133,36 @@ C zlib と同一に書ける。C ツールチェーン不要でどこでもビ�
   （4 GiB 超で wrap）。圧縮オフセットは自前で `in_pos - avail_in` から算出して
   回避している。
 - unsafe FFI は `provider::deflate::RawInflater`（RAII で `inflateEnd`）に隔離する。
+
+---
+
+## 0005. ファイル mmap に memmap2 を採用
+
+- 日付: 2026-06-18
+- ステータス: 採用
+- 選択肢: memmap2 / ファイル全読み（`std::fs::read` で `Vec<u8>`）/ 自前 mmap FFI
+
+### 決定
+
+ディスク上の `archive.zip` のメモリマッピングに **`memmap2`** を用いる
+（`disk::FileMount`）。
+
+### 理由
+
+- 本プロジェクトの中核は「ZIP を仮想メモリのバッキングストアとして扱う」ことで、
+  アーカイブは OS のページングで遅延ロードしたい。全読みは大きなアーカイブで
+  RAM を食い、設計の前提（mmap + `MADV_RANDOM`）に反する。
+- `memmap2` は Windows / Unix 双方に対応し、C ツールチェーン不要。0001 で想定
+  していた mmap ライブラリ。
+- 設計方針「mmap は外から渡す」に沿い、mmap の所有は `disk` 層に閉じ、`mount` /
+  `vmidx` / `archive` は `&[u8]` だけを見る。`Mmap::map` は本質的に unsafe
+  （外部書き換えで観測内容が変わりうる）で、read-only マウントとして扱い変更検出は
+  fingerprint / ESTALE に委ねる。
+
+### 備考
+
+- 当面 mmap するのは `archive.zip` のみ。サイドカー `vmidx` は `Vec<u8>` で読み
+  （無効時は再構築して別 `Vec` になる）、`vmidx` 自体の mmap（`MADV_RANDOM`、
+  巨大な標準 DEFLATE 索引向け）は後段の最適化。
+- Windows の安定 inode（`MetadataExt::file_index`）は nightly 限定のため、stable
+  では inode を 0 とする。fingerprint の確定要因は cd_hash なので影響しない。
