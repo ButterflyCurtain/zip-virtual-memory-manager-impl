@@ -15,15 +15,19 @@
 //!   組み立てと、`name_hash` 二分探索による `path` ルックアップ
 //! - [`CheckpointChunk`] / [`Checkpoint`]: CHECKPOINT CHUNK の decode と、
 //!   目標オフセット以下で最も近いチェックポイントの探索
+//! - [`Advisory`] / [`BlockState`]: 性能ヒントの ADVISORY 領域の
+//!   encode/parse とサイズ計算（破棄しても正しさには影響しない）
 //!
 //! 全整数はリトルエンディアン、全オフセットはファイル先頭からのバイト
 //! オフセット。設計: docs `ZIP_Virtual_Memory_Manager_vmidx_Index_Spec`。
 
+mod advisory;
 mod checkpoint;
 mod entry;
 mod header;
 mod table;
 
+pub use advisory::{Advisory, BLOCK_STATE_SIZE, BlockState, advisory_size, block_state_flags};
 pub use checkpoint::{
     CHUNK_HEADER_SIZE, Checkpoint, CheckpointChunk, nearest_checkpoint,
 };
