@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 crc32c = "0.6"
+getrandom = "0.2"
 libz-rs-sys = "0.6.3"
 memmap2 = "0.9.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

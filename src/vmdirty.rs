@@ -22,6 +22,11 @@
 //! 全整数はリトルエンディアン、全オフセットはファイル先頭から。CRC は全フィールド
 //! **CRC-32C（Castagnoli）**。commit のエントリ CRC（ISO-HDLC）とは別物。
 
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 /// FILE HEADER の固定長（バイト）。
 pub const HEADER_SIZE: usize = 88;
 /// COMMIT MARKER の固定長（バイト）。
@@ -545,6 +550,129 @@ pub fn read_vmdirty(bytes: &[u8]) -> RecoveryResult {
     }
 }
 
+/// 新しい generation_id を暗号論的乱数から引く（Section 6、UUIDv4 構造）。
+/// セッションごとに一意で、連番ではない。version=4・variant ビットを固定する。
+pub fn new_generation_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    getrandom::getrandom(&mut id).expect("OS CSPRNG");
+    id[6] = (id[6] & 0x0F) | 0x40; // version = 4
+    id[8] = (id[8] & 0x3F) | 0x80; // variant = 10xx
+    id
+}
+
+/// 現在の壁時計をエポックからのナノ秒で（ヘッダ `created_at_ns` 用、情報目的）。
+pub fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// spill 書き込みの durability モード（Section 4 fsync policy）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPolicy {
+    /// `--sync-spill`（既定）。各レコードは復帰前に durable。設計の O_DSYNC を
+    /// 移植性のため明示 `sync_data()` で近似する（書き込みごとに 1 回）。
+    Sync,
+    /// `--lazy-spill`。レコードは OS ページキャッシュに溜め、COMMIT MARKER の
+    /// ときだけ `fdatasync`。spill 後・次の commit 前のクラッシュは in-flight
+    /// ページを失う（アプリが再試行できる前提）。
+    Lazy,
+}
+
+/// vmdirty ジャーナルへの追記専用ライタ（設計 Section 7 `VmdirtyWriter`）。
+///
+/// FILE HEADER を書いてから DATA / METADATA / COMMIT MARKER を追記する。各レコードは
+/// torn-write 窓を狭めるため **1 回の `write_all` で**書き出す（設計どおり「1
+/// レコード = 1 write」）。`sequence_num` は 1 始まりで DATA / METADATA を跨いで
+/// 単調増加し（I-5）、generation_id でセッションを刻む。
+///
+/// `Sync` モードでは追記ごとに `sync_data()`、`Lazy` モードでは COMMIT MARKER の
+/// ときだけ `sync_data()` する。設計は sync モードを `O_DSYNC` で表現するが、本実装は
+/// 移植性（Windows / Unix）のため明示 `sync_data()` で同じ durability を満たす。
+pub struct VmdirtyWriter {
+    file: File,
+    generation_id: [u8; 16],
+    next_seq: u64,
+    sync: SyncPolicy,
+}
+
+impl VmdirtyWriter {
+    /// `path` に新しい vmdirty を作る（既存は truncate）。`header` の
+    /// generation_id（通常 [`new_generation_id`]）でセッションを刻む。FILE HEADER を
+    /// 書いて durable にしてから返す。
+    pub fn create(path: &Path, header: &Header, sync: SyncPolicy) -> io::Result<VmdirtyWriter> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(&header.encode())?;
+        file.sync_data()?;
+        Ok(VmdirtyWriter {
+            file,
+            generation_id: header.generation_id,
+            next_seq: 1,
+            sync,
+        })
+    }
+
+    /// このセッションの generation_id。
+    pub fn generation_id(&self) -> [u8; 16] {
+        self.generation_id
+    }
+
+    /// 直近に割り当てた `sequence_num`（まだ 1 件も書いていなければ 0）。
+    /// COMMIT MARKER の `commit_sequence` に使える。
+    pub fn last_sequence(&self) -> u64 {
+        self.next_seq - 1
+    }
+
+    /// DATA RECORD を 1 件追記し、割り当てた `sequence_num` を返す（dirty ページが
+    /// Tier 1 から Tier 2 へ spill されるたびに 1 件）。
+    pub fn append_data_record(
+        &mut self,
+        entry_name: &str,
+        page_index: u64,
+        data: &[u8],
+    ) -> io::Result<u64> {
+        let seq = self.next_seq;
+        let rec = encode_data_record(&self.generation_id, seq, entry_name, page_index, data);
+        self.write_record(&rec)?;
+        self.next_seq += 1;
+        Ok(seq)
+    }
+
+    /// METADATA RECORD を 1 件追記し、割り当てた `sequence_num` を返す
+    /// （CREATE / REMOVE / RESIZE / RENAME。DATA と同じ連番空間）。
+    pub fn append_metadata(&mut self, entry_name: &str, op: &MetaOp) -> io::Result<u64> {
+        let seq = self.next_seq;
+        let rec = encode_metadata_record(&self.generation_id, seq, entry_name, op);
+        self.write_record(&rec)?;
+        self.next_seq += 1;
+        Ok(seq)
+    }
+
+    /// COMMIT MARKER を追記して `fdatasync` する（flush の境界）。`commit_sequence`
+    /// はこの境界が含む最後のレコードの `sequence_num`、`page_count` はこの時点の
+    /// dirty ページ総数。書き終えると Sync/Lazy を問わず durable。
+    pub fn append_commit_marker(&mut self, commit_sequence: u64, page_count: u64) -> io::Result<()> {
+        let marker = encode_commit_marker(&self.generation_id, commit_sequence, page_count);
+        self.file.write_all(&marker)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// 1 レコードを 1 回の `write_all` で書き、Sync モードなら `sync_data`。
+    fn write_record(&mut self, rec: &[u8]) -> io::Result<()> {
+        self.file.write_all(rec)?;
+        if self.sync == SyncPolicy::Sync {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
 /// エントリ名のデコード。不正 UTF-8 は Section 2 どおり置換（U+FFFD）する。
 fn decode_name(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
@@ -818,6 +946,110 @@ mod tests {
         assert_eq!(r.uncommitted_ops.len(), 1);
         assert_eq!(r.uncommitted_ops[0].sequence, 3);
         assert_eq!(r.valid_through_seq, 3);
+    }
+
+    /// テスト用の一時ファイルパス（Drop で削除）。
+    struct TempFile(std::path::PathBuf);
+    impl TempFile {
+        fn new(tag: &str) -> TempFile {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "zipvmm_vmdirty_{}_{}_{}",
+                std::process::id(),
+                tag,
+                n
+            ));
+            TempFile(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn writer_header(gen_id: [u8; 16]) -> Header {
+        Header {
+            flags: 0,
+            generation_id: gen_id,
+            source_file_size: 4096,
+            source_inode: 7,
+            source_cd_hash: [0xAB; CD_HASH_SIZE],
+            created_at_ns: now_ns(),
+            page_size: 4096,
+        }
+    }
+
+    #[test]
+    fn generation_id_has_uuid_v4_bits_and_varies() {
+        let a = new_generation_id();
+        let b = new_generation_id();
+        assert_eq!(a[6] & 0xF0, 0x40, "version nibble = 4");
+        assert_eq!(a[8] & 0xC0, 0x80, "variant bits = 10");
+        assert_ne!(a, b, "二つの世代 ID は（ほぼ確実に）異なる");
+    }
+
+    #[test]
+    fn writer_roundtrips_through_recovery() {
+        let tf = TempFile::new("rt");
+        let gen_id = new_generation_id();
+        let page = vec![0x7Eu8; 4096];
+
+        let mut w = VmdirtyWriter::create(tf.path(), &writer_header(gen_id), SyncPolicy::Sync)
+            .expect("create");
+        assert_eq!(w.generation_id(), gen_id);
+        assert_eq!(w.last_sequence(), 0);
+
+        let s1 = w.append_data_record("a.bin", 0, &page).unwrap();
+        let s2 = w.append_metadata("a.bin", &MetaOp::Resize { new_size: 4096 }).unwrap();
+        assert_eq!((s1, s2), (1, 2));
+        w.append_commit_marker(w.last_sequence(), 1).unwrap();
+        // commit 後に追記した分は uncommitted になる。
+        let s3 = w.append_data_record("b.bin", 5, &page).unwrap();
+        assert_eq!(s3, 3);
+        drop(w);
+
+        let bytes = std::fs::read(tf.path()).unwrap();
+        let r = read_vmdirty(&bytes);
+        assert_eq!(r.status, RecoveryStatus::Ok);
+        assert_eq!(r.truncation_point, None);
+        assert_eq!(r.generation_id, gen_id);
+        assert_eq!(r.last_commit_seq, 2);
+        // committed: data seq1 + op seq2。
+        assert_eq!(r.committed_pages.len(), 1);
+        assert_eq!(r.committed_pages[0].sequence, 1);
+        assert_eq!(r.committed_ops.len(), 1);
+        assert_eq!(r.committed_ops[0].op, MetaOp::Resize { new_size: 4096 });
+        // uncommitted: data seq3。
+        assert_eq!(r.uncommitted_pages.len(), 1);
+        assert_eq!(r.uncommitted_pages[0].entry_name, "b.bin");
+        assert_eq!(r.uncommitted_pages[0].sequence, 3);
+        assert_eq!(r.valid_through_seq, 3);
+    }
+
+    #[test]
+    fn lazy_writer_also_produces_readable_journal() {
+        let tf = TempFile::new("lazy");
+        let gen_id = new_generation_id();
+        let page = vec![0x11u8; 64];
+        let mut w = VmdirtyWriter::create(tf.path(), &writer_header(gen_id), SyncPolicy::Lazy)
+            .expect("create");
+        w.append_data_record("x", 0, &page).unwrap();
+        w.append_data_record("x", 1, &page).unwrap();
+        w.append_commit_marker(w.last_sequence(), 2).unwrap();
+        drop(w);
+
+        let bytes = std::fs::read(tf.path()).unwrap();
+        let r = read_vmdirty(&bytes);
+        assert_eq!(r.status, RecoveryStatus::Ok);
+        assert_eq!(r.last_commit_seq, 2);
+        assert_eq!(r.committed_pages.len(), 2);
+        assert!(r.uncommitted_pages.is_empty());
     }
 
     #[test]

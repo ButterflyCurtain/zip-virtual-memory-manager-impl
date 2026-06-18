@@ -206,3 +206,43 @@ I/O・spill ポリシー・generation_id 生成・compaction は後続に分け�
 - 残り（後続増分）: `VmdirtyWriter`（O_DSYNC / 単一 write / fdatasync）、Tier 1↔
   Tier 2 の FIFO spill と `dirty_limit`、generation_id の CSPRNG 生成（getrandom
   等、依存追加時に 0007 で記録）、回復決定木の mount/disk 配線、compaction。
+
+---
+
+## 0007. generation_id の生成に getrandom を採用し、O_DSYNC を `sync_data()` で近似
+
+- 日付: 2026-06-19
+- ステータス: 採用
+- 選択肢: generation_id 乱数源 = getrandom / rand / 自前 OS 呼び出し。
+  durability = O_DSYNC をプラットフォーム別 FFI で再現 / 明示 `sync_data()` で近似
+
+### 決定
+
+vmdirty の `VmdirtyWriter`（Section 7）を実装するにあたり:
+
+- **generation_id（128bit UUIDv4、Section 6）の乱数源に `getrandom`** を用いる。
+- **sync-spill モードの durability は `File::sync_data()` の明示呼び出しで表現**する
+  （設計の `O_DSYNC` を移植性のため近似）。各 DATA/METADATA レコードを 1 回の
+  `write_all` で書いた直後に `sync_data()`、COMMIT MARKER は常に `sync_data()`。
+
+### 理由
+
+- generation_id は「セッションごとに一意・連番でない・推測不能」が要件で、設計が
+  CSPRNG を明示する（Section 6）。`getrandom` は OS のエントロピー源を薄く呼ぶ
+  だけの最小クレートで、`rand` のような分布生成器は要らない。version=4 / variant
+  ビットは自前で立てる（UUID クレートも不要）。
+- `O_DSYNC` 相当を Windows / Unix で揃えるには FFI（`FILE_FLAG_WRITE_THROUGH` /
+  `O_DSYNC`）が要るが、durability の本質は「レコード復帰前にディスクに到達して
+  いること」。書き込み直後の `sync_data()` で同じ保証が立ち、設計の
+  「crash-before/after」テストオラクル（IMPLEMENTATION_NOTES）も満たせる。本リポは
+  「純 Rust を基本に、必要な所だけ C へ」方針（0004）で、ここは FFI を避けられる。
+
+### 備考
+
+- `sync_data()`（≒ `fdatasync`）の **失敗は retryable ではない**（fsyncgate）。
+  上位で ERROR 状態に倒す配線は回復決定木の増分で入れる。現状の `VmdirtyWriter` は
+  `io::Result` を素通しするだけ。
+- IMPLEMENTATION_NOTES が指す **rename 後の親ディレクトリ fsync**（compaction /
+  commit の原子性 durability）はまだ。Unix 限定の後続課題として残す。
+- 依存連番: 0001 Rust / 0002 crc32c / 0003 xxhash-rust / 0004 libz-rs-sys /
+  0005 memmap2 / **0007 getrandom**。
