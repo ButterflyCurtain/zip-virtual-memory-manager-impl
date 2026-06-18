@@ -1,0 +1,32 @@
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Build output
+target/
+build/
+out/
+bin/
+*.class
+
+# Gradle
+.gradle/
+
+# Maven
+.mvn/
+!.mvn/wrapper/maven-wrapper.jar
+
+# Logs / temp
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 整理前ファイルの一時退避場所
+_archive/
+
+# 捨て物
+_rubbish/
