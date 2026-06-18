@@ -1,29 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
 # IDE
 .idea/
-*.iml
 .vscode/
-
-# Build output
-target/
-build/
-out/
-bin/
-*.class
-
-# Gradle
-.gradle/
-
-# Maven
-.mvn/
-!.mvn/wrapper/maven-wrapper.jar
-
-# Logs / temp
-*.log
-*.tmp
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
 
 # 整理前ファイルの一時退避場所
 _archive/
