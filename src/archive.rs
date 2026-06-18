@@ -11,6 +11,8 @@
 //!   [`ZipError::Unsupported`]）
 //! - [`Archive::cd_block`]: fingerprint 用の Central Directory バイト列の特定
 //!   （`vmidx::hash_cd_block` に渡す対象）
+//! - [`Archive::data_offset`] / [`Archive::entry_data`]: ローカルヘッダを読んで
+//!   圧縮データ先頭オフセットを確定し、圧縮データバイト列を取り出す
 //!
 //! 全整数はリトルエンディアン。設計: docs `ZIP_Virtual_Memory_Manager`
 //! および `..._Diff_Layer_Pressure_Integrity_Detection`（cd_hash の定義）。
@@ -22,11 +24,15 @@ use std::fmt;
 const EOCD_SIG: u32 = 0x0605_4b50;
 /// Central Directory ファイルヘッダのシグネチャ。
 const CDFH_SIG: u32 = 0x0201_4b50;
+/// ローカルファイルヘッダのシグネチャ。
+const LFH_SIG: u32 = 0x0403_4b50;
 
 /// EOCD レコードの最小長（可変長コメントを除く固定部）。
 const EOCD_MIN_SIZE: usize = 22;
 /// Central Directory ファイルヘッダの固定部の長さ。
 const CDFH_FIXED_SIZE: usize = 46;
+/// ローカルファイルヘッダの固定部の長さ。
+const LFH_FIXED_SIZE: usize = 30;
 /// ZIP のフィールドが Zip64 の実値を別所に持つことを示す 32 ビット番兵。
 const ZIP64_U32_SENTINEL: u32 = 0xFFFF_FFFF;
 /// 同上の 16 ビット番兵（エントリ数など）。
@@ -151,6 +157,36 @@ impl<'a> Archive<'a> {
         let end = start + self.cd_size as usize;
         &self.data[start..end]
     }
+
+    /// 圧縮データ先頭のアーカイブ内オフセットを算出する。
+    ///
+    /// CD の extra field 長とローカルヘッダの extra field 長は一致しないこと
+    /// があるため、必ずローカルファイルヘッダを読んで確定する（CD の値からの
+    /// 推測はしない）。`vmidx` の `EntryRecord::data_offset` に入る値。
+    pub fn data_offset(&self, entry: &CdEntry) -> Result<u64, ZipError> {
+        let lho = entry.local_header_offset as usize;
+        let h = self.data.get(lho..).ok_or(ZipError::Truncated)?;
+        if rd_u32(h, 0)? != LFH_SIG {
+            return Err(ZipError::BadSignature);
+        }
+        let name_len = rd_u16(h, 26)? as usize;
+        let extra_len = rd_u16(h, 28)? as usize;
+        let data_off = lho + LFH_FIXED_SIZE + name_len + extra_len;
+        let end = data_off
+            .checked_add(entry.compressed_size as usize)
+            .ok_or(ZipError::Truncated)?;
+        if end > self.data.len() {
+            return Err(ZipError::Truncated);
+        }
+        Ok(data_off as u64)
+    }
+
+    /// エントリの圧縮データバイト列を返す（`compressed_size` バイト）。
+    /// STORE の直接読みや、DEFLATE/Zstd デコーダへの入力に使う。
+    pub fn entry_data(&self, entry: &CdEntry) -> Result<&'a [u8], ZipError> {
+        let off = self.data_offset(entry)? as usize;
+        Ok(&self.data[off..off + entry.compressed_size as usize])
+    }
 }
 
 /// EOCD レコードの先頭オフセットを末尾から探索する。コメント長を考慮し、
@@ -267,10 +303,16 @@ mod tests {
 
         /// STORE エントリを 1 件追加する（LFH + データ。CD レコードは後で連結）。
         fn add_store(&mut self, name: &str, data: &[u8]) -> &mut Self {
+            self.add_store_lfh_extra(name, data, b"")
+        }
+
+        /// STORE エントリを追加するが、ローカルヘッダだけに extra field を持た
+        /// せる（CD 側は extra なし）。data_offset 算出が LFH を読むことの検証用。
+        fn add_store_lfh_extra(&mut self, name: &str, data: &[u8], lfh_extra: &[u8]) -> &mut Self {
             let lho = self.bytes.len() as u32;
             let name_b = name.as_bytes();
             // ローカルファイルヘッダ。
-            push_u32(&mut self.bytes, 0x0403_4b50);
+            push_u32(&mut self.bytes, LFH_SIG);
             push_u16(&mut self.bytes, 20); // version needed
             push_u16(&mut self.bytes, 0); // flags
             push_u16(&mut self.bytes, 0); // method = STORE
@@ -280,8 +322,9 @@ mod tests {
             push_u32(&mut self.bytes, data.len() as u32); // comp size
             push_u32(&mut self.bytes, data.len() as u32); // uncomp size
             push_u16(&mut self.bytes, name_b.len() as u16);
-            push_u16(&mut self.bytes, 0); // extra len
+            push_u16(&mut self.bytes, lfh_extra.len() as u16); // extra len
             self.bytes.extend_from_slice(name_b);
+            self.bytes.extend_from_slice(lfh_extra);
             self.bytes.extend_from_slice(data);
 
             // Central Directory ファイルヘッダ。
@@ -380,6 +423,31 @@ mod tests {
         let junk = vec![0u8; 100];
         assert!(matches!(Archive::parse(&junk), Err(ZipError::NotZip)));
         assert!(matches!(Archive::parse(b"short"), Err(ZipError::NotZip)));
+    }
+
+    #[test]
+    fn resolves_data_offset_and_reads_store_payload() {
+        let zip = two_entry_zip();
+        let ar = Archive::parse(&zip).expect("valid zip parses");
+        let e = ar.entries().to_vec();
+        // 最初のエントリ: lho=0, LFH 固定 30 + 名前 9 + extra 0 = 39。
+        assert_eq!(ar.data_offset(&e[0]).unwrap(), 39);
+        assert_eq!(ar.entry_data(&e[0]).unwrap(), b"hi");
+        assert_eq!(ar.entry_data(&e[1]).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn data_offset_honors_local_header_extra() {
+        // CD には extra を載せず、LFH にだけ 6 バイトの extra を持たせる。
+        let mut f = ZipFixture::new();
+        f.add_store_lfh_extra("x.bin", b"DATA", &[1, 2, 3, 4, 5, 6]);
+        let zip = f.finish(b"");
+        let ar = Archive::parse(&zip).expect("valid zip parses");
+        let e = ar.entries().to_vec();
+        // CD の extra(0) を信じると 30+5=35 になるが、正しくは LFH extra(6) を
+        // 足した 30+5+6=41。
+        assert_eq!(ar.data_offset(&e[0]).unwrap(), 41);
+        assert_eq!(ar.entry_data(&e[0]).unwrap(), b"DATA");
     }
 
     #[test]
