@@ -4,13 +4,11 @@
 //! 設計仕様は別リポジトリを参照:
 //! <https://github.com/ButterflyCurtain/zip-virtual-memory-manager>
 //!
-//! 現状はスケルトンのみ。モジュール構成は設計の確定にあわせて追加していく。
+//! モジュール構成は設計の章立てに対応する。現状は `vmidx` のみ実装、
+//! 他は役割を示すスタブ。
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        // クレートがビルド・テストできることの最小確認。
-        assert!(true);
-    }
-}
+pub mod archive;
+pub mod lock;
+pub mod page;
+pub mod vmdirty;
+pub mod vmidx;
