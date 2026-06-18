@@ -22,8 +22,10 @@
 //! 圧縮データを取り出し vmidx から最近チェックポイントを引く配線は読み取り層
 //! （マウント）の責務。
 
+mod deflate;
 mod store;
 
+pub use deflate::DeflateProvider;
 pub use store::StoreProvider;
 
 use crate::vmidx::{Checkpoint, ProviderType};
@@ -106,15 +108,12 @@ pub trait CompressionProvider {
 
 /// `ProviderType` に対応する組み込みプロバイダを返す。未対応種別は `None`。
 ///
-/// 現状は STORE のみ。DEFLATE / DEFLATE_VMM / Zstd は解凍依存の追加とあわせて
-/// 順次足す。
+/// STORE と標準 DEFLATE を実装済み。DEFLATE_VMM / Zstd は順次足す。
 pub fn builtin_provider(pt: ProviderType) -> Option<Box<dyn CompressionProvider>> {
     match pt {
         ProviderType::Store => Some(Box::new(StoreProvider)),
-        ProviderType::Deflate
-        | ProviderType::DeflateVmm
-        | ProviderType::Zstd
-        | ProviderType::Unsupported => None,
+        ProviderType::Deflate => Some(Box::new(DeflateProvider)),
+        ProviderType::DeflateVmm | ProviderType::Zstd | ProviderType::Unsupported => None,
     }
 }
 

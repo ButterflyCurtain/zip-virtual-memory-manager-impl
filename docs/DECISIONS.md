@@ -90,3 +90,46 @@ CRC-32C（Castagnoli）の実装として **`crc32c` クレート**を用いる�
 
 - 現状は `name_hash` 用に `xxh3_64` のみを使用。`xxh3_128`（fingerprint）は
   open() の検証カスケードを実装する段階で使う。
+
+---
+
+## 0004. DEFLATE 解凍に libz-rs-sys（zlib-rs）を採用
+
+- 日付: 2026-06-18
+- ステータス: 採用
+- 選択肢: libz-rs-sys（zlib-rs, 純Rust）/ libz-sys（C zlib）/ flate2（安全API）/ 自前 inflate
+
+### 決定
+
+標準 DEFLATE プロバイダの解凍に **`libz-rs-sys`（zlib-rs）** を用いる。
+
+### 背景・理由
+
+DEFLATE の任意地点からの再開（seek index の本体）は zlib の `zran.c` 方式が
+枯れた正攻法で、3 つのプリミティブを要する:
+
+- `inflateInit2(strm, -15)`（raw inflate、ZIP は zlib ヘッダ無し）
+- `inflatePrime(bits, value)`（DEFLATE はビットストリームでブロックがバイト
+  境界に揃わないため、再開地点の端数ビットを再注入する）
+- `inflateSetDictionary(window 32KB)`（直前 32 KB の展開出力を辞書として復元）
+
+`flate2` の安全 API はこのうち `prime` / `set_dictionary` を露出しておらず、
+純 Rust の既存クレートに信頼できる中途再開の実装は無い。方針としては
+「純 Rust を基本に、C の方が良い実装になる部分は C に振り切る」を採り、本件は
+zlib 互換 API が必要と判断した。
+
+採用した `libz-rs-sys` は zlib の C API を **純 Rust（zlib-rs）で**実装したもので、
+`inflatePrime` / `inflateSetDictionary` / `inflateMark` まで揃い、zran のコードを
+C zlib と同一に書ける。C ツールチェーン不要でどこでもビルドでき、メモリ安全。
+
+### 備考（libz-sys を見送った理由）
+
+- 本物の C zlib（`libz-sys`）も候補だったが、当環境（`x86_64-pc-windows-gnu`）の
+  MSYS2 gcc で cc-rs のコンパイラ検出が落ちてビルドできず、MSVC ターゲットへの
+  切り替えは過剰と判断した。`libz-rs-sys` が同一の zran 能力をより少ない摩擦で
+  提供するため、現時点ではそちらを優先する。将来 C zlib 固有の最適化が要れば
+  再評価する。
+- `total_in` / `total_out` は zlib ABI の `c_ulong` で Windows では 32 ビット
+  （4 GiB 超で wrap）。圧縮オフセットは自前で `in_pos - avail_in` から算出して
+  回避している。
+- unsafe FFI は `provider::deflate::RawInflater`（RAII で `inflateEnd`）に隔離する。
