@@ -13,14 +13,20 @@
 //! - [`Header`] / [`EntryRecord`]: 固定幅構造の encode/decode と CRC-32C 検証
 //! - [`EntryIndexBuilder`] / [`EntryIndex`]: NAME HEAP とエントリテーブルの
 //!   組み立てと、`name_hash` 二分探索による `path` ルックアップ
+//! - [`CheckpointChunk`] / [`Checkpoint`]: CHECKPOINT CHUNK の decode と、
+//!   目標オフセット以下で最も近いチェックポイントの探索
 //!
 //! 全整数はリトルエンディアン、全オフセットはファイル先頭からのバイト
 //! オフセット。設計: docs `ZIP_Virtual_Memory_Manager_vmidx_Index_Spec`。
 
+mod checkpoint;
 mod entry;
 mod header;
 mod table;
 
+pub use checkpoint::{
+    CHUNK_HEADER_SIZE, Checkpoint, CheckpointChunk, nearest_checkpoint,
+};
 pub use entry::{EntryRecord, ProviderType};
 pub use header::Header;
 pub use table::{EntryIndex, EntryIndexBuilder, hash_name};
@@ -64,6 +70,17 @@ pub enum DecodeError {
     HeaderCrcMismatch { stored: u32, computed: u32 },
     /// ENTRY RECORD の CRC-32C 不一致。
     RecordCrcMismatch { stored: u32, computed: u32 },
+    /// CHECKPOINT CHUNK のマジックが一致しない。
+    ChunkBadMagic,
+    /// CHECKPOINT CHUNK の CRC-32C 不一致。
+    ChunkCrcMismatch { stored: u32, computed: u32 },
+    /// CHECKPOINT CHUNK がバッファ末尾で切り詰められている。
+    ChunkTruncated,
+    /// チェックポイント記録形式を持たないプロバイダ（STORE / UNSUPPORTED）の
+    /// チャンクが現れた。
+    ChunkNoCheckpointFormat(ProviderType),
+    /// チャンクチェーンが循環している（不正な `next_chunk_offset`）。
+    ChunkChainCycle,
 }
 
 impl fmt::Display for DecodeError {
@@ -81,6 +98,16 @@ impl fmt::Display for DecodeError {
                 f,
                 "vmidx: entry record CRC mismatch (stored {stored:#010x}, computed {computed:#010x})"
             ),
+            DecodeError::ChunkBadMagic => write!(f, "vmidx: bad checkpoint chunk magic"),
+            DecodeError::ChunkCrcMismatch { stored, computed } => write!(
+                f,
+                "vmidx: checkpoint chunk CRC mismatch (stored {stored:#010x}, computed {computed:#010x})"
+            ),
+            DecodeError::ChunkTruncated => write!(f, "vmidx: checkpoint chunk truncated"),
+            DecodeError::ChunkNoCheckpointFormat(p) => {
+                write!(f, "vmidx: provider {p:?} has no checkpoint record format")
+            }
+            DecodeError::ChunkChainCycle => write!(f, "vmidx: checkpoint chunk chain cycle"),
         }
     }
 }
