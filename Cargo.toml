@@ -1,0 +1,10 @@
+[package]
+name = "zip-vmm"
+version = "0.1.0"
+edition = "2024"
+description = "ZIP archive as a backing store for virtual memory (implementation)"
+repository = "https://github.com/ButterflyCurtain/zip-virtual-memory-manager-impl"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
