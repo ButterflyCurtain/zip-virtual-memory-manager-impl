@@ -10,6 +10,7 @@
 pub mod archive;
 pub mod index_build;
 pub mod lock;
+pub mod mount;
 pub mod page;
 pub mod provider;
 pub mod vmdirty;
