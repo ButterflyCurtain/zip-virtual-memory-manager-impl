@@ -497,3 +497,74 @@ in-place 穴再利用がこのアーキで具体的に壊すもの（不採用�
 - 特定特許の「認識」を公開文書に明記すると willful 主張を呼びうるため、本判断ログは
   private リポの DECISIONS に留め、公開候補の `PRIOR_ART.md` は prior art の記述に限定する。
   （以上は法的助言ではない。）
+
+## 0012. M4 append-only INCREMENTAL commit の設計（追記レイアウト / truncate ロールバック / ディスク効率）
+
+- 日付: 2026-06-19
+- ステータス: 採用（設計。実装はこれから）
+- 文脈: ADR 0011 で M4 = append-only INCREMENTAL + 別機構 FULL compaction と決めた。本 ADR は
+  append-only 経路の具体設計。**プロジェクトの北極星は「ディスク効率の最大化」**（in-place を
+  志向した動機の核）。
+
+### 決定（追記レイアウト）
+
+INCREMENTAL commit は既存アーカイブのバイトを保ったまま差分を末尾に積む:
+
+1. **未変更エントリは元のオフセットのまま**（既存バイト再利用 → 追記コスト 0、vmidx も有効）。
+2. 変更/新規エントリの LFH + データを **EOF へ追記**。
+3. 全 live エントリを指す **新 CD を追記**（未変更 = 元オフセット、変更 = 追記オフセット）。
+4. **新 EOCD を末尾**に。旧 CD/EOCD・変更前バイトは dead として中間に取り残す。
+
+結果: 1 編集あたり全書き直しなし。大きなアーカイブ + 小さな編集で I/O が `O(変更 + 件数)` に
+（FULL の `O(filesize)` に対して）。dead の累積は FULL compaction（既存 `build_full` +
+`durable_replace`）で回収し、定常サイズを上界する。
+
+### クラッシュ安全（truncate ロールバック）
+
+**旧バイト `[0, old_len)` を一切書き換えないので、ロールバック = `old_len` への truncate で
+旧アーカイブ（妥当な ZIP）に戻る。** よって WAL は軽い:
+
+- 追記前に `old_len` を sidecar に INTENT として記録 + fsync。
+- 新データ + 新 CD + 新 EOCD を書いて fsync し、COMMIT を記録。
+- 回復: INTENT あり・COMMIT なし → アーカイブを `old_len` へ truncate（旧へ復帰）。COMMIT あり
+  → 新を採用。
+- in-place のような before-image ログは不要（上書きしないから）。これが append-only を選ぶ
+  実利の一つ（「安全な WAL が複雑」という懸念は append-only では小さい）。
+
+### mmap / プラットフォーム
+
+- INCREMENTAL commit も FULL commit と同じく **`self` を消費し mmap を先に解放**してから
+  アーカイブを開いて追記する。よって live な read-only mmap を変更する問題（Windows の
+  マップ中ファイル制約を含む）を回避する。呼び出し側は commit 後に開き直す。
+
+### ディスク効率のレバー（北極星に直結）
+
+- 未変更エントリは追記ゼロ（既存バイト再利用）。
+- **INCREMENTAL / FULL の閾値**: 追記分 + dead が bloat 係数を超えたら FULL compaction で回収。
+  定常サイズの上界 = この閾値。
+- **content-addressed dedup（後段・任意）**: 追記前に圧縮バイト列の XXH3 が既存と一致したら
+  追記せず CD で既存オフセットを指す。dead を増やさず重複を排除（特許の free-block 再利用とは
+  別軸、クレーム外）。
+- **vmidx 追記拡張**: 未変更エントリのオフセットが不変なので、将来は索引を丸ごと作り直さず
+  追記分だけ拡張できる（v1 は cache 再構築でも可）。
+
+### 特許
+
+ADR 0011 のとおり incremental 経路に **穴再利用・近傍シャッフル・free-block list を持ち込まない**
+ので claim 1/2/6/7 外（dead は「次の FULL compaction で捨てるだけの未追跡バイト」で、再利用する
+"free block" ではない）。in-place は実験トラック / 満了後（~2030）昇格の道を残す。
+
+### 実装の刻み（予定）
+
+1. `build_incremental`（既存アーカイブ + diff/table から「追記計画 + 新 CD/EOCD バイト」を生成。
+   未変更は元オフセット、変更/新規は追記オフセットで CD を組む）。
+2. `FileMount::commit_incremental`（mmap 解放 → INTENT 記録 → 追記 → COMMIT。回復に
+   truncate ロールバックを配線）。
+3. INCREMENTAL / FULL 選択ポリシー（閾値）。
+4. （後段）dedup、vmidx 追記拡張。
+
+### 背景
+
+in-place は当初の方向で、動機はディスク効率の最大化。append-only はその約束（全書き直しを
+しない編集）を継ぎ、空間回収は compaction に委ねる。in-place は削除せず実験 / post-2030
+トラックとして残す（ADR 0011）。
