@@ -289,3 +289,62 @@ vmdirty の `VmdirtyWriter`（Section 7）を実装するにあたり:
   `dirty_limit` は無制限のまま（spill を起こさない）に保つ。
 - `take_spill_victims` の返り値は呼び出し側が `append_data_record` で vmdirty へ
   書き、(entry,page)→offset を Tier 2 索引（設計 `VmdirtyIndex`）に積む。
+
+---
+
+## 0009. M3 ③ の配線: 既定回復ハンドラ + 耐久性コアのみ（エントリ操作は分離）
+
+- 日付: 2026-06-19
+- ステータス: 採用
+- 選択肢:
+  - 回復 API = (a) 既定ハンドラで安全枝を自動・曖昧枝は委譲 / (b) 常に呼び出し側へ
+    委譲（自動なし）/ (c) 当面は自動のみ（曖昧枝は黙って recover_committed）
+  - 範囲 = (d) 耐久性コア（spill 配線 + 三段読み + open 回復）のみ /
+    (e) エントリ操作（create/remove/truncate/rename）も同時
+
+### 決定
+
+③（mount/disk への Tier 2 spill 配線 + 回復読み取り）を **(a) + (d)** で実装する。
+
+- **回復 API**: `FileMount::open` は [`DefaultRecoveryHandler`] で設計 Section 3 の
+  決定木を回す。**曖昧でない枝のみ自動**（commit 境界ありで `last_commit_seq>0` かつ
+  uncommitted 空 → `recover_committed`、stale 空ファイル → silently discard）、
+  **データを失いうる枝は `Abort`**（CONFLICT / ヘッダ破損 / version 非対応 /
+  commit マーカー無しで未コミットあり）。Abort は `FileMountError::RecoveryRequired`
+  として `RecoveryResult` を呼び出し側へ返す。全枝を制御したい場合は
+  `open_with_recovery(path, options, handler)` で任意の `RecoveryHandler` を渡す。
+- **範囲**: spill 配線（write 経路の Tier1→Tier2→source 三段化、`Tier2`＝writer +
+  in-memory `VmdirtyIndex` + read ハンドル）、三段読み、flush（STRICT）、open 回復
+  （決定木・`vmdirty.bak.{gen}` rename・新 gen 開始・回復分の flush）まで。エントリ
+  操作（METADATA RECORD の生成/replay）は次増分（④近辺）へ分離。spill は **opt-in**
+  （`OpenOptions::dirty_limit` 既定 `UNLIMITED`＝従来挙動不変）、sync は **Sync 既定**。
+
+### 理由
+
+- 設計 Section 3 は「VMM は自動解決しない」と宣言する一方、決定木自身が 1 枝に
+  `auto: recover_committed（safe default）`、別枝に `silently discard` を許す。素直に
+  読めば「**曖昧でない枝は自動・残りは委譲**」であり、(a) がこれに一致する。(b) は
+  決定木の `auto`/`silently` と矛盾し全 open にハンドラを強制する。(c) は曖昧枝で
+  uncommitted を黙って捨て、不変条件 **I-2「dirty ページは commit/discard/recover
+  以外で消えない」**に反する。
+- エントリ操作は immutable な vmidx の上に in-memory エントリ表を被せて
+  read/write/commit の意味論を変える別物で、耐久性コア（既存エントリのページを
+  `entry_name` キーで扱うだけで自己完結）と混ぜると配線が二重化する。設計が「正しさ
+  が宿る」とする crash-before/after はコア側に集約されるので、まずそこを緑で固める。
+
+### 備考
+
+- **logical_size の復元は DATA RECORD のテール短長で行う**（設計 Section 2 の max
+  ルール `page_index×page_size + data_len`）。spill / write-hit / flush でページを
+  書く際、末尾ページは `logical_size` でクランプして書き、読み戻し
+  （`read_page_at`）は `page_size` までゼロ埋めする。RESIZE METADATA は使わない
+  （implicit extension も max ルールで復元できる）。
+- **commit の耐久性**: `build_full` は Tier 1 のみ読むため、commit 前に flush
+  （Tier1 を全 durable 化、Tier1 には残す）→ `rehydrate_into`（Tier2 のみのページを
+  Tier1 へ読み戻す）してから組み立てる。commit 成功で vmdirty 削除、`vmdirty.bak.*`
+  は forensics 用に残す。
+- **未了（後続）**: エントリ操作（④）、compaction（dead>live で発火、⑤）、rename 後の
+  親ディレクトリ fsync（Unix、⑤）、fsync 失敗を ERROR 状態へ倒す配線（fsyncgate）、
+  FIFO の write-hit 再スタンプ最適化（正しさ無関係）。
+- 設計テキスト側の Section 3（「自動解決しない」宣言と決定木の `auto`/`silently`
+  枝の食い違い）は公開リポで文言を明確化する候補（別 push）。

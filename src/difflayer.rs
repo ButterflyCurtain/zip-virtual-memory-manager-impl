@@ -211,6 +211,12 @@ impl DiffLayer {
         victims
     }
 
+    /// Tier 1 に常駐している `(entry_name, page_index)` を FIFO（挿入順＝最古から）
+    /// で列挙する。flush（全 spill）が durable 化の順序として使う。
+    pub fn resident_pages(&self) -> Vec<(String, u64)> {
+        self.order.values().cloned().collect()
+    }
+
     /// 全 dirty 状態を捨てる（commit 完了後）。
     pub fn clear(&mut self) {
         self.entries.clear();

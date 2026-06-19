@@ -16,5 +16,6 @@ pub mod lock;
 pub mod mount;
 pub mod page;
 pub mod provider;
+pub mod tier2;
 pub mod vmdirty;
 pub mod vmidx;

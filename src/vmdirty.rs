@@ -568,6 +568,19 @@ pub fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// [`VmdirtyWriter::append_data_record`] が返す、書き込んだ DATA RECORD の
+/// payload 位置。Tier 2 索引（`(entry,page)→offset`）はこれを使って後で
+/// [`read_page_at`] でページを読み戻す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataLoc {
+    /// 割り当てられた `sequence_num`。
+    pub sequence: u64,
+    /// DATA RECORD の data フィールド先頭のファイルオフセット。
+    pub data_offset: u64,
+    /// data フィールドの長さ（末尾ページは `page_size` 未満になりうる）。
+    pub data_len: u32,
+}
+
 /// spill 書き込みの durability モード（Section 4 fsync policy）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
@@ -595,6 +608,9 @@ pub struct VmdirtyWriter {
     generation_id: [u8; 16],
     next_seq: u64,
     sync: SyncPolicy,
+    /// 次に書くレコードのファイルオフセット（= 現在のファイル長）。各レコードを
+    /// 追記するたびにその長さ分進む。Tier 2 索引が data オフセットを求めるのに使う。
+    pos: u64,
 }
 
 impl VmdirtyWriter {
@@ -614,6 +630,7 @@ impl VmdirtyWriter {
             generation_id: header.generation_id,
             next_seq: 1,
             sync,
+            pos: HEADER_SIZE as u64,
         })
     }
 
@@ -628,19 +645,28 @@ impl VmdirtyWriter {
         self.next_seq - 1
     }
 
-    /// DATA RECORD を 1 件追記し、割り当てた `sequence_num` を返す（dirty ページが
-    /// Tier 1 から Tier 2 へ spill されるたびに 1 件）。
+    /// DATA RECORD を 1 件追記し、書き込んだ payload の [`DataLoc`] を返す（dirty
+    /// ページが Tier 1 から Tier 2 へ spill されるたびに 1 件）。返った
+    /// `data_offset` / `data_len` を Tier 2 索引に積めば、後で [`read_page_at`] で
+    /// そのページを読み戻せる。
     pub fn append_data_record(
         &mut self,
         entry_name: &str,
         page_index: u64,
         data: &[u8],
-    ) -> io::Result<u64> {
+    ) -> io::Result<DataLoc> {
         let seq = self.next_seq;
+        let record_start = self.pos;
         let rec = encode_data_record(&self.generation_id, seq, entry_name, page_index, data);
         self.write_record(&rec)?;
         self.next_seq += 1;
-        Ok(seq)
+        // DATA RECORD: magic(4)+gen(16)+seq(8)+name_len(2)+name(N)+page_index(8)
+        //              +data_len(4) = 42 + N バイト後に data フィールドが始まる。
+        Ok(DataLoc {
+            sequence: seq,
+            data_offset: record_start + 42 + entry_name.len() as u64,
+            data_len: data.len() as u32,
+        })
     }
 
     /// METADATA RECORD を 1 件追記し、割り当てた `sequence_num` を返す
@@ -664,13 +690,56 @@ impl VmdirtyWriter {
     }
 
     /// 1 レコードを 1 回の `write_all` で書き、Sync モードなら `sync_data`。
+    /// 書いた分だけ `pos`（追記位置）を進める。
     fn write_record(&mut self, rec: &[u8]) -> io::Result<()> {
         self.file.write_all(rec)?;
+        self.pos += rec.len() as u64;
         if self.sync == SyncPolicy::Sync {
             self.file.sync_data()?;
         }
         Ok(())
     }
+}
+
+/// vmdirty ファイルの `data_offset` から 1 ページ分を読み戻す（Tier 2 read path）。
+/// `data_len` が `page_size` 未満（末尾の短いページ）のときは残りをゼロ埋めして
+/// 常に `page_size` バイトを返す（呼び出し側の read 経路は均一なページとして扱い、
+/// `logical_size` でクランプする）。`file` は vmdirty への read ハンドル。
+pub fn read_page_at(
+    file: &File,
+    data_offset: u64,
+    data_len: usize,
+    page_size: usize,
+) -> io::Result<Vec<u8>> {
+    let mut page = vec![0u8; page_size];
+    let n = data_len.min(page_size);
+    pread_exact(file, &mut page[..n], data_offset)?;
+    Ok(page)
+}
+
+/// 位置指定の正確な読み取り（追記中の writer ハンドルと干渉しない別 read ハンドル
+/// を前提）。Unix は `pread`、Windows は `seek_read` を短読みループで包む。
+#[cfg(unix)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file.seek_read(&mut buf[read..], offset + read as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "vmdirty pread reached EOF before filling page",
+            ));
+        }
+        read += n;
+    }
+    Ok(())
 }
 
 /// エントリ名のデコード。不正 UTF-8 は Section 2 どおり置換（U+FFFD）する。
@@ -1005,13 +1074,17 @@ mod tests {
         assert_eq!(w.generation_id(), gen_id);
         assert_eq!(w.last_sequence(), 0);
 
-        let s1 = w.append_data_record("a.bin", 0, &page).unwrap();
+        let loc1 = w.append_data_record("a.bin", 0, &page).unwrap();
         let s2 = w.append_metadata("a.bin", &MetaOp::Resize { new_size: 4096 }).unwrap();
-        assert_eq!((s1, s2), (1, 2));
+        assert_eq!((loc1.sequence, s2), (1, 2));
+        // 最初の DATA RECORD はヘッダ直後。data は magic+gen+seq+name_len+name(5)
+        // +page_index+data_len = 42+5 = 47 バイト後から始まる。
+        assert_eq!(loc1.data_offset, HEADER_SIZE as u64 + 42 + 5);
+        assert_eq!(loc1.data_len, 4096);
         w.append_commit_marker(w.last_sequence(), 1).unwrap();
         // commit 後に追記した分は uncommitted になる。
-        let s3 = w.append_data_record("b.bin", 5, &page).unwrap();
-        assert_eq!(s3, 3);
+        let loc3 = w.append_data_record("b.bin", 5, &page).unwrap();
+        assert_eq!(loc3.sequence, 3);
         drop(w);
 
         let bytes = std::fs::read(tf.path()).unwrap();
@@ -1030,6 +1103,30 @@ mod tests {
         assert_eq!(r.uncommitted_pages[0].entry_name, "b.bin");
         assert_eq!(r.uncommitted_pages[0].sequence, 3);
         assert_eq!(r.valid_through_seq, 3);
+    }
+
+    #[test]
+    fn read_page_at_roundtrips_full_and_short_pages() {
+        let tf = TempFile::new("readat");
+        let gen_id = new_generation_id();
+        let full = vec![0xC3u8; 4096];
+        let short = vec![0x5Au8; 100]; // 末尾の短いページ
+
+        let mut w = VmdirtyWriter::create(tf.path(), &writer_header(gen_id), SyncPolicy::Sync)
+            .expect("create");
+        let loc_full = w.append_data_record("e", 0, &full).unwrap();
+        let loc_short = w.append_data_record("e", 1, &short).unwrap();
+        drop(w);
+
+        // 別の read ハンドルで位置指定読み。
+        let f = std::fs::File::open(tf.path()).unwrap();
+        let p0 = read_page_at(&f, loc_full.data_offset, loc_full.data_len as usize, 4096).unwrap();
+        assert_eq!(p0, full);
+        // 短いページは page_size までゼロ埋めされて返る。
+        let p1 = read_page_at(&f, loc_short.data_offset, loc_short.data_len as usize, 4096).unwrap();
+        assert_eq!(&p1[..100], &short[..]);
+        assert!(p1[100..].iter().all(|&b| b == 0));
+        assert_eq!(p1.len(), 4096);
     }
 
     #[test]

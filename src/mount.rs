@@ -31,6 +31,7 @@ use crate::difflayer::DiffLayer;
 use crate::index_build::{build_vmidx_eager, BuildError, BuildParams};
 use crate::page::{page_count, page_extent, PageCache, PageConfig, PageKey};
 use crate::provider::{builtin_provider, check_range, ProviderError};
+use crate::tier2::Tier2;
 use crate::vmidx::{
     hash_cd_block, DecodeError, EntryRecord, FingerprintVerdict, ProviderType, SourceStat, Vmidx,
 };
@@ -74,6 +75,8 @@ pub enum ReadError {
     /// CONSISTENCY の ESTALE）。検出後マウントは STALE になり、以降の read は
     /// 一律これを返す（close + reopen が必要）。
     Stale,
+    /// Tier 2（vmdirty）からページを読み戻す段の I/O 失敗。
+    Tier2(String),
 }
 
 impl fmt::Display for ReadError {
@@ -85,6 +88,7 @@ impl fmt::Display for ReadError {
             ReadError::Provider(e) => write!(f, "read: {e}"),
             ReadError::DataOutOfRange => write!(f, "read: entry data outside archive"),
             ReadError::Stale => write!(f, "read: archive changed since mount (ESTALE)"),
+            ReadError::Tier2(e) => write!(f, "read: tier 2 spill read failed: {e}"),
         }
     }
 }
@@ -102,6 +106,8 @@ pub enum WriteError {
     Vmidx(DecodeError),
     /// COW の元ページをソースから読む段で失敗した。
     Read(Box<ReadError>),
+    /// Tier 2（vmdirty）への spill / write-hit 書き出しの I/O 失敗。
+    Spill(String),
 }
 
 impl fmt::Display for WriteError {
@@ -111,6 +117,7 @@ impl fmt::Display for WriteError {
             WriteError::Unsupported(p) => write!(f, "write: unsupported provider {p:?}"),
             WriteError::Vmidx(e) => write!(f, "write: {e}"),
             WriteError::Read(e) => write!(f, "write: copy-on-write read failed: {e}"),
+            WriteError::Spill(e) => write!(f, "write: tier 2 spill failed: {e}"),
         }
     }
 }
@@ -186,6 +193,7 @@ impl<'a> Mount<'a> {
                 self.archive,
                 &self.vmidx_image,
                 &self.diff.borrow(),
+                None,
                 path,
                 offset,
                 len,
@@ -214,6 +222,7 @@ impl<'a> Mount<'a> {
             self.archive,
             &self.vmidx_image,
             &mut self.diff.borrow_mut(),
+            None,
             path,
             offset,
             data,
@@ -302,13 +311,21 @@ pub fn read_entry(
 }
 
 /// エントリ `path` の `[offset, offset + data.len())` を Diff Layer に COW で書く
-/// （設計 WRITE PATH）。触れる各ページは、未取り込みならソース（キャッシュなしの
-/// [`read_entry`]）から元内容を読み込み、`page_size` バイトに右ゼロ埋めしてから
-/// 書き込みを適用する。末尾超過はエントリを伸ばす（`logical_size` 更新）。
+/// （設計 WRITE PATH）。`tier2` を渡すと書き込み経路は三段になる:
+/// - **Tier 1 ヒット**: 常駐ページを in-place 更新。
+/// - **Tier 2 ヒット**: vmdirty から読み戻して書き込みを適用し、新しい DATA RECORD を
+///   追記する（設計 4.1「Tier 2 ページへの write hit は新レコード追記、Tier 1 へは
+///   戻さない」）。
+/// - **ミス**: ソース（キャッシュなしの [`read_entry`]）から COW し Tier 1 に載せる。
+///
+/// 末尾超過はエントリを伸ばす（`logical_size` 更新）。書き終えて `tier2` があり
+/// `dirty_limit` を超えていれば最古から spill する。`tier2 = None` は M2 互換の
+/// Tier 1 のみ（spill なし）。
 pub fn write_into(
     archive: &[u8],
     vmidx_image: &[u8],
     diff: &mut DiffLayer,
+    mut tier2: Option<&mut Tier2>,
     path: &str,
     offset: u64,
     data: &[u8],
@@ -338,8 +355,21 @@ pub fn write_into(
     let last = (end - 1) / page_size; // data 非空なので end >= 1
     for page in first..=last {
         let page_start = page * page_size;
-        if !diff.has_page(path, page) {
-            // COW: ページサイズ分のゼロバッファに元内容を載せる。
+        if diff.has_page(path, page) {
+            // Tier 1 ヒット: 常駐バッファを直接更新。
+            let buf = diff.page_mut(path, page).expect("tier1 hit");
+            apply_write(buf, page_start, offset, end, data);
+        } else if let Some(t2) = tier2.as_deref_mut().filter(|t| t.has(path, page)) {
+            // Tier 2 ヒット: 読み戻して適用し、新 DATA RECORD を追記（Tier 1 へは戻さない）。
+            let mut buf = t2
+                .read_page(path, page)
+                .map_err(|e| WriteError::Spill(e.to_string()))?
+                .expect("tier2 hit");
+            apply_write(&mut buf, page_start, offset, end, data);
+            t2.write_hit(path, page, &buf, new_logical)
+                .map_err(|e| WriteError::Spill(e.to_string()))?;
+        } else {
+            // ミス: ソースから COW して Tier 1 に載せる。
             let mut buf = vec![0u8; page_size as usize];
             if page_start < original_size {
                 let avail = ((original_size - page_start).min(page_size)) as usize;
@@ -347,20 +377,36 @@ pub fn write_into(
                     .map_err(|e| WriteError::Read(Box::new(e)))?;
                 buf[..avail].copy_from_slice(&orig);
             }
+            apply_write(&mut buf, page_start, offset, end, data);
             diff.insert_page(path, page, buf);
         }
-        // このページに重なる書き込み範囲を適用する。
-        let buf = diff.page_mut(path, page).expect("just inserted");
-        let w_lo = offset.max(page_start);
-        let w_hi = end.min(page_start + page_size);
-        let dst_lo = (w_lo - page_start) as usize;
-        let dst_hi = (w_hi - page_start) as usize;
-        let src_lo = (w_lo - offset) as usize;
-        let src_hi = (w_hi - offset) as usize;
-        buf[dst_lo..dst_hi].copy_from_slice(&data[src_lo..src_hi]);
     }
     diff.set_logical_size(path, new_logical);
+
+    // 書き込み後、上限超過なら最古から Tier 2 へ退避する。
+    if let Some(t2) = tier2.as_deref_mut() {
+        if diff.over_limit() {
+            t2.spill_over_limit(diff)
+                .map_err(|e| WriteError::Spill(e.to_string()))?;
+        }
+    }
     Ok(())
+}
+
+/// `page_size` バイトのページバッファ `buf`（先頭が `page_start`）へ、書き込み範囲
+/// `[offset, end)` のうち当該ページに重なる分だけ `data` から適用する。
+fn apply_write(buf: &mut [u8], page_start: u64, offset: u64, end: u64, data: &[u8]) {
+    let page_end = page_start + buf.len() as u64;
+    let w_lo = offset.max(page_start);
+    let w_hi = end.min(page_end);
+    if w_lo >= w_hi {
+        return;
+    }
+    let dst_lo = (w_lo - page_start) as usize;
+    let dst_hi = (w_hi - page_start) as usize;
+    let src_lo = (w_lo - offset) as usize;
+    let src_hi = (w_hi - offset) as usize;
+    buf[dst_lo..dst_hi].copy_from_slice(&data[src_lo..src_hi]);
 }
 
 /// dirty なエントリの `[offset, offset + len)` を Diff Layer から読む（設計
@@ -371,6 +417,7 @@ pub fn read_dirty(
     archive: &[u8],
     vmidx_image: &[u8],
     diff: &DiffLayer,
+    tier2: Option<&Tier2>,
     path: &str,
     offset: u64,
     len: usize,
@@ -398,9 +445,19 @@ pub fn read_dirty(
         let page_start = page * page_size;
         let chunk_end = end.min(page_start + page_size);
         let take = (chunk_end - pos) as usize;
+        let in_page = (pos - page_start) as usize;
 
         if let Some(p) = diff.page(path, page) {
-            let in_page = (pos - page_start) as usize;
+            // Tier 1 ヒット。
+            out.extend_from_slice(&p[in_page..in_page + take]);
+        } else if let Some(p) = tier2
+            .filter(|t| t.has(path, page))
+            .map(|t| t.read_page(path, page))
+            .transpose()
+            .map_err(|e| ReadError::Tier2(e.to_string()))?
+            .flatten()
+        {
+            // Tier 2 ヒット（vmdirty から読み戻し、page_size までゼロ埋め済み）。
             out.extend_from_slice(&p[in_page..in_page + take]);
         } else {
             // 未変更ページ。ソース範囲内は読み、超える分はゼロ（gap）。

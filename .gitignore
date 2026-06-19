@@ -20,3 +20,6 @@ _archive/
 
 # 捨て物
 _rubbish/
+
+# ローカル専用の引き継ぎ資料（共有しない）
+/docs/HANDOFF.md
