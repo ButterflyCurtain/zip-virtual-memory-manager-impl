@@ -414,7 +414,7 @@ vmdirty の `VmdirtyWriter`（Section 7）を実装するにあたり:
   `journal_op` / `purge_entry` / `purge_pages_beyond`。`commit::build_full` は
   `&EntryTable` を取り、tombstone をスキップ・created を新規 LFH/CD で出す。
 - 依存追加なし。`cargo test` 166 緑・警告なし。
-- **④b rename 実装済み（同 decision、作業ツリー）**: 設計どおり `entrytable` に
+- **④b rename 実装済み（同 decision、コミット `82a8cd4`）**: 設計どおり `entrytable` に
   `Overlay::Aliased{source}` + `apply_rename`/`aliased_source`/`aliases`/`is_aliased`、
   `difflayer`/`tier2` に `rename_entry`（現在名キーの再キー）、`mount` に `entry_rename`
   （ENOENT/EEXIST、未対応圧縮種別でも通す）/`resolve_entry` の別名解決、`commit::build_full`
@@ -425,3 +425,75 @@ vmdirty の `VmdirtyWriter`（Section 7）を実装するにあたり:
 - **未了（⑤ 以降）**: compaction（⑤）、rename 後の親 dir fsync
   （⑤）、fsyncgate。CD-only 改名の INCREMENTAL は M4。非 UTF-8 名のエントリ操作は
   対象外（エントリ表は UTF-8 名のみ）。
+
+## 0011. M4 = append-only INCREMENTAL + 別機構の FULL compaction（in-place 穴再利用は不採用）
+
+- 日付: 2026-06-19
+- ステータス: 採用（設計方針。実装は ⑤ 以降）
+- 選択肢（空間回収モデル）:
+  - (a) **in-place 穴再利用 + フリーブロックリスト**（既存ブロックをその場で書き換え、
+    入らなければ近傍ブロックを EOF へ逃がして空きをマーク、空きを best-fit 再利用する
+    ハイブリッド。US8024382 型）
+  - (b) **append-only INCREMENTAL コミット**（変更/新規エントリを EOF に追記し新 CD を
+    EOF に書く。古いデータは dead）＋ **別機構の FULL compaction**（dead/live 比トリガで
+    全書き直し + rename）
+
+### 決定
+
+**(b)**。M4 は append-only INCREMENTAL と FULL compaction を**別々の機構**として用意し、
+**アーカイブ本体の live バイトを in-place で書き換える穴再利用は採らない**。穴再利用が要る
+回収は compaction の中（全書き直し時の再配置）だけに閉じ、incremental 経路には
+穴再利用・近傍シャッフル・CD ギャップ由来の freelist を一切持ち込まない。両者は
+dead/live 比トリガで繋ぐ（コピー GC / LSM / SQLite auto-vacuum と同型）。
+
+### 理由
+
+**根源的理由: このアーキの不変条件「live データを in-place で壊さない」と一致する。**
+zip-vmm は (i) ソースを不変スナップショットとして read-only mmap、(ii) 書き込みは COW で
+diff layer、(iii) commit は rename で原子置換、という「既存バイトを破壊的に書き換えない」
+設計。append-only も compaction(rename) もこの原則を保つが、in-place 穴再利用は破る。
+M4 を append-only にするのは diff layer の COW / FULL commit の rename と**同じ原則を
+アーカイブ本体に適用しただけ**で、設計に一貫する。
+
+in-place 穴再利用がこのアーキで具体的に壊すもの（不採用の根拠）:
+
+1. **不変スナップショット mmap + ESTALE**: 自分の commit が size/mtime/cd_hash を変え、
+   自前の ESTALE/fingerprint 検知を**自分で誤発火**させる。特に Windows はマップ中
+   ファイルの上書き・短縮が制限される。
+2. **vmidx（fingerprint 検証つきキャッシュ）**: 穴再利用は既存エントリの**オフセットを
+   動かす** → cd_hash 変化で vmidx 無効 → EAGER 再構築（再 inflate で CP 生成）。
+   「全書き直しを避けた」利得を seek index 再構築が食う。append-only はオフセット不変で
+   vmidx を**追記拡張**できる。
+3. **クラッシュ安全**: rename の無料の原子性を失う。CD/EOCD の in-place 更新は原子的でなく、
+   vmdirty WAL を**アーカイブ本体の変更**まで広げる（shadow-CD 等）必要があり複雑度が跳ねる。
+4. **fingerprint 同一性**: in-place は inode 同じ・cd_hash 変化 → 回復決定木の CONFLICT 枝と
+   衝突する。
+5. **dead zone と ZIP 妥当性**: 穴を署名でマークすれば特許の raw-block 機構そのもの、
+   しなければ厳格な線形バリデータが嫌う場合がある。append-only + tail 寄り dead が単純。
+
+→ このアーキでは in-place 再利用の旨味が 2・3 で大きく相殺される。append-only は4本柱
+すべてと素直に噛み合う。
+
+**append-only と compaction の役割分担（どちらも優れる面があるから両方用意する）:**
+
+| | append-only INCREMENTAL（前者） | FULL compaction（後者） |
+|---|---|---|
+| 強み | 低レイテンシな頻繁・小コミット、シーケンシャル書き込み、vmidx 追記拡張、書込中も旧データ無傷 | dead space 完全回収・ファイルサイズ有界化、断片化解消、正準な clean ZIP 生成、vmidx を新鮮に再構築、rename で原子安全 |
+| 弱み | 単調増加（dead 蓄積） | O(filesize) バースト・一時 2 倍ディスク |
+| 役割 | 通常パス | 閾値トリガの回収パス |
+
+定常オーバーヘッドは閾値で有界、1 バイトあたり償却 O(1) 回の書き直しに収まる。
+
+### 特許に関する備考（主目的ではない副次効果）
+
+- 本方針は **US8024382B2（[`PRIOR_ART.md`](PRIOR_ART.md)）の芯**（in-place ブロック編集 +
+  CD 由来 freelist + 近傍シャッフル回収）を**実施しない**ので結果的にクレーム外に収まる。
+  ただし**不採用の主因はエンジニアリング（上記アーキ不整合）であり、回避が目的ではない**。
+  「組合せで適用範囲を曖昧化」は all-elements rule で効かない（周辺機能を足しても claim の
+  全要素を踏めば踏む）ため、最初から狙わない。
+- in-place ハイブリッドを将来試すなら: アーカイブ本体変更を vmdirty WAL の一級市民にする
+  前提で**実験モジュール・既定 off**。claim 8（freed extent への modified データ配置）が
+  境界＝**FTO 対象**。米国のみ・~2030 満了の文脈を踏まえ、確実性が要るなら弁理士。
+- 特定特許の「認識」を公開文書に明記すると willful 主張を呼びうるため、本判断ログは
+  private リポの DECISIONS に留め、公開候補の `PRIOR_ART.md` は prior art の記述に限定する。
+  （以上は法的助言ではない。）
