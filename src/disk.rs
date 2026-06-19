@@ -37,7 +37,7 @@ use memmap2::Mmap;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::fs::{self, File, Metadata};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -514,9 +514,11 @@ impl FileMount {
     /// 差し替える。マウントを消費する（mmap を解放）。クラッシュ前は元の
     /// `archive.zip` が無傷で残り、後は新 ZIP が有効（POSIX rename の原子性）。
     ///
-    /// 既定プロファイルでは fsync しない（M2。durability は M3）。サイドカー
-    /// vmidx は更新せず残すが、次回 open 時に fingerprint 不一致で再構築される
-    /// （vmidx はキャッシュ）。
+    /// 耐久性（⑤ / Section 6.3）: 新 ZIP を `sync_all`（データ + メタデータ）してから
+    /// `rename` し、rename 自体も親ディレクトリ fsync で durable にする。よって commit が
+    /// 成功を返したら新アーカイブは安定ストレージ上にある。fsync 失敗は伝播する
+    /// （fsyncgate）。サイドカー vmidx は更新せず残し（次回 open で fingerprint 不一致なら
+    /// 再構築。vmidx はキャッシュなので fsync しない）。
     pub fn commit(self) -> Result<(), FileMountError> {
         if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
             return Ok(());
@@ -541,14 +543,24 @@ impl FileMount {
         // archive.new.zip に書いてから rename で差し替える。Windows では mmap 保持中の
         // ファイルを切り詰め上書きできないが、別名 write → rename は通る（新 inode、
         // 旧マッピングは旧内容のまま生存。設計が想定する典型的な置き換え）。
+        // 耐久性（Section 6.3 / fsyncgate）: 新 ZIP をデータ + メタデータごと fsync して
+        // から rename し、rename 自体も親ディレクトリ fsync で durable にする。これで
+        // 「commit が成功を返した ⇒ 新アーカイブは安定ストレージ上」を保証する。fsync
+        // 失敗は握りつぶさず伝播する（vmidx はキャッシュなので別途 fsync しない）。
         let tmp = commit_tmp(&self.archive_path);
-        fs::write(&tmp, &new_zip)?;
-        fs::rename(&tmp, &self.archive_path)?;
+        durable_replace(&tmp, &self.archive_path, &new_zip)?;
 
-        // commit 成功 → dirty 状態は新 archive に在る。vmdirty を削除する（設計
-        // commit(): "On success: deletes vmdirty"）。`vmdirty.bak.*` は forensics 用に残す。
+        // commit 成功 → dirty 状態は新 archive に在る。vmdirty を削除し、その削除も
+        // サイドカー dir の fsync で durable にする（設計 commit(): "On success: deletes
+        // vmdirty"）。`vmdirty.bak.*` は forensics 用に残す。
+        //
+        // 残存ウィンドウ（既知）: アーカイブが durable になった後・vmdirty 削除が durable
+        // になる前にクラッシュすると、再 open 時に「新アーカイブ + 旧 vmdirty」が残り、
+        // 指紋不一致で CONFLICT（RecoveryRequired）に見える。完全な解消は commit epoch /
+        // マーカ方式（別増分）が要る。ここでは窓を最小化するに留める。
         if self.vmdirty_path.exists() {
             let _ = fs::remove_file(&self.vmdirty_path);
+            let _ = fsync_parent_dir(&self.vmdirty_path);
         }
         Ok(())
     }
@@ -604,8 +616,41 @@ fn commit_tmp(archive_path: &Path) -> PathBuf {
     archive_path.with_file_name(name)
 }
 
-/// vmidx 像を `vmidx.tmp` に書いて `vmidx` へ rename（Section 6.3 a/b）。既定
-/// プロファイルにつき fsync しない。
+/// `data` を `tmp` に書き、**fsync してから** `dst` へ rename で原子置換し、親
+/// ディレクトリも fsync して rename 自体を durable にする（POSIX）。クラッシュ
+/// 安全な「書いて差し替える」の標準手順（write → fsync → rename → dir fsync）。
+/// fsync 失敗は握りつぶさず伝播する（fsyncgate）。Windows はディレクトリの fsync
+/// 概念が無いので rename（MoveFileEx 相当）の原子性に委ねる。
+fn durable_replace(tmp: &Path, dst: &Path, data: &[u8]) -> io::Result<()> {
+    {
+        let mut f = File::create(tmp)?;
+        f.write_all(data)?;
+        // データ + メタデータ（サイズ）の双方を安定ストレージへ。
+        f.sync_all()?;
+    }
+    fs::rename(tmp, dst)?;
+    fsync_parent_dir(dst)?;
+    Ok(())
+}
+
+/// `path` の親ディレクトリを fsync して、その中で起きた rename / unlink を durable
+/// にする（POSIX のディレクトリ耐久性）。Windows ではディレクトリハンドルへの
+/// flush は一般に行えない / 意味を持たないので no-op（rename の原子性に委ねる）。
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// vmidx 像を `vmidx.tmp` に書いて `vmidx` へ rename（Section 6.3 a/b）。vmidx は
+/// 失われても再構築できるキャッシュなので、ここは fsync しない（Section 6.3 c）。
 fn write_sidecar_index(sidecar: &Path, vmidx_path: &Path, image: &[u8]) -> io::Result<()> {
     fs::create_dir_all(sidecar)?;
     let tmp = sidecar.join("vmidx.tmp");
@@ -1487,6 +1532,39 @@ mod tests {
         let m3 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m3.read("b.bin", 0, 8).unwrap(), b"abcdefgh");
         assert_eq!(m3.read("a.bin", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn durable_replace_writes_and_atomically_replaces() {
+        let dir = TempDir::new();
+        let dst = dir.path().join("a.bin");
+        fs::write(&dst, b"OLD CONTENT").unwrap();
+        let tmp = dir.path().join("a.bin.new");
+
+        durable_replace(&tmp, &dst, b"new durable bytes").expect("durable_replace");
+
+        assert_eq!(fs::read(&dst).unwrap(), b"new durable bytes");
+        // 一時ファイルは rename で消費され残らない。
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn commit_leaves_no_vmdirty_and_reopens_clean() {
+        // 耐久 commit 後はサイドカー vmdirty が消え、再 open が CLEAN になること。
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("dc.zip");
+        fs::write(&zip_path, store_zip(&[("a.txt", b"0123456789")])).unwrap();
+
+        let m = open_spill(&zip_path, 0); // spill 有効 → vmdirty 生成
+        m.write("a.txt", 0, b"XY").unwrap();
+        m.flush().expect("flush");
+        assert!(vmdirty_path(dir.path(), "dc.zip").exists());
+        m.commit().expect("durable commit");
+
+        assert!(!vmdirty_path(dir.path(), "dc.zip").exists());
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert!(!m2.is_dirty());
+        assert_eq!(m2.read("a.txt", 0, 10).unwrap(), b"XY23456789");
     }
 
     #[test]
