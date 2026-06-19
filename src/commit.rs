@@ -22,7 +22,7 @@
 //!
 //! [`disk`]: crate::disk
 
-use crate::archive::{Archive, ZipError};
+use crate::archive::{Archive, CdEntry, ZipError};
 use crate::difflayer::DiffLayer;
 use crate::entrytable::{EntryTable, Kind};
 use crate::mount::{read_entry, ReadError};
@@ -217,6 +217,188 @@ pub fn build_full(
     push_u16(&mut body, 0); // コメント長
 
     Ok(body)
+}
+
+/// INCREMENTAL commit（ADR 0012）。既存アーカイブのバイトは保ったまま、変更/新規/
+/// 別名エントリだけを末尾に追記する「追記分バイト列」を返す。呼び出し側はこれを
+/// アーカイブ末尾（オフセット `archive.len()`）に書く。
+///
+/// 返すレイアウト: `[変更/新規/別名の LFH+データ][全 live を指す新 CD][新 EOCD]`。
+/// 未変更エントリは元の local header offset のまま新 CD に載る（再圧縮もコピーも
+/// せず追記コスト 0）。旧 CD/EOCD・変更前バイトは中間に dead として残り、FULL
+/// compaction で回収する（設計 ADR 0011/0012）。
+pub fn build_incremental(
+    archive: &[u8],
+    vmidx_image: &[u8],
+    diff: &DiffLayer,
+    table: &EntryTable,
+) -> Result<Vec<u8>, CommitError> {
+    let ar = Archive::parse(archive).map_err(CommitError::Zip)?;
+    let base = archive.len() as u64; // 追記開始の絶対オフセット。
+
+    let mut body: Vec<u8> = Vec::new(); // 末尾に追記する LFH+データ（後で CD/EOCD も足す）。
+    let mut placed: Vec<(u64, u16, u32, u64, u64, Vec<u8>)> =
+        Vec::with_capacity(ar.entries().len());
+    let mut emitted_created: HashSet<String> = HashSet::new();
+
+    for entry in ar.entries() {
+        let name_utf8 = std::str::from_utf8(&entry.name).ok();
+        if let Some(name) = name_utf8 {
+            // rename ターゲットで再利用された vmidx 名は別名ループで現在名として追記。
+            if table.is_aliased(name) {
+                continue;
+            }
+            match table.kind(name, true) {
+                Kind::Absent => continue, // tombstone / rename 元 → 新 CD から外す。
+                Kind::Created => {
+                    let (method, crc, stored, uncomp) =
+                        build_created(archive, vmidx_image, diff, name)?;
+                    place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, &entry.name)?;
+                    emitted_created.insert(name.to_owned());
+                    continue;
+                }
+                Kind::Source => {}
+            }
+        }
+
+        // 通常のソースエントリ（非 UTF-8 名はオーバーレイ対象外＝常に未変更）。
+        if let Some(name) = name_utf8.filter(|n| diff.is_dirty(n)) {
+            // 変更あり → 再材料化して末尾に追記。
+            let logical = diff.logical_size(name).unwrap_or(entry.uncompressed_size);
+            let original = diff.source_size(name).unwrap_or(entry.uncompressed_size);
+            let content =
+                assemble_content(archive, vmidx_image, diff, name, logical, original, Some(name))?;
+            let crc = crc32(&content);
+            let (method, stored) = match entry.provider_type {
+                ProviderType::Store => (0u16, content.clone()),
+                ProviderType::Deflate => (8u16, deflate(&content)?),
+                other => return Err(CommitError::Unsupported(other)),
+            };
+            let uncomp = content.len() as u64;
+            place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, &entry.name)?;
+        } else {
+            // 未変更 → 追記せず、元の local header offset で新 CD に載せる。
+            record_in_place(&mut placed, entry)?;
+        }
+    }
+
+    // vmidx に無い created エントリ。
+    for name in table.created_names() {
+        if emitted_created.contains(name) {
+            continue;
+        }
+        let (method, crc, stored, uncomp) = build_created(archive, vmidx_image, diff, name)?;
+        place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, name.as_bytes())?;
+    }
+
+    // 別名（rename ターゲット）。LFH の名前を現在名にするため、未変更でも LFH+データを
+    // 追記する（データは verbatim コピー、再圧縮なし＝未対応圧縮種別でも通る）。
+    for (current, source) in table.aliases() {
+        let src_entry = ar
+            .entries()
+            .iter()
+            .find(|e| e.name == source.as_bytes())
+            .ok_or(CommitError::Read(ReadError::NotFound))?;
+        let (method, crc, stored, uncomp) = if diff.is_dirty(current) {
+            let logical = diff
+                .logical_size(current)
+                .unwrap_or(src_entry.uncompressed_size);
+            let original = diff
+                .source_size(current)
+                .unwrap_or(src_entry.uncompressed_size);
+            let content =
+                assemble_content(archive, vmidx_image, diff, current, logical, original, Some(source))?;
+            let crc = crc32(&content);
+            let (method, stored) = match src_entry.provider_type {
+                ProviderType::Store => (0u16, content.clone()),
+                ProviderType::Deflate => (8u16, deflate(&content)?),
+                other => return Err(CommitError::Unsupported(other)),
+            };
+            (method, crc, stored, content.len() as u64)
+        } else {
+            let stored = ar.entry_data(src_entry).map_err(CommitError::Zip)?.to_vec();
+            (
+                src_entry.method_code,
+                src_entry.crc32,
+                stored,
+                src_entry.uncompressed_size,
+            )
+        };
+        place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, current.as_bytes())?;
+    }
+
+    // 新 Central Directory（全 live エントリ）。CD は追記分の直後 = base + body.len()。
+    let cd_offset = base + body.len() as u64;
+    let mut cd: Vec<u8> = Vec::new();
+    for (lho, method, crc, comp_size, uncomp_size, name) in &placed {
+        write_cdfh(&mut cd, *method, *crc, *comp_size, *uncomp_size, *lho, name);
+    }
+    let cd_size = cd.len() as u64;
+    body.extend_from_slice(&cd);
+
+    let count = placed.len();
+    if cd_offset > u32::MAX as u64 || cd_size > u32::MAX as u64 || count > u16::MAX as usize {
+        return Err(CommitError::TooLarge);
+    }
+
+    // 新 End Of Central Directory（末尾。backscan はこれを最後の EOCD として拾う）。
+    push_u32(&mut body, EOCD_SIG);
+    push_u16(&mut body, 0);
+    push_u16(&mut body, 0);
+    push_u16(&mut body, count as u16);
+    push_u16(&mut body, count as u16);
+    push_u32(&mut body, cd_size as u32);
+    push_u32(&mut body, cd_offset as u32);
+    push_u16(&mut body, 0);
+
+    Ok(body)
+}
+
+/// 追記領域へ 1 エントリを書き（LFH+データ）、その**絶対** local header offset
+/// （`base + 追記内位置`）を CD 用に記録する。32 ビット超過は [`CommitError::TooLarge`]。
+#[allow(clippy::too_many_arguments)]
+fn place_appended(
+    body: &mut Vec<u8>,
+    placed: &mut Vec<(u64, u16, u32, u64, u64, Vec<u8>)>,
+    base: u64,
+    method: u16,
+    crc: u32,
+    stored: &[u8],
+    uncomp_size: u64,
+    name: &[u8],
+) -> Result<(), CommitError> {
+    let comp_size = stored.len() as u64;
+    let lho = base + body.len() as u64;
+    if lho > u32::MAX as u64 || comp_size > u32::MAX as u64 || uncomp_size > u32::MAX as u64 {
+        return Err(CommitError::TooLarge);
+    }
+    write_lfh(body, method, crc, comp_size, uncomp_size, name);
+    body.extend_from_slice(stored);
+    placed.push((lho, method, crc, comp_size, uncomp_size, name.to_vec()));
+    Ok(())
+}
+
+/// 未変更エントリを元の local header offset のまま新 CD に載せる（追記しない＝
+/// 既存バイトをそのまま再利用）。
+fn record_in_place(
+    placed: &mut Vec<(u64, u16, u32, u64, u64, Vec<u8>)>,
+    entry: &CdEntry,
+) -> Result<(), CommitError> {
+    if entry.local_header_offset > u32::MAX as u64
+        || entry.compressed_size > u32::MAX as u64
+        || entry.uncompressed_size > u32::MAX as u64
+    {
+        return Err(CommitError::TooLarge);
+    }
+    placed.push((
+        entry.local_header_offset,
+        entry.method_code,
+        entry.crc32,
+        entry.compressed_size,
+        entry.uncompressed_size,
+        entry.name.clone(),
+    ));
+    Ok(())
 }
 
 /// エントリの論理内容（長さ `logical`）を組み立てる。各ページは Diff Layer 優先、

@@ -26,7 +26,7 @@
 //! ＝後段の担当）。
 
 use crate::archive::{Archive, ZipError};
-use crate::commit::{build_full, CommitError};
+use crate::commit::{build_full, build_incremental, CommitError};
 use crate::difflayer::DiffLayer;
 use crate::entrytable::{EntryTable, Kind};
 use crate::index_build::{build_vmidx_eager, BuildError, BuildParams};
@@ -388,6 +388,24 @@ impl<'a> Mount<'a> {
             &self.diff.borrow(),
             &self.entries.borrow(),
         )
+    }
+
+    /// INCREMENTAL commit（設計 commit() FLOW の INCREMENTAL path。ADR 0012）。未変更
+    /// エントリは元位置のまま、変更/新規/別名だけを末尾に追記した新しいアーカイブ
+    /// バイト列を返す（メモリ版。ディスク版は実ファイルへの末尾追記 + truncate
+    /// ロールバックで実装する）。`[既存バイト][追記分]` を連結して返し、マウントを
+    /// 消費する。未変更エントリの再圧縮が無いぶん大きなアーカイブの小編集で安い。
+    pub fn commit_incremental(self) -> Result<Vec<u8>, CommitError> {
+        let appended = build_incremental(
+            self.archive,
+            &self.vmidx_image,
+            &self.diff.borrow(),
+            &self.entries.borrow(),
+        )?;
+        let mut out = Vec::with_capacity(self.archive.len() + appended.len());
+        out.extend_from_slice(self.archive);
+        out.extend_from_slice(&appended);
+        Ok(out)
     }
 }
 
@@ -1766,5 +1784,82 @@ mod tests {
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 3).unwrap(), b"new");
         assert_eq!(m2.read("b.txt", 0, 8).unwrap(), b"ORIGINAL");
+    }
+
+    fn lho_of(zip: &[u8], name: &[u8]) -> u64 {
+        Archive::parse(zip)
+            .unwrap()
+            .entries()
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap()
+            .local_header_offset
+    }
+
+    #[test]
+    fn incremental_commit_appends_changed_keeps_unchanged() {
+        let mut zb = ZipBuilder::new();
+        zb.add("keep.txt", 0, b"unchanged!", 10);
+        zb.add("edit.txt", 0, b"0123456789", 10);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+        let keep_lho_before = lho_of(&zip, b"keep.txt");
+
+        mount.write("edit.txt", 0, b"AB").unwrap();
+        let grown = mount.commit_incremental().unwrap();
+
+        // append-only: 既存バイトはそのまま prefix に残る。
+        assert!(grown.len() > zip.len());
+        assert_eq!(&grown[..zip.len()], &zip[..]);
+
+        // 開き直して両方読める。
+        let m2 = Mount::open(&grown, &params).expect("reopen");
+        assert_eq!(m2.read("keep.txt", 0, 10).unwrap(), b"unchanged!");
+        assert_eq!(m2.read("edit.txt", 0, 10).unwrap(), b"AB23456789");
+
+        // 未変更 keep.txt は元位置のまま、変更 edit.txt は追記領域（元長以降）へ。
+        assert_eq!(lho_of(&grown, b"keep.txt"), keep_lho_before);
+        assert!(lho_of(&grown, b"edit.txt") >= zip.len() as u64);
+    }
+
+    #[test]
+    fn incremental_commit_handles_create_remove_rename() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"AAAA", 4);
+        zb.add("b.txt", 0, b"BBBB", 4);
+        zb.add("c.txt", 0, b"CCCC", 4);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.create("new.txt").unwrap();
+        mount.write("new.txt", 0, b"NEW").unwrap();
+        mount.remove("b.txt").unwrap();
+        mount.rename("c.txt", "d.txt").unwrap();
+        let grown = mount.commit_incremental().unwrap();
+
+        assert_eq!(&grown[..zip.len()], &zip[..]); // prefix 不変。
+        let m2 = Mount::open(&grown, &params).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 4).unwrap(), b"AAAA"); // 未変更。
+        assert_eq!(m2.read("new.txt", 0, 3).unwrap(), b"NEW"); // created。
+        assert_eq!(m2.read("b.txt", 0, 1), Err(ReadError::NotFound)); // removed。
+        assert_eq!(m2.read("d.txt", 0, 4).unwrap(), b"CCCC"); // renamed。
+        assert_eq!(m2.read("c.txt", 0, 1), Err(ReadError::NotFound));
+        assert_eq!(lho_of(&grown, b"a.txt"), lho_of(&zip, b"a.txt")); // 未変更は元位置。
+    }
+
+    #[test]
+    fn incremental_commit_without_changes_keeps_entries_readable() {
+        // 変更ゼロでも壊れた追記をしない（新 CD は全 live を元位置で指す）。
+        let mut zb = ZipBuilder::new();
+        zb.add("x.txt", 0, b"hello", 5);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+        let grown = mount.commit_incremental().unwrap();
+        let m2 = Mount::open(&grown, &params).expect("reopen");
+        assert_eq!(m2.read("x.txt", 0, 5).unwrap(), b"hello");
+        assert_eq!(lho_of(&grown, b"x.txt"), lho_of(&zip, b"x.txt"));
     }
 }
