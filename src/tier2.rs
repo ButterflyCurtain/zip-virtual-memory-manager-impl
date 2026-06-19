@@ -40,6 +40,10 @@ pub struct Tier2 {
     /// （古いレコードは回復 walk の sequence 順 replay で supersede される）。
     index: HashMap<String, HashMap<u64, DataLoc>>,
     page_size: u64,
+    /// このジャーナルに追記した DATA RECORD の累計数（spill / write_hit / flush）。
+    /// live ページ数（[`live_page_count`](Self::live_page_count)）との差が dead
+    /// レコード数の目安で、compaction 発火判定（dead > live）に使う。
+    data_records: u64,
 }
 
 impl Tier2 {
@@ -58,6 +62,7 @@ impl Tier2 {
             read_file,
             index: HashMap::new(),
             page_size: page_size.max(1),
+            data_records: 0,
         })
     }
 
@@ -108,6 +113,7 @@ impl Tier2 {
                 .writer
                 .append_data_record(&v.entry_name, v.page_index, data)?;
             self.put(&v.entry_name, v.page_index, loc);
+            self.data_records += 1;
         }
         Ok(())
     }
@@ -125,6 +131,7 @@ impl Tier2 {
         let data = clamp_tail(full_page, page, self.page_size, logical);
         let loc = self.writer.append_data_record(entry, page, data)?;
         self.put(entry, page, loc);
+        self.data_records += 1;
         Ok(())
     }
 
@@ -139,6 +146,7 @@ impl Tier2 {
             let data = clamp_tail(&full, page, self.page_size, logical);
             let loc = self.writer.append_data_record(&entry, page, data)?;
             self.put(&entry, page, loc);
+            self.data_records += 1;
         }
         let seq = self.writer.last_sequence();
         let count = self.page_count() as u64;
@@ -211,6 +219,45 @@ impl Tier2 {
     /// 情報目的）。
     fn page_count(&self) -> usize {
         self.index.values().map(HashMap::len).sum()
+    }
+
+    // ── compaction サポート（⑤）──
+
+    /// 現在 live な（索引が指している）ページの異なり数。
+    pub fn live_page_count(&self) -> usize {
+        self.page_count()
+    }
+
+    /// このジャーナルに追記した DATA RECORD の累計数（live + dead）。
+    pub fn data_record_count(&self) -> u64 {
+        self.data_records
+    }
+
+    /// dead レコード（supersede 済み / purge 済みで索引が指していない DATA RECORD）が
+    /// live ページ数を超えているか。compaction の発火条件（設計 Section 10）。
+    /// live が 0 のとき（全部 remove 等）も dead>0 なら true。
+    pub fn should_compact(&self) -> bool {
+        let live = self.live_page_count() as u64;
+        let dead = self.data_records.saturating_sub(live);
+        dead > live
+    }
+
+    /// 索引が指している全ページ `(entry, page)` を列挙する（compaction で live
+    /// ページを新ジャーナルへ書き写すのに使う）。`read_page` と併用するため
+    /// 借用を残さないよう所有値で返す。
+    pub fn indexed_pages(&self) -> Vec<(String, u64)> {
+        self.index
+            .iter()
+            .flat_map(|(e, m)| m.keys().map(move |&p| (e.clone(), p)))
+            .collect()
+    }
+
+    /// COMMIT MARKER を書いて durable にする（compaction で新ジャーナルを締める）。
+    /// 全 live ページと METADATA を書き終えた後に 1 回だけ呼ぶ。
+    pub fn commit_marker(&mut self) -> io::Result<()> {
+        let seq = self.writer.last_sequence();
+        let count = self.page_count() as u64;
+        self.writer.append_commit_marker(seq, count)
     }
 }
 

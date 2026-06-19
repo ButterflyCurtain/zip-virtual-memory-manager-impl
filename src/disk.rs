@@ -226,6 +226,11 @@ pub struct FileMount {
     miss_tick: Cell<u32>,
     /// 一度 STALE になったら以降の read は一律 ESTALE（スティッキー）。
     stale: Cell<bool>,
+    /// spill / compaction の durability（新 vmdirty 生成時に引き継ぐ）。
+    sync: SyncPolicy,
+    /// open 時のソース cd_hash（compaction で新 vmdirty ヘッダに入れる。fingerprint
+    /// の一部）。再 stat はせず open 時の値を保持する。
+    cd_hash: [u8; 16],
 }
 
 impl FileMount {
@@ -310,6 +315,10 @@ impl FileMount {
         let vmdirty_path = sidecar.join("vmdirty");
         let mut tier2: Option<Tier2> = None;
 
+        // 中断した compaction の置き去り（`vmdirty.compact`）は authoritative では
+        // ないので掃除する（vmdirty 本体だけが正、orphan は無視）。
+        let _ = fs::remove_file(compact_tmp(&vmdirty_path));
+
         // ── 回復（vmdirty があれば）──
         if vmdirty_path.exists() {
             let bytes = fs::read(&vmdirty_path)?;
@@ -367,6 +376,8 @@ impl FileMount {
             estale_interval: options.estale_interval,
             miss_tick: Cell::new(0),
             stale: Cell::new(false),
+            sync: options.sync,
+            cd_hash,
         })
     }
 
@@ -509,6 +520,82 @@ impl FileMount {
         Ok(())
     }
 
+    /// vmdirty の dead レコードが live ページを超えているか（compaction の発火条件、
+    /// 設計 Section 10）。spill 無効なら常に `false`。
+    pub fn should_compact(&self) -> bool {
+        self.tier2
+            .borrow()
+            .as_ref()
+            .is_some_and(Tier2::should_compact)
+    }
+
+    /// vmdirty を compaction する（⑤）。supersede / purge 済みの dead DATA RECORD を
+    /// 捨て、現在の live 状態だけを持つ新世代ジャーナルを作って原子的に差し替える。
+    /// spill 無効（Tier 2 無し）なら no-op。
+    ///
+    /// 手順（クラッシュ安全）:
+    /// 1. `flush` で Tier 1 を旧 vmdirty へ durable 化（以降クラッシュしても旧
+    ///    vmdirty が完全な authoritative）。
+    /// 2. `vmdirty.compact`（別ファイル）に新世代を構築: METADATA（構造変更 +
+    ///    RESIZE）→ live ページ（Tier 1 常駐は Diff から、Tier 2 のみは旧から読み写す）
+    ///    → COMMIT MARKER。ここまでで新ファイルは durable。旧 vmdirty は無傷なので
+    ///    この間のクラッシュは旧から復元でき、orphan な `vmdirty.compact` は次回 open で
+    ///    掃除される。
+    /// 3. 旧 Tier 2 を閉じ（Windows の置換のため）、`vmdirty.compact` → `vmdirty` へ
+    ///    rename で原子置換し親 dir を fsync。以降は新世代で続行。
+    pub fn compact(&self) -> Result<(), FileMountError> {
+        if self.tier2.borrow().is_none() {
+            return Ok(());
+        }
+        let page_size = self.cfg.page_size;
+
+        // 1. Tier 1 を旧 vmdirty へ durable 化（クラッシュ時の authoritative）。
+        self.tier2
+            .borrow_mut()
+            .as_mut()
+            .expect("tier2 present")
+            .flush(&mut self.diff.borrow_mut())?;
+
+        // 2. 新世代を temp に構築。
+        let tmp = compact_tmp(&self.vmdirty_path);
+        let header = new_vmdirty_header(&self.fingerprint, &self.cd_hash, page_size as u32);
+        let mut new = Tier2::create(&tmp, &header, self.sync, page_size)?;
+        // METADATA を先に（RENAME/CREATE/REMOVE + RESIZE。DATA より前の seq）。
+        rejournal_recovered(&mut new, &self.diff.borrow(), &self.entries.borrow())?;
+        {
+            let old_ref = self.tier2.borrow();
+            let old = old_ref.as_ref().expect("tier2 present");
+            let diff = self.diff.borrow();
+            // live ページ: Tier 1 常駐は Diff から（最新コピー）。
+            for (entry, page) in diff.resident_pages() {
+                let logical = diff.logical_size(&entry).unwrap_or(0);
+                let full = diff.page(&entry, page).expect("resident page").to_vec();
+                new.write_hit(&entry, page, &full, logical)?;
+            }
+            // Tier 2 のみのページは旧ジャーナルから読み写す（Tier 1 へは戻さない）。
+            for (entry, page) in old.indexed_pages() {
+                if diff.has_page(&entry, page) {
+                    continue;
+                }
+                let logical = diff.logical_size(&entry).unwrap_or(0);
+                let full = old.read_page(&entry, page)?.expect("indexed page present");
+                new.write_hit(&entry, page, &full, logical)?;
+            }
+        }
+        new.commit_marker()?; // 新ファイルを durable に締める。
+
+        // 3. 旧を閉じてから原子置換。rename が失敗しても tier2 は必ず Some(new) に
+        //    残し（None 化しない）、新世代は temp パスのまま journaling を続けられる
+        //    （次回 open は旧 vmdirty から復元、orphan は掃除）。
+        let old = self.tier2.borrow_mut().take().expect("tier2 present");
+        drop(old);
+        let renamed = fs::rename(&tmp, &self.vmdirty_path);
+        *self.tier2.borrow_mut() = Some(new);
+        renamed?;
+        fsync_parent_dir(&self.vmdirty_path)?;
+        Ok(())
+    }
+
     /// FULL commit（設計 commit() FLOW の FULL path）。Diff Layer を反映した新しい
     /// 完全な ZIP を `archive.new.zip` に書き、`archive.zip` へ `rename` で原子的に
     /// 差し替える。マウントを消費する（mmap を解放）。クラッシュ前は元の
@@ -614,6 +701,15 @@ fn commit_tmp(archive_path: &Path) -> PathBuf {
         .to_os_string();
     name.push(".new");
     archive_path.with_file_name(name)
+}
+
+/// compaction 用の一時ファイルパス（`vmdirty` の隣に `vmdirty.compact`）。新世代を
+/// ここへ構築し、durable にしてから `vmdirty` へ rename で原子置換する。中断時の
+/// 置き去りは authoritative ではなく、次回 open で掃除する。
+fn compact_tmp(vmdirty_path: &Path) -> PathBuf {
+    let mut name = vmdirty_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".compact");
+    vmdirty_path.with_file_name(name)
 }
 
 /// `data` を `tmp` に書き、**fsync してから** `dst` へ rename で原子置換し、親
@@ -1592,5 +1688,99 @@ mod tests {
         m2.commit().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m3.read("b.bin", 0, 16).unwrap(), expect);
+    }
+
+    #[test]
+    fn compaction_shrinks_journal_and_preserves_state() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("comp.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", &vec![0u8; 8])])).unwrap();
+
+        let m = open_spill(&zip_path, 0); // 即 spill
+        // 同じページを繰り返し書く → 旧 DATA RECORD が dead として積む。
+        for i in 0..10u8 {
+            m.write("a.bin", 0, &[i; 8]).unwrap();
+        }
+        let vp = vmdirty_path(dir.path(), "comp.zip");
+        let before = fs::metadata(&vp).unwrap().len();
+        assert!(m.should_compact(), "dead > live のはず");
+
+        m.compact().expect("compact");
+
+        // compaction 後は dead が消え、ジャーナルが縮む。
+        assert!(!m.should_compact());
+        let after = fs::metadata(&vp).unwrap().len();
+        assert!(after < before, "journal should shrink: {after} >= {before}");
+        // orphan な vmdirty.compact は残らない。
+        assert!(!compact_tmp(&vp).exists());
+        // live 状態（最後に書いた値）は保たれる。
+        assert_eq!(m.read("a.bin", 0, 8).unwrap(), vec![9u8; 8]);
+    }
+
+    #[test]
+    fn compaction_result_survives_crash_and_recovers() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("compr.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", &vec![0u8; 8])])).unwrap();
+
+        {
+            let m = open_spill(&zip_path, 0);
+            for i in 0..6u8 {
+                m.write("a.bin", 0, &[i; 8]).unwrap();
+            }
+            m.compact().expect("compact");
+            // compaction は COMMIT MARKER で締めるので、ここで crash しても committed。
+        }
+
+        // 再 open: 新世代ジャーナルから recover_committed。最後の書き込みが戻る。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), vec![5u8; 8]);
+        m2.commit().expect("commit recovered");
+        let m3 = FileMount::open(&zip_path).expect("reopen clean");
+        assert_eq!(m3.read("a.bin", 0, 8).unwrap(), vec![5u8; 8]);
+    }
+
+    #[test]
+    fn compaction_preserves_entry_ops_and_recovers() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("compe.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[("a.bin", b"AAAA"), ("b.bin", b"BBBB"), ("c.bin", b"CCCC")]),
+        )
+        .unwrap();
+
+        {
+            let m = open_spill(&zip_path, 0);
+            m.create("new.bin").unwrap();
+            m.write("new.bin", 0, &[7u8; 4]).unwrap();
+            m.remove("b.bin").unwrap();
+            m.rename("c.bin", "d.bin").unwrap();
+            // dead を積む: new.bin の同じページを書き直す。
+            for i in 0..5u8 {
+                m.write("new.bin", 0, &[i; 4]).unwrap();
+            }
+            m.compact().expect("compact");
+
+            // compaction 直後の live 状態。
+            assert_eq!(m.read("new.bin", 0, 4).unwrap(), vec![4u8; 4]);
+            assert_eq!(m.read("a.bin", 0, 4).unwrap(), b"AAAA");
+            assert_eq!(m.read("b.bin", 0, 1), Err(ReadError::NotFound));
+            assert_eq!(m.read("d.bin", 0, 4).unwrap(), b"CCCC");
+            assert_eq!(m.read("c.bin", 0, 1), Err(ReadError::NotFound));
+        }
+
+        // crash → 新世代から回復しても同じ（構造変更 + 別名 + created が保たれる）。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(m2.read("new.bin", 0, 4).unwrap(), vec![4u8; 4]);
+        assert_eq!(m2.read("b.bin", 0, 1), Err(ReadError::NotFound));
+        assert_eq!(m2.read("d.bin", 0, 4).unwrap(), b"CCCC");
+        assert_eq!(m2.read("c.bin", 0, 1), Err(ReadError::NotFound));
+        m2.commit().expect("commit recovered");
+        let m3 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m3.read("new.bin", 0, 4).unwrap(), vec![4u8; 4]);
+        assert_eq!(m3.read("d.bin", 0, 4).unwrap(), b"CCCC");
+        assert_eq!(m3.read("b.bin", 0, 1), Err(ReadError::NotFound));
+        assert_eq!(m3.read("c.bin", 0, 1), Err(ReadError::NotFound));
     }
 }
