@@ -273,8 +273,10 @@ impl<'a> Mount<'a> {
     /// それ以外はページキャッシュ経由（ミス時のみ展開 + read-ahead 充填）。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
         let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
-        // dirty（overlaid / 書き込み済み）または created は Diff Layer から。
-        if self.diff.borrow().is_dirty(path) || resolved.source.is_none() {
+        // overlaid（dirty / created / 別名）は Diff Layer 経由で読む。別名は
+        // ソース名が現在名と異なるので（`source != Some(path)`）ここに入り、
+        // read_dirty がソース名でソース ZIP を読む。
+        if self.diff.borrow().is_dirty(path) || resolved.source.as_deref() != Some(path) {
             return read_dirty(
                 self.archive,
                 &self.vmidx_image,
@@ -356,8 +358,22 @@ impl<'a> Mount<'a> {
         )
     }
 
-    /// dirty なエントリ、または構造変更（create / remove）があるか（commit が実体を
-    /// 持つか）。
+    /// エントリ `old` を `new` へ rename する（設計 rename()）。データは再圧縮せず
+    /// `new` を `old` のソースへの別名にする。`old` が無ければ [`EntryError::NotFound`]、
+    /// `new` が既に存在すれば（同名指定含む）[`EntryError::Exists`]。
+    pub fn rename(&self, old: &str, new: &str) -> Result<(), EntryError> {
+        entry_rename(
+            &mut self.entries.borrow_mut(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            None,
+            old,
+            new,
+        )
+    }
+
+    /// dirty なエントリ、または構造変更（create / remove / rename）があるか
+    /// （commit が実体を持つか）。
     pub fn is_dirty(&self) -> bool {
         !self.diff.borrow().is_empty() || !self.entries.borrow().is_empty()
     }
@@ -453,6 +469,20 @@ pub fn resolve_entry(
     path: &str,
 ) -> Result<ResolvedEntry, ResolveError> {
     let vmidx = Vmidx::parse(vmidx_image).map_err(ResolveError::Vmidx)?;
+    // 別名（rename ターゲット）は現在名ではなく **ソース名**で vmidx を引く。
+    if let Some(src) = table.aliased_source(path) {
+        let (_, record) = vmidx
+            .lookup(src)
+            .map_err(ResolveError::Vmidx)?
+            .ok_or(ResolveError::NotFound)?;
+        if builtin_provider(record.provider_type).is_none() {
+            return Err(ResolveError::Unsupported(record.provider_type));
+        }
+        return Ok(ResolvedEntry {
+            source: Some(src.to_owned()),
+            original_size: record.uncompressed_size,
+        });
+    }
     let rec = vmidx.lookup(path).map_err(ResolveError::Vmidx)?;
     match table.kind(path, rec.is_some()) {
         Kind::Absent => Err(ResolveError::NotFound),
@@ -549,6 +579,45 @@ pub fn entry_truncate(
         }
         t2.journal_op(path, &MetaOp::Resize { new_size })
             .map_err(|e| EntryError::Journal(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// エントリ `old` を `new` へ rename する（設計 rename()）。`old` が存在しなければ
+/// [`EntryError::NotFound`]、`new` が既に実効的に存在すれば（同名指定を含む）
+/// [`EntryError::Exists`]。データは再圧縮せず、`new` を `old` の究極のソースへの
+/// 別名にする（[`EntryTable::apply_rename`]）。ソース ZIP は触らない。圧縮種別が
+/// 未対応（Zstd 等）でも rename 自体は通る（verbatim コピーで commit できるため。
+/// 読み書きは別名でも従来どおり Unsupported）。`tier2` があれば Diff / 索引を
+/// 付け替え、METADATA RENAME を journal する。
+pub fn entry_rename(
+    table: &mut EntryTable,
+    diff: &mut DiffLayer,
+    vmidx_image: &[u8],
+    tier2: Option<&mut Tier2>,
+    old: &str,
+    new: &str,
+) -> Result<(), EntryError> {
+    let old_in_vmidx = entry_in_vmidx(vmidx_image, old)?;
+    if table.kind(old, old_in_vmidx) == Kind::Absent {
+        return Err(EntryError::NotFound);
+    }
+    let new_in_vmidx = entry_in_vmidx(vmidx_image, new)?;
+    // old == new もここで Exists（kind(new) == kind(old) != Absent）。
+    if table.kind(new, new_in_vmidx) != Kind::Absent {
+        return Err(EntryError::Exists);
+    }
+    table.apply_rename(old, new, old_in_vmidx);
+    diff.rename_entry(old, new);
+    if let Some(t2) = tier2 {
+        t2.rename_entry(old, new);
+        t2.journal_op(
+            old,
+            &MetaOp::Rename {
+                new_name: new.to_owned(),
+            },
+        )
+        .map_err(|e| EntryError::Journal(e.to_string()))?;
     }
     Ok(())
 }
@@ -671,9 +740,11 @@ pub fn read_dirty(
     len: usize,
 ) -> Result<Vec<u8>, ReadError> {
     // 存在確認は呼び出し側の [`resolve_entry`] が済ませている。`source` = 未変更
-    // ページを読むソース名（None = created）。ソース読み出しの上限は Diff Layer の
-    // source high-water（truncate-shrink で縮む）を優先する。
-    let logical = diff.logical_size(path).ok_or(ReadError::NotFound)?;
+    // ページを読むソース名（None = created）。Diff にエントリが無いのは「1 度も
+    // 書いていない別名」（純粋な rename）だけで、論理サイズ・source high-water とも
+    // 呼び出し側が渡す `original_size`（= ソースの uncompressed_size）に従う。
+    // dirty なら Diff の値（truncate-shrink で縮んだ high-water 含む）を優先。
+    let logical = diff.logical_size(path).unwrap_or(original_size);
     let original_size = diff.source_size(path).unwrap_or(original_size);
     let page_size = diff.page_size();
 
@@ -1546,5 +1617,154 @@ mod tests {
         let new_zip = mount.commit().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 10).unwrap(), b"AB234567YZ");
+    }
+
+    #[test]
+    fn rename_unchanged_store_entry_then_commit() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"payload!!", 9);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.rename("a.txt", "b.txt").unwrap();
+        // 旧名は消え、新名で元データが読める（再圧縮なし）。
+        assert_eq!(mount.read("a.txt", 0, 9), Err(ReadError::NotFound));
+        assert_eq!(mount.read("b.txt", 0, 9).unwrap(), b"payload!!");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("b.txt", 0, 9).unwrap(), b"payload!!");
+        assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn rename_unchanged_deflate_entry_commits_verbatim() {
+        let data = sample_data(50_000);
+        let mut zb = ZipBuilder::new();
+        zb.add("d.bin", 8, &raw_deflate(&data), data.len() as u32);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.rename("d.bin", "moved.bin").unwrap();
+        assert_eq!(mount.read("moved.bin", 0, 100).unwrap(), &data[..100]);
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("moved.bin", 1000, 200).unwrap(), &data[1000..1200]);
+        assert_eq!(m2.read("d.bin", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn rename_then_write_recompresses_under_new_name() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"0123456789", 10);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.rename("a.txt", "b.txt").unwrap();
+        mount.write("b.txt", 0, b"AB").unwrap();
+        // COW: 書いた所だけ変わり、残りはソース a.txt の元データから引く。
+        assert_eq!(mount.read("b.txt", 0, 10).unwrap(), b"AB23456789");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("b.txt", 0, 10).unwrap(), b"AB23456789");
+    }
+
+    #[test]
+    fn rename_chain_folds_to_original_source() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"chained", 7);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.rename("a.txt", "b.txt").unwrap();
+        mount.rename("b.txt", "c.txt").unwrap();
+        assert_eq!(mount.read("b.txt", 0, 7), Err(ReadError::NotFound));
+        assert_eq!(mount.read("c.txt", 0, 7).unwrap(), b"chained");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("c.txt", 0, 7).unwrap(), b"chained");
+        assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn rename_errors_on_missing_and_existing() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"a", 1);
+        zb.add("b.txt", 0, b"b", 1);
+        let zip = zb.finish();
+        let mount = Mount::open(&zip, &BuildParams::default()).expect("open");
+
+        assert_eq!(mount.rename("ghost", "x"), Err(EntryError::NotFound));
+        assert_eq!(mount.rename("a.txt", "b.txt"), Err(EntryError::Exists));
+        // 同名指定も Exists。
+        assert_eq!(mount.rename("a.txt", "a.txt"), Err(EntryError::Exists));
+    }
+
+    #[test]
+    fn rename_onto_removed_name_reuses_target() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"AAA", 3);
+        zb.add("b.txt", 0, b"BBB", 3);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.remove("b.txt").unwrap();
+        mount.rename("a.txt", "b.txt").unwrap();
+        // b.txt は今や a.txt のソースを指す（元の "BBB" ではない）。
+        assert_eq!(mount.read("b.txt", 0, 3).unwrap(), b"AAA");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("b.txt", 0, 3).unwrap(), b"AAA");
+        assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn rename_created_entry_stays_created() {
+        let mut zb = ZipBuilder::new();
+        zb.add("keep.txt", 0, b"keep", 4);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.create("x.txt").unwrap();
+        mount.write("x.txt", 0, b"made").unwrap();
+        mount.rename("x.txt", "y.txt").unwrap();
+        assert_eq!(mount.read("x.txt", 0, 4), Err(ReadError::NotFound));
+        assert_eq!(mount.read("y.txt", 0, 4).unwrap(), b"made");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("y.txt", 0, 4).unwrap(), b"made");
+        assert_eq!(m2.read("keep.txt", 0, 4).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn rename_recreate_old_name_keeps_both() {
+        // rename a→b の後 a を作り直すと、a（新規）と b（元 a のソース）が併存。
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"ORIGINAL", 8);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.rename("a.txt", "b.txt").unwrap();
+        mount.create("a.txt").unwrap();
+        mount.write("a.txt", 0, b"new").unwrap();
+        assert_eq!(mount.read("a.txt", 0, 8).unwrap(), b"new");
+        assert_eq!(mount.read("b.txt", 0, 8).unwrap(), b"ORIGINAL");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 3).unwrap(), b"new");
+        assert_eq!(m2.read("b.txt", 0, 8).unwrap(), b"ORIGINAL");
     }
 }

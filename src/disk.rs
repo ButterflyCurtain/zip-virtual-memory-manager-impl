@@ -23,8 +23,8 @@ use crate::difflayer::{DiffLayer, UNLIMITED};
 use crate::entrytable::EntryTable;
 use crate::index_build::BuildParams;
 use crate::mount::{
-    entry_create, entry_remove, entry_truncate, read_cached, read_dirty, resolve_entry,
-    resolve_index, write_into, EntryError, OpenError, ReadError, WriteError,
+    entry_create, entry_remove, entry_rename, entry_truncate, read_cached, read_dirty,
+    resolve_entry, resolve_index, write_into, EntryError, OpenError, ReadError, WriteError,
 };
 use crate::page::{PageCache, PageConfig};
 use crate::tier2::Tier2;
@@ -392,9 +392,9 @@ impl FileMount {
             return Err(ReadError::Stale);
         }
         let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
-        // dirty（overlaid / 書き込み済み）または created は Diff Layer から
-        // （設計 READ PATH の Tier 1 → Tier 2）。
-        if self.diff.borrow().is_dirty(path) || resolved.source.is_none() {
+        // overlaid（dirty / created / 別名）は Diff Layer 経由（設計 READ PATH の
+        // Tier 1 → Tier 2）。別名はソース名が現在名と異なるのでここに入る。
+        if self.diff.borrow().is_dirty(path) || resolved.source.as_deref() != Some(path) {
             let t2 = self.tier2.borrow();
             return read_dirty(
                 &self.archive,
@@ -479,7 +479,22 @@ impl FileMount {
         )
     }
 
-    /// dirty な変更、または構造変更（create / remove）があるか。
+    /// エントリ `old` を `new` へ rename する（設計 rename()）。`old` が無ければ
+    /// [`EntryError::NotFound`]、`new` が既に存在すれば（同名指定含む）
+    /// [`EntryError::Exists`]。spill 有効時は METADATA RENAME を vmdirty に journal する。
+    pub fn rename(&self, old: &str, new: &str) -> Result<(), EntryError> {
+        let mut t2 = self.tier2.borrow_mut();
+        entry_rename(
+            &mut self.entries.borrow_mut(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            t2.as_mut(),
+            old,
+            new,
+        )
+    }
+
+    /// dirty な変更、または構造変更（create / remove / rename）があるか。
     pub fn is_dirty(&self) -> bool {
         !self.diff.borrow().is_empty() || !self.entries.borrow().is_empty()
     }
@@ -676,7 +691,7 @@ fn replay_recovered(
     for (_, item) in items {
         match item {
             Item::Page(p) => {
-                let base = original_size(vmidx_image, &p.entry_name).unwrap_or(0);
+                let base = base_for(vmidx_image, table, &p.entry_name);
                 diff.ensure_entry(&p.entry_name, base);
                 let candidate = p.page_index.saturating_mul(ps) + p.data.len() as u64;
                 let cur = diff.logical_size(&p.entry_name).unwrap_or(base);
@@ -700,7 +715,7 @@ fn replay_recovered(
                     diff.remove_entry(&o.entry_name);
                 }
                 MetaOp::Resize { new_size } => {
-                    let base = original_size(vmidx_image, &o.entry_name).unwrap_or(0);
+                    let base = base_for(vmidx_image, table, &o.entry_name);
                     diff.ensure_entry(&o.entry_name, base);
                     let cur = diff.logical_size(&o.entry_name).unwrap_or(base);
                     if *new_size < cur {
@@ -708,8 +723,13 @@ fn replay_recovered(
                     }
                     diff.set_logical_size(&o.entry_name, *new_size);
                 }
-                // RENAME（④b）は ④a の vmdirty には現れない。
-                MetaOp::Rename { .. } => {}
+                MetaOp::Rename { new_name } => {
+                    // dirty 状態を付け替えてから別名オーバーレイを立てる（以降の
+                    // RESIZE/DATA は新名で来て base_for がソースから base を引く）。
+                    let old_in_vmidx = original_size(vmidx_image, &o.entry_name).is_some();
+                    diff.rename_entry(&o.entry_name, new_name);
+                    table.apply_rename(&o.entry_name, new_name, old_in_vmidx);
+                }
             },
         }
     }
@@ -728,8 +748,28 @@ fn rejournal_recovered(t2: &mut Tier2, diff: &DiffLayer, table: &EntryTable) -> 
     for name in table.created_names() {
         t2.journal_op(name, &MetaOp::Create)?;
     }
+    // rename 元（別名のソース名）は tombstone だが、その消失は RENAME が表すので
+    // REMOVE は書かない（書くと replay で RENAME 前にソースが消える）。
+    let alias_sources: Vec<&str> = table.aliases().map(|(_, s)| s).collect();
     for name in table.tombstones() {
+        if alias_sources.contains(&name) {
+            continue;
+        }
         t2.journal_op(name, &MetaOp::Remove)?;
+    }
+    // 別名は RENAME(ソース → 現在名) で再現する。RESIZE/DATA より前に書くことで
+    // replay の base_for がソースから base を引ける（dirty 別名のサイズ整合）。
+    let aliases: Vec<(String, String)> = table
+        .aliases()
+        .map(|(c, s)| (c.to_owned(), s.to_owned()))
+        .collect();
+    for (current, source) in aliases {
+        t2.journal_op(
+            &source,
+            &MetaOp::Rename {
+                new_name: current,
+            },
+        )?;
     }
     let sizes: Vec<(String, u64, u64)> = diff
         .dirty_paths()
@@ -746,6 +786,13 @@ fn rejournal_recovered(t2: &mut Tier2, diff: &DiffLayer, table: &EntryTable) -> 
         t2.journal_op(&name, &MetaOp::Resize { new_size: logical })?;
     }
     Ok(())
+}
+
+/// 回復 replay の logical_size base。別名（rename ターゲット）なら **ソース名**で
+/// vmidx を引く（現在名は vmidx に無いため）。プレーンなら現在名。無ければ 0。
+fn base_for(vmidx_image: &[u8], table: &EntryTable, name: &str) -> u64 {
+    let src = table.aliased_source(name).unwrap_or(name);
+    original_size(vmidx_image, src).unwrap_or(0)
 }
 
 /// vmidx からエントリの元 `uncompressed_size` を引く（回復の logical_size の base）。
@@ -1397,5 +1444,75 @@ mod tests {
         let m = FileMount::open(&zip_path).expect("clean reopen");
         assert_eq!(m.read("data.bin", 0, 8).unwrap(), b"abcdefgh");
         assert!(!m.is_dirty());
+    }
+
+    #[test]
+    fn rename_persists_through_commit() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("rn.zip");
+        fs::write(&zip_path, store_zip(&[("a.txt", b"payload!"), ("k.txt", b"keep")])).unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        m.rename("a.txt", "b.txt").unwrap();
+        assert_eq!(m.read("a.txt", 0, 1), Err(ReadError::NotFound));
+        assert_eq!(m.read("b.txt", 0, 8).unwrap(), b"payload!");
+        m.commit().expect("commit");
+
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m2.read("b.txt", 0, 8).unwrap(), b"payload!");
+        assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
+        assert_eq!(m2.read("k.txt", 0, 4).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn recover_unchanged_rename_after_flush_then_crash() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("rrn.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", b"abcdefgh")])).unwrap();
+
+        // セッション 1: 純粋な rename（書き込みなし）+ flush → commit せず crash。
+        {
+            let m = open_spill(&zip_path, 0);
+            m.rename("a.bin", "b.bin").unwrap();
+            m.flush().expect("flush");
+        }
+        assert!(vmdirty_path(dir.path(), "rrn.zip").exists());
+
+        // セッション 2: auto recover_committed。別名は RENAME 再 journal から復元され、
+        // 未変更ページはソース a.bin から読める。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(m2.read("b.bin", 0, 8).unwrap(), b"abcdefgh");
+        assert_eq!(m2.read("a.bin", 0, 1), Err(ReadError::NotFound));
+        m2.commit().expect("commit recovered");
+        let m3 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m3.read("b.bin", 0, 8).unwrap(), b"abcdefgh");
+        assert_eq!(m3.read("a.bin", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn recover_rename_then_partial_write_after_flush_then_crash() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("rnw.zip");
+        // 16 バイト（ページ 8 で 2 ページ）。COW で先頭ページだけ書く。
+        let original: Vec<u8> = (0..16u8).collect();
+        fs::write(&zip_path, store_zip(&[("a.bin", &original)])).unwrap();
+
+        {
+            let m = open_spill(&zip_path, 0); // 即 spill（dirty 別名 → Tier 2）
+            m.rename("a.bin", "b.bin").unwrap();
+            m.write("b.bin", 0, b"XY").unwrap();
+            m.flush().expect("flush");
+        }
+
+        // 回復後、書いた先頭は XY、未書き込み（2 ページ目）はソース a.bin の元バイト。
+        let m2 = open_spill(&zip_path, 0);
+        let mut expect = original.clone();
+        expect[0] = b'X';
+        expect[1] = b'Y';
+        assert_eq!(m2.read("b.bin", 0, 16).unwrap(), expect);
+        assert_eq!(m2.read("a.bin", 0, 1), Err(ReadError::NotFound));
+        m2.commit().expect("commit recovered");
+        let m3 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m3.read("b.bin", 0, 16).unwrap(), expect);
     }
 }

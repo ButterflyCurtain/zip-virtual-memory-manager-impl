@@ -144,6 +144,27 @@ impl DiffLayer {
             });
     }
 
+    /// dirty 状態のキーを `old` から `new` へ付け替える（rename）。`old` に
+    /// dirty エントリが無ければ何もしない（純粋な rename で 1 度も書いていない
+    /// 場合＝未変更ページはソースから引くので Diff には何も無い）。ページ・論理
+    /// サイズ・source_size・FIFO スタンプはそのまま引き継ぐ（会計 `dirty_current`
+    /// は不変）。`new` 側の既存エントリは呼び出し側が存在チェック（EEXIST）で
+    /// 排除している前提で上書きする。
+    pub fn rename_entry(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if let Some(entry) = self.entries.remove(old) {
+            self.entries.insert(new.to_owned(), entry);
+            // FIFO 並びの (エントリ名, ページ) も付け替える（スタンプは保持）。
+            for (name, _) in self.order.values_mut() {
+                if name == old {
+                    *name = new.to_owned();
+                }
+            }
+        }
+    }
+
     /// `path` の source_size（未変更ページをソースから読んでよい先頭バイト数）。
     /// dirty でなければ `None`。
     pub fn source_size(&self, path: &str) -> Option<u64> {
@@ -313,6 +334,45 @@ mod tests {
         assert!(d.has_page("a", 0));
         d.page_mut("a", 0).unwrap()[3] = 0x42;
         assert_eq!(d.page("a", 0).unwrap()[3], 0x42);
+    }
+
+    #[test]
+    fn rename_entry_moves_state_and_keeps_accounting() {
+        let mut d = DiffLayer::new(8);
+        d.ensure_entry("a", 16);
+        d.insert_page("a", 0, vec![0xAB; 8]);
+        d.set_logical_size("a", 20);
+        let before = d.dirty_bytes();
+        d.rename_entry("a", "b");
+        // old は消え、new が状態を引き継ぐ。
+        assert!(!d.is_dirty("a"));
+        assert!(d.is_dirty("b"));
+        assert_eq!(d.logical_size("b"), Some(20));
+        assert_eq!(d.source_size("b"), Some(16));
+        assert_eq!(d.page("b", 0).unwrap()[0], 0xAB);
+        assert_eq!(d.dirty_bytes(), before); // 会計は不変
+    }
+
+    #[test]
+    fn rename_entry_noop_when_source_clean() {
+        let mut d = DiffLayer::new(8);
+        // 1 度も書いていない名前の rename は Diff に何も作らない。
+        d.rename_entry("a", "b");
+        assert!(!d.is_dirty("a"));
+        assert!(!d.is_dirty("b"));
+    }
+
+    #[test]
+    fn rename_entry_preserves_fifo_victim_order() {
+        // a の古いページ → b へ rename しても FIFO 最古のまま退避される。
+        let mut d = DiffLayer::with_dirty_limit(8, 8);
+        put(&mut d, "a", 0); // 最古
+        put(&mut d, "c", 0); // 新しい
+        d.rename_entry("a", "b");
+        let victims = d.take_spill_victims();
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].entry_name, "b"); // 付け替え後の名前で最古
+        assert_eq!(victims[0].page_index, 0);
     }
 
     #[test]

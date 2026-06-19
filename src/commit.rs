@@ -74,9 +74,12 @@ impl std::error::Error for CommitError {}
 /// `table` はセッション内の構造変更（create / remove）。実効的なエントリ集合は
 /// 「vmidx − tombstone ∪ created」で組み立てる:
 ///
-/// - tombstone → 出力しない。
+/// - tombstone（remove / rename 元）→ 出力しない。
 /// - created（vmidx に同名があれば上書き、無ければ新規）→ Diff から組み立て、
 ///   既定 DEFLATE で再圧縮して新しい LFH/CD を出す。
+/// - 別名（rename ターゲット）→ 現在名で出力し、未変更データはソース名の archive
+///   エントリから引く。未 dirty なら verbatim コピー（未対応圧縮種別でも通る）、
+///   dirty なら組み立て直してソースの元メソッドで再圧縮する。
 /// - それ以外のソースエントリ → dirty なら再圧縮、未変更なら verbatim コピー。
 pub fn build_full(
     archive: &[u8],
@@ -97,6 +100,11 @@ pub fn build_full(
 
         // UTF-8 名のみオーバーレイ対象（非 UTF-8 名は table に入りえない）。
         if let Some(name) = name_utf8 {
+            // この vmidx 名が rename ターゲットとして再利用されている場合（別名）は、
+            // ここでは出さず後段の別名ループでソースから組み立てる。
+            if table.is_aliased(name) {
+                continue;
+            }
             match table.kind(name, true) {
                 Kind::Absent => continue, // tombstone → 出力しない
                 Kind::Created => {
@@ -143,6 +151,45 @@ pub fn build_full(
         }
         let (method, crc, stored, uncomp) = build_created(archive, vmidx_image, diff, name)?;
         place_entry(&mut body, &mut placed, method, crc, &stored, uncomp, name.as_bytes())?;
+    }
+
+    // 別名エントリ（rename ターゲット）。現在名で出力し、未変更データはソース名の
+    // archive エントリから引く。未 dirty なら圧縮ストリームを verbatim コピー
+    // （再圧縮なし＝未対応圧縮種別でも通る）、dirty なら論理内容を組み立てて
+    // ソースの元メソッドで再圧縮する。
+    for (current, source) in table.aliases() {
+        let src_entry = ar
+            .entries()
+            .iter()
+            .find(|e| e.name == source.as_bytes())
+            .ok_or(CommitError::Read(ReadError::NotFound))?;
+        let (method, crc, stored, uncomp) = if diff.is_dirty(current) {
+            let logical = diff
+                .logical_size(current)
+                .unwrap_or(src_entry.uncompressed_size);
+            let original = diff
+                .source_size(current)
+                .unwrap_or(src_entry.uncompressed_size);
+            let content =
+                assemble_content(archive, vmidx_image, diff, current, logical, original, Some(source))?;
+            let crc = crc32(&content);
+            let (method, stored) = match src_entry.provider_type {
+                ProviderType::Store => (0u16, content.clone()),
+                ProviderType::Deflate => (8u16, deflate(&content)?),
+                other => return Err(CommitError::Unsupported(other)),
+            };
+            (method, crc, stored, content.len() as u64)
+        } else {
+            // 未変更: ソースの圧縮ストリームを verbatim コピー（CRC・サイズは CD）。
+            let stored = ar.entry_data(src_entry).map_err(CommitError::Zip)?.to_vec();
+            (
+                src_entry.method_code,
+                src_entry.crc32,
+                stored,
+                src_entry.uncompressed_size,
+            )
+        };
+        place_entry(&mut body, &mut placed, method, crc, &stored, uncomp, current.as_bytes())?;
     }
 
     // Central Directory。

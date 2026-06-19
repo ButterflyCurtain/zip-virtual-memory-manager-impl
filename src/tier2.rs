@@ -185,6 +185,19 @@ impl Tier2 {
         self.index.remove(entry);
     }
 
+    /// Tier 2 索引のキーを `old` から `new` へ付け替える（rename）。ディスク上の
+    /// 旧 DATA RECORD は `old` 名のまま残るが、回復 replay は RENAME RECORD を
+    /// sequence 順に適用して同じ付け替えを再現する。`old` に索引が無ければ no-op。
+    /// ジャーナルへの RENAME 追記は [`journal_op`](Self::journal_op) で別途行う。
+    pub fn rename_entry(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if let Some(pages) = self.index.remove(old) {
+            self.index.insert(new.to_owned(), pages);
+        }
+    }
+
     /// `entry` の `new_size` 以降に完全に収まるページを Tier 2 索引から外す
     /// （truncate-shrink 用）。再 extend 時に古い末尾ページが蘇らないようにする。
     pub fn purge_pages_beyond(&mut self, entry: &str, new_size: u64) {

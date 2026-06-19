@@ -1,7 +1,7 @@
 //! In-memory エントリ表（設計 ENTRY OPERATIONS）。
 //!
-//! immutable な vmidx の上に被せ、セッション内の **構造変更**（create / remove、
-//! ④b で rename）を表現するオーバーレイ。実効的なエントリ集合は
+//! immutable な vmidx の上に被せ、セッション内の **構造変更**（create / remove /
+//! rename）を表現するオーバーレイ。実効的なエントリ集合は
 //! 「vmidx ∪ created − tombstone（+ rename）」で、[`kind`](EntryTable::kind) が
 //! 1 名前についてそれを判定する。
 //!
@@ -11,9 +11,14 @@
 //! [`disk`](crate::disk)）の責務。truncate は構造を変えない（論理サイズの変更 +
 //! ページ整理）ので、ここには記録しない。
 //!
-//! **④a の範囲**: Created / Tombstone のみ。rename（現在名 → 別ソース名への
-//! 写像）は ④b で `Aliased { source }` を加えて表現する。それまで「あるエントリの
-//! ソース名は現在名に一致する」（[`Kind::Source`]）。
+//! **rename（④b）**: 現在名を別のソース名へ写像する `Aliased { source }` で
+//! 表現する。`rename(old, new)` は `new → Aliased { source }`（`source` は old の
+//! 究極のソース名＝old がプレーンなら old 自身、old が既に別名なら連鎖を畳んだ
+//! 元のソース名）と `old → Tombstone` を立てる。[`kind`](EntryTable::kind) は
+//! Aliased を [`Kind::Source`] として返しつつ、未変更ページの読み出しは
+//! `source` 名で行う（[`aliased_source`](EntryTable::aliased_source)）。
+//! `source` は常に **immutable な archive 内の名前**を指す（セッション内の
+//! create/remove には影響されない）。
 
 use std::collections::HashMap;
 
@@ -25,8 +30,10 @@ enum Overlay {
     Created,
     /// remove された（tombstone）。read/write は ENOENT、commit は出力しない。
     Tombstone,
-    // ④b: Aliased { source: String } を追加して rename を表現する。
-    //      kind() は Source を返しつつ、ソース読み出しは `source` 名で行う。
+    /// rename の結果、この現在名は別のソース名（archive 内の名前）からデータを
+    /// 引く（設計 rename()）。kind() は Source を返しつつ、未変更ページの読み出しと
+    /// commit の verbatim コピーは `source` で行う。
+    Aliased { source: String },
 }
 
 /// エントリの実効的な種別（vmidx ∪ created − tombstone）。
@@ -64,6 +71,8 @@ impl EntryTable {
         match self.overlay.get(name) {
             Some(Overlay::Tombstone) => Kind::Absent,
             Some(Overlay::Created) => Kind::Created,
+            // 別名はソース由来として扱う（ただし読み出しは `aliased_source` の名前）。
+            Some(Overlay::Aliased { .. }) => Kind::Source,
             None => {
                 if in_vmidx {
                     Kind::Source
@@ -82,6 +91,68 @@ impl EntryTable {
     /// `name` を tombstone にする（remove）。
     pub fn mark_tombstone(&mut self, name: &str) {
         self.overlay.insert(name.to_owned(), Overlay::Tombstone);
+    }
+
+    /// `name` を `source`（archive 内のソース名）への別名にする（rename ターゲット）。
+    pub fn mark_aliased(&mut self, name: &str, source: &str) {
+        self.overlay.insert(
+            name.to_owned(),
+            Overlay::Aliased {
+                source: source.to_owned(),
+            },
+        );
+    }
+
+    /// `name` が別名なら、その究極のソース名（archive 内の名前）。プレーンな
+    /// ソース・created・tombstone・未知なら `None`。
+    pub fn aliased_source(&self, name: &str) -> Option<&str> {
+        match self.overlay.get(name) {
+            Some(Overlay::Aliased { source }) => Some(source.as_str()),
+            _ => None,
+        }
+    }
+
+    /// `name` が別名（rename ターゲット）か。
+    pub fn is_aliased(&self, name: &str) -> bool {
+        matches!(self.overlay.get(name), Some(Overlay::Aliased { .. }))
+    }
+
+    /// 別名エントリ（現在名, ソース名）の列。commit で現在名へ出力しソースから
+    /// データを引く対象、および回復後の再 journal（RENAME）対象。
+    pub fn aliases(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.overlay.iter().filter_map(|(k, v)| match v {
+            Overlay::Aliased { source } => Some((k.as_str(), source.as_str())),
+            _ => None,
+        })
+    }
+
+    /// rename(old → new) のオーバーレイ遷移（存在チェックは呼び出し側）。new は
+    /// old のデータ同一性を継承する: created なら created、別名/プレーンなら究極の
+    /// ソース名への別名。old は tombstone にする。`old_in_vmidx` は old 名の
+    /// ソースエントリが vmidx に在るか。回復 replay と live の両方から使う。
+    pub fn apply_rename(&mut self, old: &str, new: &str, old_in_vmidx: bool) {
+        let new_overlay = match self.overlay.get(old) {
+            // created の rename → 連鎖して created（ソース無し）。
+            Some(Overlay::Created) => Overlay::Created,
+            // 既に別名 → 究極のソース名を畳んで引き継ぐ（連鎖 rename）。
+            Some(Overlay::Aliased { source }) => Overlay::Aliased {
+                source: source.clone(),
+            },
+            // tombstone は本来到達しない（呼び出し側が ENOENT 弾き）。防御的に
+            // None と同じ扱い。
+            Some(Overlay::Tombstone) | None => {
+                if old_in_vmidx {
+                    Overlay::Aliased {
+                        source: old.to_owned(),
+                    }
+                } else {
+                    // ソースも無い → created 相当（空）。
+                    Overlay::Created
+                }
+            }
+        };
+        self.overlay.insert(new.to_owned(), new_overlay);
+        self.overlay.insert(old.to_owned(), Overlay::Tombstone);
     }
 
     /// created オーバーレイを持つ名前（commit で新規 LFH/CD を出す対象、
@@ -141,6 +212,49 @@ mod tests {
         assert_eq!(t.kind("gone", true), Kind::Absent);
         let toms: Vec<&str> = t.tombstones().collect();
         assert_eq!(toms, vec!["gone"]);
+    }
+
+    #[test]
+    fn rename_plain_source_creates_alias_and_tombstone() {
+        let mut t = EntryTable::new();
+        // a は vmidx 由来のプレーンなソース。
+        t.apply_rename("a", "b", true);
+        assert_eq!(t.kind("a", true), Kind::Absent); // old は消える
+        assert_eq!(t.kind("b", false), Kind::Source); // new はソース扱い
+        assert_eq!(t.aliased_source("b"), Some("a")); // ただしソースは a
+        assert!(t.is_aliased("b"));
+        let al: Vec<(&str, &str)> = t.aliases().collect();
+        assert_eq!(al, vec![("b", "a")]);
+    }
+
+    #[test]
+    fn rename_chain_folds_to_original_source() {
+        let mut t = EntryTable::new();
+        t.apply_rename("a", "b", true); // b -> alias(a)
+        t.apply_rename("b", "c", false); // b は vmidx に無いが既に別名
+        assert_eq!(t.aliased_source("c"), Some("a")); // 連鎖を畳む
+        assert_eq!(t.kind("b", false), Kind::Absent);
+        assert_eq!(t.kind("c", false), Kind::Source);
+    }
+
+    #[test]
+    fn rename_created_stays_created() {
+        let mut t = EntryTable::new();
+        t.mark_created("x");
+        t.apply_rename("x", "y", false);
+        assert_eq!(t.kind("x", false), Kind::Absent);
+        assert_eq!(t.kind("y", false), Kind::Created);
+        assert!(!t.is_aliased("y"));
+    }
+
+    #[test]
+    fn rename_onto_removed_name_reuses_target() {
+        let mut t = EntryTable::new();
+        // b を消してから a を b へ rename（ターゲット名の再利用）。
+        t.mark_tombstone("b");
+        t.apply_rename("a", "b", true);
+        assert_eq!(t.aliased_source("b"), Some("a"));
+        assert_eq!(t.kind("b", true), Kind::Source);
     }
 
     #[test]

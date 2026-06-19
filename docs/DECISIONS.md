@@ -414,6 +414,14 @@ vmdirty の `VmdirtyWriter`（Section 7）を実装するにあたり:
   `journal_op` / `purge_entry` / `purge_pages_beyond`。`commit::build_full` は
   `&EntryTable` を取り、tombstone をスキップ・created を新規 LFH/CD で出す。
 - 依存追加なし。`cargo test` 166 緑・警告なし。
-- **未了（④b 以降）**: rename（`Aliased`、Diff/Tier2 の再キー、回復 rename replay、
-  CD-only 改名の INCREMENTAL は M4）、compaction（⑤）、rename 後の親 dir fsync
-  （⑤）、fsyncgate。非 UTF-8 名のエントリ操作は対象外（エントリ表は UTF-8 名のみ）。
+- **④b rename 実装済み（同 decision、作業ツリー）**: 設計どおり `entrytable` に
+  `Overlay::Aliased{source}` + `apply_rename`/`aliased_source`/`aliases`/`is_aliased`、
+  `difflayer`/`tier2` に `rename_entry`（現在名キーの再キー）、`mount` に `entry_rename`
+  （ENOENT/EEXIST、未対応圧縮種別でも通す）/`resolve_entry` の別名解決、`commit::build_full`
+  の alias ループ（未 dirty=verbatim コピー／dirty=ソース元メソッドで再圧縮）、`disk` の
+  `replay_recovered`(`MetaOp::Rename` + `base_for`)/`rejournal_recovered`（RENAME を RESIZE
+  前に出し rename 元 REMOVE を省く）。連鎖 rename は究極のソースへ畳む。`cargo test`
+  184 緑・警告なし。
+- **未了（⑤ 以降）**: compaction（⑤）、rename 後の親 dir fsync
+  （⑤）、fsyncgate。CD-only 改名の INCREMENTAL は M4。非 UTF-8 名のエントリ操作は
+  対象外（エントリ表は UTF-8 名のみ）。
