@@ -206,7 +206,7 @@ impl fmt::Display for EntryError {
 impl std::error::Error for EntryError {}
 
 /// 1 つのアーカイブに対するマウント。読み取りに加え、Diff Layer Tier 1 を介した
-/// 書き込み（[`write`](Mount::write)）と FULL [`commit`](Mount::commit) を提供する
+/// 書き込み（[`write`](Mount::write)）と FULL [`commit_full`](Mount::commit_full) を提供する
 /// （設計 WRITE PATH / commit() FLOW の M2 最小形）。ソース ZIP は commit まで
 /// 一切書き換えない。
 pub struct Mount<'a> {
@@ -381,7 +381,12 @@ impl<'a> Mount<'a> {
     /// 全 dirty 変更を反映した新しい ZIP バイト列を返す（FULL commit。設計
     /// commit() FLOW の FULL path）。マウントを消費する: 呼び出し側は返った
     /// バイト列で開き直す（ディスクでは `archive.new.zip` に書いて `rename`）。
-    pub fn commit(self) -> Result<Vec<u8>, CommitError> {
+    ///
+    /// メモリ版 `Mount` は INCREMENTAL/FULL 選択ポリシー（bloat 閾値）を持たない
+    /// プリミティブ層。自動選択は閾値を持つ [`FileMount::commit`](crate::disk::FileMount::commit)
+    /// に置く（`Mount` は `commit_full` / [`commit_incremental`](Self::commit_incremental)
+    /// を明示的に呼ぶ）。
+    pub fn commit_full(self) -> Result<Vec<u8>, CommitError> {
         build_full(
             self.archive,
             &self.vmidx_image,
@@ -1365,7 +1370,7 @@ mod tests {
         assert_eq!(mount.read("b.txt", 0, 9).unwrap(), b"unchanged");
 
         // FULL commit → 新 ZIP を開き直して反映を確認。
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
         assert_eq!(m2.read("a.txt", 0, 11).unwrap(), b"hello rust!");
         assert_eq!(m2.read("b.txt", 0, 9).unwrap(), b"unchanged");
@@ -1387,7 +1392,7 @@ mod tests {
         assert_eq!(mount.read("a.txt", 6, 10).unwrap(), b"Y");
         assert_eq!(mount.read("a.txt", 7, 5).unwrap(), b"");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
         assert_eq!(m2.read("a.txt", 0, 7).unwrap(), expect);
     }
@@ -1411,7 +1416,7 @@ mod tests {
         expect[6..12].copy_from_slice(b"ABCDEF");
         assert_eq!(mount.read("a.txt", 0, 20).unwrap(), expect);
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open_with_page_config(&new_zip, &params, cfg).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 20).unwrap(), expect);
     }
@@ -1447,7 +1452,7 @@ mod tests {
         );
 
         // FULL commit: big.bin は再圧縮、note.txt は verbatim コピー。
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
         let mut expect = data.clone();
         expect[90_000..90_100].copy_from_slice(&patch);
@@ -1472,7 +1477,7 @@ mod tests {
         let mount = Mount::open(&zip, &params).expect("open");
         assert!(!mount.is_dirty());
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
         assert_eq!(m2.read("a.txt", 0, 5).unwrap(), b"hello");
         assert_eq!(m2.read("big.bin", 0, data.len()).unwrap(), data);
@@ -1499,7 +1504,7 @@ mod tests {
         assert_eq!(mount.read("new.txt", 0, 4).unwrap(), b"\x00\x00hi");
 
         // commit 後に開き直すと新エントリが在り、既存も保たれる。
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("new.txt", 0, 4).unwrap(), b"\x00\x00hi");
         assert_eq!(m2.read("a.txt", 0, 8).unwrap(), b"existing");
@@ -1532,7 +1537,7 @@ mod tests {
         // 存在しないものの remove は ENOENT。
         assert_eq!(mount.remove("absent"), Err(EntryError::NotFound));
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 4).unwrap(), b"keep");
         assert_eq!(m2.read("b.txt", 0, 1), Err(ReadError::NotFound));
@@ -1549,7 +1554,7 @@ mod tests {
         mount.write("a.txt", 0, b"HELLO").unwrap();
         mount.remove("a.txt").unwrap();
         assert_eq!(mount.read("a.txt", 0, 5), Err(ReadError::NotFound));
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
     }
@@ -1569,7 +1574,7 @@ mod tests {
         mount.write("a.txt", 0, b"fresh").unwrap();
         assert_eq!(mount.read("a.txt", 0, 8).unwrap(), b"fresh");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 5).unwrap(), b"fresh");
     }
@@ -1593,7 +1598,7 @@ mod tests {
         // 存在しないものは ENOENT。
         assert_eq!(mount.truncate("absent", 0), Err(EntryError::NotFound));
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         // commit 後は size 7（clean エントリは範囲超え read が OutOfRange）。
         assert_eq!(m2.read("a.txt", 0, 7).unwrap(), b"0123\x00\x00\x00");
@@ -1632,7 +1637,7 @@ mod tests {
         mount.write("a.txt", 0, b"AB").unwrap();
         mount.write("a.txt", 8, b"YZ").unwrap();
         assert_eq!(mount.read("a.txt", 0, 10).unwrap(), b"AB234567YZ");
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 10).unwrap(), b"AB234567YZ");
     }
@@ -1650,7 +1655,7 @@ mod tests {
         assert_eq!(mount.read("a.txt", 0, 9), Err(ReadError::NotFound));
         assert_eq!(mount.read("b.txt", 0, 9).unwrap(), b"payload!!");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("b.txt", 0, 9).unwrap(), b"payload!!");
         assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
@@ -1668,7 +1673,7 @@ mod tests {
         mount.rename("d.bin", "moved.bin").unwrap();
         assert_eq!(mount.read("moved.bin", 0, 100).unwrap(), &data[..100]);
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("moved.bin", 1000, 200).unwrap(), &data[1000..1200]);
         assert_eq!(m2.read("d.bin", 0, 1), Err(ReadError::NotFound));
@@ -1687,7 +1692,7 @@ mod tests {
         // COW: 書いた所だけ変わり、残りはソース a.txt の元データから引く。
         assert_eq!(mount.read("b.txt", 0, 10).unwrap(), b"AB23456789");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("b.txt", 0, 10).unwrap(), b"AB23456789");
     }
@@ -1705,7 +1710,7 @@ mod tests {
         assert_eq!(mount.read("b.txt", 0, 7), Err(ReadError::NotFound));
         assert_eq!(mount.read("c.txt", 0, 7).unwrap(), b"chained");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("c.txt", 0, 7).unwrap(), b"chained");
         assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
@@ -1739,7 +1744,7 @@ mod tests {
         // b.txt は今や a.txt のソースを指す（元の "BBB" ではない）。
         assert_eq!(mount.read("b.txt", 0, 3).unwrap(), b"AAA");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("b.txt", 0, 3).unwrap(), b"AAA");
         assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
@@ -1759,7 +1764,7 @@ mod tests {
         assert_eq!(mount.read("x.txt", 0, 4), Err(ReadError::NotFound));
         assert_eq!(mount.read("y.txt", 0, 4).unwrap(), b"made");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("y.txt", 0, 4).unwrap(), b"made");
         assert_eq!(m2.read("keep.txt", 0, 4).unwrap(), b"keep");
@@ -1780,7 +1785,7 @@ mod tests {
         assert_eq!(mount.read("a.txt", 0, 8).unwrap(), b"new");
         assert_eq!(mount.read("b.txt", 0, 8).unwrap(), b"ORIGINAL");
 
-        let new_zip = mount.commit().unwrap();
+        let new_zip = mount.commit_full().unwrap();
         let m2 = Mount::open(&new_zip, &params).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 3).unwrap(), b"new");
         assert_eq!(m2.read("b.txt", 0, 8).unwrap(), b"ORIGINAL");

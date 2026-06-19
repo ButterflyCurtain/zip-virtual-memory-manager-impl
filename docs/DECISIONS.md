@@ -602,10 +602,20 @@ in-place は当初の方向で、動機はディスク効率の最大化。appen
   - `gc_max_bloat_bytes: u64`（既定 `UNLIMITED` = バイト数では発火しない）
   - 両条件は独立に評価し、一方でも満たせば FULL（設計 "either alone is sufficient"）。
 
-- **API**: `FileMount::commit_auto(self) -> Result<CommitOutcome, FileMountError>` が
-  `bloat_ratio ≥ gc_threshold || bloat_bytes ≥ gc_max_bloat_bytes` で **FULL**（既存 `commit()`）、
-  それ以外は **INCREMENTAL**（既存 `commit_incremental()`）を選ぶ。補助に `should_full_commit()` と
-  `bloat()`。選択は **CD だけを見て**決めるので選んだ片方しか build せず、再圧縮の二度手間は起きない。
+- **API（spec の名前ごと合わせる。当初 `commit_auto`/`compact` で実装したが、同セッションで
+  spec 整合へ改名した）**:
+  - `FileMount::commit(self) -> Result<CommitOutcome, FileMountError>` = 標準の入口。
+    `bloat_ratio ≥ gc_threshold || bloat_bytes ≥ gc_max_bloat_bytes` で **FULL**、それ以外 **INCREMENTAL**
+    （設計 `commit()` = "Selects INCREMENTAL or FULL based on bloat_ratio and gc_threshold"）。
+  - `FileMount::commit_full(self)` = 明示 FULL（設計 `commit_strategy=FULL` / `commit(force_compact=true)`）。
+  - `FileMount::commit_incremental(self)` = 明示 INCREMENTAL プリミティブ。
+  - `FileMount::compact(self)` = CLEAN からのアーカイブ FULL compaction（設計 `compact()`。dirty なら
+    `CompactWhileDirty`）。中身は空 Diff での FULL commit。
+  - `FileMount::compact_journal(&self)` = vmdirty ジャーナル compaction（設計 `compactJournal()`、⑤）。
+    旧名 `compact`。対の predicate は `should_compact_journal()`（旧 `should_compact`）。
+  - 補助: `should_full_commit()` / `bloat()`、`CommitOutcome{Noop,Incremental,Full}`。
+  選択は **CD だけを見て**決めるので選んだ片方しか build せず、再圧縮の二度手間は起きない。`Mount`
+  （メモリ版プリミティブ層）は閾値を持たず `commit_full` / `commit_incremental` のみ（自動選択は無し）。
 
 ### 理由
 
@@ -616,18 +626,13 @@ in-place は当初の方向で、動機はディスク効率の最大化。appen
   （設計が明記）。判定は INCREMENTAL の build より前に済むので、FULL を選ぶ時も incremental の
   追記分を作って捨てる無駄が無い。
 
-### 命名: 設計との差分（実装側に記録、設計リポは触らない）
+### 命名の整合（当初の差分を解消）
 
-設計仕様の `commit()` / `compact()` と、実装の同名 API は意味がずれる。設計リポを書き換えるのではなく
-実装側 `docs/SPEC_DIVERGENCE.md` に差分として ADR リンク付きで残す方針（本リポの流儀）。要点:
-
-- 設計の `commit()` は bloat で INCREMENTAL/FULL を**自動選択**する。実装では役割を分け、
-  `commit()` = 明示 FULL / `commit_incremental()` = 明示 INCREMENTAL を**プリミティブ**として温存し、
-  自動選択は `commit_auto()` に置いた（設計 `force_compact` / `commit_strategy=FULL` 相当は
-  プリミティブの直接呼び出しで表現）。
-- 実装の `compact()` は **vmdirty ジャーナルの compaction**（⑤）で、設計の `compact()`
-  （アーカイブの FULL compaction）とは別物。アーカイブ FULL compaction は `commit()` /
-  `commit_auto()→FULL` が担う。
+刻み3 を最初 `commit_auto()`（自動選択）/ `commit()`（明示 FULL）/ `compact()`（vmdirty ジャーナル）で
+実装したが、これは設計の `commit()`（自動選択）/ `compact()`（アーカイブ compaction）/ `compactJournal()`
+（ジャーナル）と名前が食い違っていた。同セッション中に**本質的に spec へ寄せる**判断（本人合意）で上記
+API へ改名し、差分を解消した。`commit()` を主入口にできるのが要点（設計が想定する標準フロー）。
+残る意図的差分・整合メモは [`SPEC_DIVERGENCE.md`](SPEC_DIVERGENCE.md) に集約。
 
 ### 未実装（後続）
 

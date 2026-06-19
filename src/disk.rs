@@ -52,11 +52,11 @@ pub struct OpenOptions {
     pub sync: SyncPolicy,
     /// ESTALE チェック間隔（ページキャッシュミス N 回ごと。0 = 無効）。
     pub estale_interval: u32,
-    /// [`FileMount::commit_auto`] が FULL を選ぶ bloat 比の閾値（設計
+    /// [`FileMount::commit`] が FULL を選ぶ bloat 比の閾値（設計
     /// `gc_threshold`、既定 **2.0** = アーカイブが live の倍に膨らんだら回収）。
     /// `bloat_ratio ≥ gc_threshold` で FULL。
     pub gc_threshold: f64,
-    /// [`FileMount::commit_auto`] が FULL を選ぶ絶対 dead バイト数の閾値（設計
+    /// [`FileMount::commit`] が FULL を選ぶ絶対 dead バイト数の閾値（設計
     /// `gc_max_bloat_bytes`、既定 `UNLIMITED` = バイト数では発火しない）。
     /// `bloat_bytes ≥ gc_max_bloat_bytes` で FULL。比とは独立に評価する。
     pub gc_max_bloat_bytes: u64,
@@ -75,7 +75,7 @@ impl Default for OpenOptions {
     }
 }
 
-/// [`FileMount::commit_auto`] がどの経路を採ったか（設計 WRITE STRATEGY SELECTION）。
+/// [`FileMount::commit`] がどの経路を採ったか（設計 WRITE STRATEGY SELECTION）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     /// dirty も構造変更も無く、何もしなかった。
@@ -151,6 +151,9 @@ pub enum FileMountError {
     Open(OpenError),
     /// commit の新 ZIP 組み立ての失敗。
     Commit(CommitError),
+    /// [`FileMount::compact`] を DIRTY なマウントで呼んだ（設計: compact() は CLEAN
+    /// からのみ。先に [`commit`](FileMount::commit) すること）。
+    CompactWhileDirty,
     /// vmdirty が存在し、回復の判断が呼び出し側に委ねられた（決定木が Abort、または
     /// ヘッダ破損 / version 非対応 / CONFLICT）。`RecoveryResult` を見て
     /// [`FileMount::open_with_recovery`] でハンドラを与え直す。エントリ操作を含む
@@ -164,6 +167,9 @@ impl fmt::Display for FileMountError {
             FileMountError::Io(e) => write!(f, "file mount: {e}"),
             FileMountError::Open(e) => write!(f, "file mount: {e}"),
             FileMountError::Commit(e) => write!(f, "file mount: {e}"),
+            FileMountError::CompactWhileDirty => {
+                write!(f, "file mount: compact() requires a clean mount; commit() first")
+            }
             FileMountError::RecoveryRequired(r) => write!(
                 f,
                 "file mount: vmdirty present, recovery decision deferred to caller (status {:?}, last_commit_seq {})",
@@ -179,6 +185,7 @@ impl std::error::Error for FileMountError {
             FileMountError::Io(e) => Some(e),
             FileMountError::Open(e) => Some(e),
             FileMountError::Commit(e) => Some(e),
+            FileMountError::CompactWhileDirty => None,
             FileMountError::RecoveryRequired(_) => None,
         }
     }
@@ -252,7 +259,7 @@ pub struct FileMount {
     /// open 時のソース cd_hash（compaction で新 vmdirty ヘッダに入れる。fingerprint
     /// の一部）。再 stat はせず open 時の値を保持する。
     cd_hash: [u8; 16],
-    /// [`FileMount::commit_auto`] の FULL 発火閾値（設計 gc_threshold / gc_max_bloat_bytes）。
+    /// [`FileMount::commit`] の FULL 発火閾値（設計 gc_threshold / gc_max_bloat_bytes）。
     gc_threshold: f64,
     gc_max_bloat_bytes: u64,
 }
@@ -581,18 +588,22 @@ impl FileMount {
         Ok(())
     }
 
-    /// vmdirty の dead レコードが live ページを超えているか（compaction の発火条件、
-    /// 設計 Section 10）。spill 無効なら常に `false`。
-    pub fn should_compact(&self) -> bool {
+    /// vmdirty **ジャーナル**の dead レコードが live ページを超えているか（journal
+    /// compaction の発火条件、設計 `compactJournal()` = dead_record > live_record）。
+    /// spill 無効なら常に `false`。アーカイブ本体の bloat（[`should_full_commit`]
+    /// (Self::should_full_commit)）とは別軸。
+    pub fn should_compact_journal(&self) -> bool {
         self.tier2
             .borrow()
             .as_ref()
             .is_some_and(Tier2::should_compact)
     }
 
-    /// vmdirty を compaction する（⑤）。supersede / purge 済みの dead DATA RECORD を
-    /// 捨て、現在の live 状態だけを持つ新世代ジャーナルを作って原子的に差し替える。
-    /// spill 無効（Tier 2 無し）なら no-op。
+    /// vmdirty **ジャーナル**を compaction する（⑤、設計 `compactJournal()`）。
+    /// supersede / purge 済みの dead DATA RECORD を捨て、現在の live 状態だけを持つ
+    /// 新世代ジャーナルを作って原子的に差し替える。spill 無効（Tier 2 無し）なら no-op。
+    /// これは **vmdirty ジャーナル**の整理で、アーカイブ本体の dead 回収（[`compact`]
+    /// (Self::compact) / FULL commit）とは別物。
     ///
     /// 手順（クラッシュ安全）:
     /// 1. `flush` で Tier 1 を旧 vmdirty へ durable 化（以降クラッシュしても旧
@@ -604,7 +615,7 @@ impl FileMount {
     ///    掃除される。
     /// 3. 旧 Tier 2 を閉じ（Windows の置換のため）、`vmdirty.compact` → `vmdirty` へ
     ///    rename で原子置換し親 dir を fsync。以降は新世代で続行。
-    pub fn compact(&self) -> Result<(), FileMountError> {
+    pub fn compact_journal(&self) -> Result<(), FileMountError> {
         if self.tier2.borrow().is_none() {
             return Ok(());
         }
@@ -657,21 +668,31 @@ impl FileMount {
         Ok(())
     }
 
-    /// FULL commit（設計 commit() FLOW の FULL path）。Diff Layer を反映した新しい
-    /// 完全な ZIP を `archive.new.zip` に書き、`archive.zip` へ `rename` で原子的に
-    /// 差し替える。マウントを消費する（mmap を解放）。クラッシュ前は元の
-    /// `archive.zip` が無傷で残り、後は新 ZIP が有効（POSIX rename の原子性）。
+    /// 明示 FULL commit（設計 commit() FLOW の FULL path / `commit_strategy=FULL` /
+    /// `commit(force_compact=true)`）。Diff Layer を反映した新しい完全な ZIP を
+    /// `archive.new.zip` に書き、`archive.zip` へ `rename` で原子的に差し替える。
+    /// マウントを消費する（mmap を解放）。クラッシュ前は元の `archive.zip` が無傷で残り、
+    /// 後は新 ZIP が有効（POSIX rename の原子性）。変更が無ければ no-op。
+    ///
+    /// 通常は bloat 閾値で自動選択する [`commit`](Self::commit) を使う。FULL を強制
+    /// したい時だけ本メソッドを直接呼ぶ。
     ///
     /// 耐久性（⑤ / Section 6.3）: 新 ZIP を `sync_all`（データ + メタデータ）してから
     /// `rename` し、rename 自体も親ディレクトリ fsync で durable にする。よって commit が
     /// 成功を返したら新アーカイブは安定ストレージ上にある。fsync 失敗は伝播する
     /// （fsyncgate）。サイドカー vmidx は更新せず残し（次回 open で fingerprint 不一致なら
     /// 再構築。vmidx はキャッシュなので fsync しない）。
-    pub fn commit(self) -> Result<(), FileMountError> {
+    pub fn commit_full(self) -> Result<(), FileMountError> {
         if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
             return Ok(());
         }
+        self.full_commit_inner()
+    }
 
+    /// FULL commit の実体（空 Diff の早期 return を持たない）。[`commit_full`]
+    /// (Self::commit_full) は変更なしを no-op にするが、[`compact`](Self::compact) は
+    /// CLEAN でも dead 回収のため本体を走らせる。
+    fn full_commit_inner(self) -> Result<(), FileMountError> {
         // 耐久性: アーカイブへ触れる前に dirty 状態を vmdirty で完結させる。flush で
         // Tier 1 常駐分を durable 化（commit 中のクラッシュは recover_committed で
         // 復元可能）、続いて Tier 2 のみのページを Tier 1 へ rehydrate して build_full
@@ -711,6 +732,21 @@ impl FileMount {
             let _ = fsync_parent_dir(&self.vmdirty_path);
         }
         Ok(())
+    }
+
+    /// アーカイブの dead space を回収する FULL compaction（設計 `compact()`）。CLEAN な
+    /// マウント（dirty ページも構造変更も無い）からのみ呼べ、書き込み無しで蓄積した
+    /// dead を捨てた最小アーカイブを作って原子置換する。DIRTY なら
+    /// [`FileMountError::CompactWhileDirty`]（先に [`commit`](Self::commit) すること）。
+    ///
+    /// これは **アーカイブ本体**の整理で、vmdirty ジャーナルの整理
+    /// （[`compact_journal`](Self::compact_journal) = 設計 `compactJournal()`）とは別物。
+    /// 中身は空 Diff での FULL commit（全エントリを verbatim コピーした正準形を書く）。
+    pub fn compact(self) -> Result<(), FileMountError> {
+        if !(self.diff.borrow().is_empty() && self.entries.borrow().is_empty()) {
+            return Err(FileMountError::CompactWhileDirty);
+        }
+        self.full_commit_inner()
     }
 
     /// INCREMENTAL commit（設計 commit() FLOW の INCREMENTAL path。ADR 0012）。未変更
@@ -794,7 +830,7 @@ impl FileMount {
         }
     }
 
-    /// [`commit_auto`](Self::commit_auto) が FULL（全書き直し）を選ぶか（設計
+    /// [`commit`](Self::commit) が FULL（全書き直し）を選ぶか（設計
     /// "Compaction thresholds"）。`bloat_ratio ≥ gc_threshold` または
     /// `bloat_bytes ≥ gc_max_bloat_bytes` のどちらか一方でも満たせば true。両条件は
     /// 独立に評価する。
@@ -803,22 +839,22 @@ impl FileMount {
         b.bloat_ratio >= self.gc_threshold || b.bloat_bytes >= self.gc_max_bloat_bytes
     }
 
-    /// INCREMENTAL / FULL を bloat 閾値で自動選択して commit する（設計
-    /// WRITE STRATEGY SELECTION の `commit()`）。第一目標のディスク効率は、通常は安い
-    /// INCREMENTAL（未変更は追記ゼロ）で進め、dead が積もって
+    /// commit する（設計 WRITE STRATEGY SELECTION の `commit()`）。bloat 閾値で
+    /// INCREMENTAL / FULL を自動選択する標準の入口。第一目標のディスク効率は、通常は
+    /// 安い INCREMENTAL（未変更は追記ゼロ）で進め、dead が積もって
     /// [`should_full_commit`](Self::should_full_commit) が立った時だけ FULL で全回収する
     /// （定常サイズを `gc_threshold` 倍の live で上界する）ことで保つ。
     ///
     /// 選択は CD だけを見て決めるので、選んだ片方しか build しない（再圧縮の二度手間は
-    /// 起きない）。FULL を強制したい呼び出し側は [`commit`](Self::commit) を、INCREMENTAL を
-    /// 強制したい側は [`commit_incremental`](Self::commit_incremental) を直接呼ぶ。
-    /// マウントを消費する。
-    pub fn commit_auto(self) -> Result<CommitOutcome, FileMountError> {
+    /// 起きない）。FULL を強制したい呼び出し側は [`commit_full`](Self::commit_full) を、
+    /// INCREMENTAL を強制したい側は [`commit_incremental`](Self::commit_incremental) を
+    /// 直接呼ぶ（設計の `commit_strategy=FULL` / `force_compact` 相当）。マウントを消費する。
+    pub fn commit(self) -> Result<CommitOutcome, FileMountError> {
         if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
             return Ok(CommitOutcome::Noop);
         }
         if self.should_full_commit() {
-            self.commit()?;
+            self.full_commit_inner()?;
             Ok(CommitOutcome::Full)
         } else {
             self.commit_incremental()?;
@@ -1423,7 +1459,7 @@ mod tests {
         // dirty な読みは Diff Layer から。
         assert_eq!(m.read("a.txt", 0, 11).unwrap(), b"hello rust!");
         // FULL commit → archive.zip を差し替え、マウントを消費。
-        m.commit().expect("commit");
+        m.commit_full().expect("commit");
 
         // 一時ファイルは残っていない。
         assert!(!dir.path().join("w.zip.new").exists());
@@ -1443,7 +1479,7 @@ mod tests {
 
         let m = FileMount::open(&zip_path).expect("open");
         assert!(!m.is_dirty());
-        m.commit().expect("noop commit");
+        m.commit_full().expect("noop commit");
         // ファイルは書き換えられていない。
         assert_eq!(fs::read(&zip_path).unwrap(), original);
     }
@@ -1579,7 +1615,7 @@ mod tests {
         for i in (0..64u64).step_by(2) {
             m.write("data.bin", i, &[0xEEu8]).unwrap();
         }
-        m.commit().expect("commit after spill");
+        m.commit_full().expect("commit after spill");
         // commit 成功で vmdirty は消える。
         assert!(!vmdirty_path(dir.path(), "s4.zip").exists());
 
@@ -1616,7 +1652,7 @@ mod tests {
         assert_eq!(count_baks(dir.path(), "r.zip"), 1);
 
         // 回復後に commit すると新 archive に反映され、開き直しても残る。
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen clean");
         assert_eq!(m3.read("data.bin", 0, 64).unwrap(), vec![0x11u8; 64]);
     }
@@ -1689,7 +1725,7 @@ mod tests {
         m.remove("drop.txt").unwrap();
         m.truncate("big.txt", 4).unwrap();
         assert!(m.is_dirty());
-        m.commit().expect("commit");
+        m.commit_full().expect("commit");
 
         let m2 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m2.read("keep.txt", 0, 4).unwrap(), b"keep");
@@ -1708,7 +1744,7 @@ mod tests {
         let m = FileMount::open(&zip_path).expect("open");
         m.remove("b.txt").unwrap();
         assert!(m.is_dirty());
-        m.commit().expect("commit");
+        m.commit_full().expect("commit");
         let m2 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m2.read("a.txt", 0, 1).unwrap(), b"a");
         assert_eq!(m2.read("b.txt", 0, 1), Err(ReadError::NotFound));
@@ -1736,7 +1772,7 @@ mod tests {
         assert_eq!(count_baks(dir.path(), "rc.zip"), 1);
 
         // 回復後 commit すると新 archive に反映され、開き直しても残る。
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen clean");
         assert_eq!(m3.read("made.bin", 0, 8).unwrap(), vec![0x55u8; 8]);
         assert_eq!(m3.read("data.bin", 0, 8).unwrap(), b"abcdefgh");
@@ -1758,7 +1794,7 @@ mod tests {
         let m2 = open_spill(&zip_path, 0);
         assert_eq!(m2.read("gone.bin", 0, 1), Err(ReadError::NotFound));
         assert_eq!(m2.read("keep.bin", 0, 4).unwrap(), b"keep");
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m3.read("gone.bin", 0, 1), Err(ReadError::NotFound));
         assert_eq!(m3.read("keep.bin", 0, 4).unwrap(), b"keep");
@@ -1783,7 +1819,7 @@ mod tests {
         let mut expect = original.clone();
         expect.resize(20, 0);
         assert_eq!(m2.read("data.bin", 0, 20).unwrap(), expect);
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m3.read("data.bin", 0, 20).unwrap(), expect);
     }
@@ -1816,7 +1852,7 @@ mod tests {
         m.rename("a.txt", "b.txt").unwrap();
         assert_eq!(m.read("a.txt", 0, 1), Err(ReadError::NotFound));
         assert_eq!(m.read("b.txt", 0, 8).unwrap(), b"payload!");
-        m.commit().expect("commit");
+        m.commit_full().expect("commit");
 
         let m2 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m2.read("b.txt", 0, 8).unwrap(), b"payload!");
@@ -1843,7 +1879,7 @@ mod tests {
         let m2 = open_spill(&zip_path, 0);
         assert_eq!(m2.read("b.bin", 0, 8).unwrap(), b"abcdefgh");
         assert_eq!(m2.read("a.bin", 0, 1), Err(ReadError::NotFound));
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m3.read("b.bin", 0, 8).unwrap(), b"abcdefgh");
         assert_eq!(m3.read("a.bin", 0, 1), Err(ReadError::NotFound));
@@ -1874,7 +1910,7 @@ mod tests {
         m.write("a.txt", 0, b"XY").unwrap();
         m.flush().expect("flush");
         assert!(vmdirty_path(dir.path(), "dc.zip").exists());
-        m.commit().expect("durable commit");
+        m.commit_full().expect("durable commit");
 
         assert!(!vmdirty_path(dir.path(), "dc.zip").exists());
         let m2 = FileMount::open(&zip_path).expect("reopen");
@@ -1904,7 +1940,7 @@ mod tests {
         expect[1] = b'Y';
         assert_eq!(m2.read("b.bin", 0, 16).unwrap(), expect);
         assert_eq!(m2.read("a.bin", 0, 1), Err(ReadError::NotFound));
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m3.read("b.bin", 0, 16).unwrap(), expect);
     }
@@ -1922,12 +1958,12 @@ mod tests {
         }
         let vp = vmdirty_path(dir.path(), "comp.zip");
         let before = fs::metadata(&vp).unwrap().len();
-        assert!(m.should_compact(), "dead > live のはず");
+        assert!(m.should_compact_journal(), "dead > live のはず");
 
-        m.compact().expect("compact");
+        m.compact_journal().expect("compact_journal");
 
         // compaction 後は dead が消え、ジャーナルが縮む。
-        assert!(!m.should_compact());
+        assert!(!m.should_compact_journal());
         let after = fs::metadata(&vp).unwrap().len();
         assert!(after < before, "journal should shrink: {after} >= {before}");
         // orphan な vmdirty.compact は残らない。
@@ -1947,14 +1983,14 @@ mod tests {
             for i in 0..6u8 {
                 m.write("a.bin", 0, &[i; 8]).unwrap();
             }
-            m.compact().expect("compact");
+            m.compact_journal().expect("compact_journal");
             // compaction は COMMIT MARKER で締めるので、ここで crash しても committed。
         }
 
         // 再 open: 新世代ジャーナルから recover_committed。最後の書き込みが戻る。
         let m2 = open_spill(&zip_path, 0);
         assert_eq!(m2.read("a.bin", 0, 8).unwrap(), vec![5u8; 8]);
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen clean");
         assert_eq!(m3.read("a.bin", 0, 8).unwrap(), vec![5u8; 8]);
     }
@@ -1979,7 +2015,7 @@ mod tests {
             for i in 0..5u8 {
                 m.write("new.bin", 0, &[i; 4]).unwrap();
             }
-            m.compact().expect("compact");
+            m.compact_journal().expect("compact_journal");
 
             // compaction 直後の live 状態。
             assert_eq!(m.read("new.bin", 0, 4).unwrap(), vec![4u8; 4]);
@@ -1995,7 +2031,7 @@ mod tests {
         assert_eq!(m2.read("b.bin", 0, 1), Err(ReadError::NotFound));
         assert_eq!(m2.read("d.bin", 0, 4).unwrap(), b"CCCC");
         assert_eq!(m2.read("c.bin", 0, 1), Err(ReadError::NotFound));
-        m2.commit().expect("commit recovered");
+        m2.commit_full().expect("commit recovered");
         let m3 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m3.read("new.bin", 0, 4).unwrap(), vec![4u8; 4]);
         assert_eq!(m3.read("d.bin", 0, 4).unwrap(), b"CCCC");
@@ -2097,7 +2133,7 @@ mod tests {
     }
 
     /// クリーン（dead 無し）なアーカイブは bloat_ratio ≈ 1.0 で、既定閾値（2.0）未満。
-    /// よって commit_auto は INCREMENTAL を選ぶ。
+    /// よって commit は INCREMENTAL を選ぶ。
     #[test]
     fn bloat_ratio_clean_archive_below_threshold() {
         let dir = TempDir::new();
@@ -2118,7 +2154,7 @@ mod tests {
     /// 閾値未満（クリーン）への小編集は INCREMENTAL を選ぶ: ファイルは末尾追記で伸び、
     /// 先頭の既存バイトは保たれる（未変更エントリは元オフセットのまま）。
     #[test]
-    fn commit_auto_picks_incremental_below_threshold() {
+    fn commit_picks_incremental_below_threshold() {
         let dir = TempDir::new();
         let zip_path = dir.path().join("auto_inc.zip");
         let orig = store_zip(&[("keep.txt", b"KEEP"), ("edit.txt", b"0123456789")]);
@@ -2126,7 +2162,7 @@ mod tests {
 
         let m = FileMount::open(&zip_path).expect("open");
         m.write("edit.txt", 0, b"XY").unwrap();
-        assert_eq!(m.commit_auto().expect("commit_auto"), CommitOutcome::Incremental);
+        assert_eq!(m.commit().expect("commit"), CommitOutcome::Incremental);
 
         // append-only の痕跡: prefix 保持 + ファイル増。
         let grown = fs::read(&zip_path).unwrap();
@@ -2140,9 +2176,9 @@ mod tests {
     }
 
     /// INCREMENTAL の積み重ねで dead が live を超え bloat_ratio ≥ 2.0 になったら、
-    /// commit_auto は FULL（全書き直し）を選び、dead を回収して最小アーカイブに戻す。
+    /// commit は FULL（全書き直し）を選び、dead を回収して最小アーカイブに戻す。
     #[test]
-    fn commit_auto_picks_full_when_bloated() {
+    fn commit_picks_full_when_bloated() {
         let dir = TempDir::new();
         let zip_path = dir.path().join("auto_full.zip");
         // 単一エントリ（= live 全体）を rewrite すると旧コピーがそのまま dead になり、
@@ -2166,7 +2202,7 @@ mod tests {
             m2.bloat().bloat_ratio
         );
         m2.write("big.bin", 4, b"WWWW").unwrap();
-        assert_eq!(m2.commit_auto().expect("commit_auto"), CommitOutcome::Full);
+        assert_eq!(m2.commit().expect("commit"), CommitOutcome::Full);
 
         // FULL で回収: ファイルは縮み、再 open 時の ratio は閾値未満（最小化）。
         let compacted_len = fs::metadata(&zip_path).unwrap().len();
@@ -2179,35 +2215,109 @@ mod tests {
         assert_eq!(m3.read("big.bin", 8, 4).unwrap(), &big[8..12]);
     }
 
-    /// 閾値以上でも commit_incremental を直接呼べば INCREMENTAL を強制できる
-    /// （commit_auto のプリミティブは温存）。逆に低い gc_threshold で commit_auto は
-    /// クリーンなアーカイブでも FULL を選ぶ。
+    /// 単一エントリを 1 回 INCREMENTAL commit して dead を積んだ（bloated な）
+    /// アーカイブを作るヘルパ。返り値は積んだ後のファイル長。
+    fn make_bloated_single_entry(zip_path: &Path, data: &[u8]) -> u64 {
+        fs::write(zip_path, store_zip(&[("big.bin", data)])).unwrap();
+        let m = FileMount::open(zip_path).expect("open");
+        m.write("big.bin", 0, b"ZZZZ").unwrap();
+        m.commit_incremental().expect("incremental commit");
+        fs::metadata(zip_path).unwrap().len()
+    }
+
+    /// プリミティブは温存: 閾値超（policy なら FULL）でも `commit_incremental` を直接
+    /// 呼べば INCREMENTAL を強制でき、ファイルは（縮まず）追記で伸びる。
     #[test]
-    fn explicit_primitives_override_policy() {
+    fn force_incremental_against_bloat_policy() {
         let dir = TempDir::new();
-        let zip_path = dir.path().join("force.zip");
+        let zip_path = dir.path().join("force_inc.zip");
+        let big: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let bloated_len = make_bloated_single_entry(&zip_path, &big);
+
+        let m = FileMount::open(&zip_path).expect("reopen");
+        assert!(m.should_full_commit(), "policy would pick FULL");
+        m.write("big.bin", 0, b"QQQQ").unwrap();
+        // policy を無視して INCREMENTAL を強制。
+        m.commit_incremental().expect("forced incremental");
+
+        let after = fs::metadata(&zip_path).unwrap().len();
+        assert!(after > bloated_len, "forced INCREMENTAL appends (FULL would shrink)");
+        let m2 = FileMount::open(&zip_path).expect("reopen2");
+        assert_eq!(m2.read("big.bin", 0, 4).unwrap(), b"QQQQ");
+    }
+
+    /// 低い gc_threshold は commit() に（普通の小編集でも）FULL を選ばせる
+    /// （設計 `commit_strategy=FULL` / `gc_threshold` に相当）。
+    #[test]
+    fn low_gc_threshold_forces_full() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("low_gc.zip");
         fs::write(&zip_path, store_zip(&[("a.bin", b"abcdefghij")])).unwrap();
 
         // gc_threshold=1.0 → クリーン（ratio>1.0）でも FULL 判定。
         let m = open_with_gc(&zip_path, 1.0);
         assert!(m.should_full_commit());
         m.write("a.bin", 0, b"ZZ").unwrap();
-        assert_eq!(m.commit_auto().expect("commit_auto"), CommitOutcome::Full);
+        assert_eq!(m.commit().expect("commit"), CommitOutcome::Full);
 
         let m2 = FileMount::open(&zip_path).expect("reopen");
         assert_eq!(m2.read("a.bin", 0, 10).unwrap(), b"ZZcdefghij");
     }
 
-    /// 変更が無ければ commit_auto は Noop で、ファイルにもサイドカーにも触れない。
+    /// 変更が無ければ commit は Noop で、ファイルにもサイドカーにも触れない。
     #[test]
-    fn commit_auto_noop_when_clean() {
+    fn commit_noop_when_clean() {
         let dir = TempDir::new();
         let zip_path = dir.path().join("noop.zip");
         let orig = store_zip(&[("a.bin", b"unchanged")]);
         fs::write(&zip_path, &orig).unwrap();
 
         let m = FileMount::open(&zip_path).expect("open");
-        assert_eq!(m.commit_auto().expect("commit_auto"), CommitOutcome::Noop);
+        assert_eq!(m.commit().expect("commit"), CommitOutcome::Noop);
+        assert_eq!(fs::read(&zip_path).unwrap(), orig);
+    }
+
+    /// `compact()` は CLEAN なマウントから（書き込み無しで）蓄積した dead を回収し、
+    /// 最小アーカイブへ縮める（設計 `compact()`）。中身は保たれる。
+    #[test]
+    fn compact_reclaims_dead_from_clean() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("compact.zip");
+        let big: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let bloated_len = make_bloated_single_entry(&zip_path, &big);
+
+        // CLEAN なマウント（dirty 無し）から compact。
+        let m = FileMount::open(&zip_path).expect("reopen");
+        assert!(!m.is_dirty());
+        assert!(m.should_full_commit(), "bloated → compact が効くはず");
+        m.compact().expect("compact");
+
+        let compacted_len = fs::metadata(&zip_path).unwrap().len();
+        assert!(compacted_len < bloated_len, "compact should shrink the archive");
+
+        let m2 = FileMount::open(&zip_path).expect("reopen after compact");
+        assert!(!m2.should_full_commit());
+        // 最新内容（ZZ + 元データの続き）が保たれる。
+        assert_eq!(m2.read("big.bin", 0, 4).unwrap(), b"ZZZZ");
+        assert_eq!(m2.read("big.bin", 4, 4).unwrap(), &big[4..8]);
+    }
+
+    /// `compact()` は DIRTY なマウントでは拒否される（先に commit すること）。
+    /// アーカイブには触れない。
+    #[test]
+    fn compact_refused_when_dirty() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("compact_dirty.zip");
+        let orig = store_zip(&[("a.bin", b"abcdefghij")]);
+        fs::write(&zip_path, &orig).unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        m.write("a.bin", 0, b"ZZ").unwrap();
+        assert!(matches!(
+            m.compact(),
+            Err(FileMountError::CompactWhileDirty)
+        ));
+        // 拒否時はアーカイブに触れない。
         assert_eq!(fs::read(&zip_path).unwrap(), orig);
     }
 }

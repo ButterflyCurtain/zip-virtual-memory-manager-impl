@@ -11,6 +11,13 @@
 > [`HANDOFF.md`](HANDOFF.md) の「未実装」や各 ADR の「未了」に置く。本書は**意図的に
 > 仕様と異なる**箇所だけを扱う。
 
+> 整合済み（差分ではない・再追加しないこと）: commit / compact 系 API は設計の
+> WRITE STRATEGY SELECTION / vmdirty Spec §7 に**名前ごと合わせた**（ADR 0013）。
+> `FileMount::commit()` = bloat 閾値で自動選択（spec `commit()`）、`commit_full()` /
+> `commit_incremental()` = 明示プリミティブ（spec `commit_strategy=FULL` / `force_compact`
+> 相当）、`compact()` = CLEAN からのアーカイブ FULL compaction（spec `compact()`）、
+> `compact_journal()` = vmdirty ジャーナル compaction（spec `compactJournal()`、内部保守）。
+
 ---
 
 ## 1. Dead Space Freelist / in-place 穴再利用を実装しない
@@ -27,29 +34,7 @@
   rename 原子性の 4 本柱と衝突する 5 点を整理）、[ADR 0012](DECISIONS.md)（append-only INCREMENTAL の
   追記レイアウトと truncate ロールバック）。特許の整理は [`PRIOR_ART.md`](PRIOR_ART.md)。
 
-## 2. `commit()` の意味（自動選択 vs 明示プリミティブ）
-
-- **設計**: 単一の `commit()` が bloat 閾値で INCREMENTAL/FULL を**自動選択**する
-  （WRITE STRATEGY SELECTION）。`force_compact=true` / `commit_strategy=FULL` で上書き。
-- **実装**: 役割を 3 つの API に分ける。
-  - `FileMount::commit()` = 明示 **FULL**（全書き直し + `durable_replace`）。
-  - `FileMount::commit_incremental()` = 明示 **INCREMENTAL**（末尾追記 + truncate ロールバック）。
-  - `FileMount::commit_auto()` = 設計の `commit()` 相当（bloat 閾値で上 2 つを選ぶ）。
-  設計の `force_compact` / `commit_strategy=FULL` は、対応するプリミティブを直接呼ぶことで表現する。
-- **理由 / ADR**: [ADR 0013](DECISIONS.md)。プリミティブを先に固めてから選択層を被せると、各経路を
-  独立にテストでき、選択ロジックの差し替えも局所化できる（刻み1/2 が各プリミティブ、刻み3 が選択層）。
-
-## 3. `compact()` の意味（vmdirty ジャーナル vs アーカイブ）
-
-- **設計**: `compact()` は**アーカイブの** FULL compaction（空の Diff Layer で FULL commit を行い、
-  dead を回収した最小アーカイブを作る）。
-- **実装**: `FileMount::compact()` は **vmdirty ジャーナルの** compaction（⑤。supersede/purge 済みの
-  dead DATA RECORD を捨て live 状態だけの新世代ジャーナルへ原子置換）。アーカイブの FULL
-  compaction は `commit()` / `commit_auto()→FULL` が担う。
-- **理由 / ADR**: [ADR 0013](DECISIONS.md) の命名節、および vmdirty compaction の [ADR 0011](DECISIONS.md)
-  文脈。両者は対象（ジャーナル / アーカイブ）が異なる別機構で、同名だが衝突しない（呼び分けに注意）。
-
-## 4. bloat メトリクスは LFH バイトを live に数えない
+## 2. bloat メトリクスは LFH バイトを live に数えない
 
 - **設計**: `bloat_bytes = file_size − Σ(compressed_size) − cd_size − eocd_size`。
 - **実装**: 同一式をそのまま採用（= LFH のバイトは live から漏れ、近似的に bloat 側へ含む）。
@@ -58,7 +43,7 @@
 - **ADR**: [ADR 0013](DECISIONS.md)。LFH 長は読まないと分からず、設計の "no additional I/O" を
   守るための意図的な近似。既定閾値 2.0 には届かない小ささ。
 
-## 5. 回復 Section 3「自動解決しない」宣言と決定木の食い違い
+## 3. 回復 Section 3「自動解決しない」宣言と決定木の食い違い
 
 - **設計**: `vmdirty_Journal_Spec` の回復 Section 3 は冒頭で「VMM は自動解決しない」と宣言する一方、
   決定木自身が 1 枝に `auto: recover_committed (safe default)`、別枝に `silently discard` を許す。
