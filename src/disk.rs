@@ -18,7 +18,7 @@
 //! 失われても再構築できる）。クラッシュ安全な durability は後段（M3）。
 
 use crate::archive::Archive;
-use crate::commit::{build_full, CommitError};
+use crate::commit::{build_full, build_incremental, CommitError};
 use crate::difflayer::{DiffLayer, UNLIMITED};
 use crate::entrytable::EntryTable;
 use crate::index_build::BuildParams;
@@ -37,7 +37,7 @@ use memmap2::Mmap;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::fs::{self, File, Metadata};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -274,6 +274,35 @@ impl FileMount {
         handler: &mut H,
     ) -> Result<FileMount, FileMountError> {
         let archive_path = archive_path.as_ref();
+        let sidecar = sidecar_dir(archive_path);
+
+        // INCREMENTAL commit の途中クラッシュ回復（mmap を張る前 = truncate 可能）。
+        // `commit.intent` が在る = 末尾追記が走った可能性。完了済み（サイズ一致 + valid
+        // ZIP）なら dirty 状態は新アーカイブに在るので vmdirty を捨てる。未完なら
+        // アーカイブを `old_len` へ truncate して旧（妥当な ZIP）へ戻し、vmdirty は活かす
+        // （ADR 0012 の truncate ロールバック）。INTENT は最後に消すので、どちらの
+        // クラッシュ窓でも disposition を一意に判定できる。
+        let mut discard_vmdirty_after_commit = false;
+        {
+            let intent_path = commit_intent_path(&sidecar);
+            if let Some((old_len, new_len)) = read_commit_intent(&intent_path)? {
+                let cur = fs::metadata(archive_path)?.len();
+                let completed = cur == new_len
+                    && fs::read(archive_path)
+                        .map(|b| Archive::parse(&b).is_ok())
+                        .unwrap_or(false);
+                if completed {
+                    discard_vmdirty_after_commit = true;
+                } else {
+                    let f = fs::OpenOptions::new().write(true).open(archive_path)?;
+                    f.set_len(old_len)?;
+                    f.sync_all()?;
+                }
+                fs::remove_file(&intent_path)?;
+                let _ = fsync_parent_dir(&intent_path);
+            }
+        }
+
         let file = File::open(archive_path)?;
         let md = file.metadata()?;
         let fingerprint = StatFingerprint::of(&md);
@@ -289,7 +318,6 @@ impl FileMount {
         // マウントとして扱い、変更検出は fingerprint / ESTALE に委ねる設計。
         let archive = unsafe { Mmap::map(&file)? };
 
-        let sidecar = sidecar_dir(archive_path);
         let vmidx_path = sidecar.join("vmidx");
         let existing = match fs::read(&vmidx_path) {
             Ok(bytes) => Some(bytes),
@@ -318,6 +346,13 @@ impl FileMount {
         // 中断した compaction の置き去り（`vmdirty.compact`）は authoritative では
         // ないので掃除する（vmdirty 本体だけが正、orphan は無視）。
         let _ = fs::remove_file(compact_tmp(&vmdirty_path));
+
+        // 完了済み INCREMENTAL commit の後始末: dirty 状態は新アーカイブに在るので
+        // 残った vmdirty は stale。replay せず捨てる（CLEAN な新アーカイブとして開く）。
+        if discard_vmdirty_after_commit && vmdirty_path.exists() {
+            fs::remove_file(&vmdirty_path)?;
+            let _ = fsync_parent_dir(&vmdirty_path);
+        }
 
         // ── 回復（vmdirty があれば）──
         if vmdirty_path.exists() {
@@ -652,6 +687,69 @@ impl FileMount {
         Ok(())
     }
 
+    /// INCREMENTAL commit（設計 commit() FLOW の INCREMENTAL path。ADR 0012）。未変更
+    /// エントリは元位置のまま、変更/新規/別名だけを **アーカイブ末尾へ追記**して新 CD/
+    /// EOCD を書く。大きなアーカイブの小編集が安い（未変更分を再圧縮も再コピーもしない）。
+    /// マウントを消費する（mmap を解放してから追記する）。
+    ///
+    /// クラッシュ安全（truncate ロールバック）: 旧バイト `[0, old_len)` を一切書き換えない
+    /// ので、未完なら `old_len` への truncate で旧アーカイブ（妥当な ZIP）に戻る。
+    /// 1. dirty を vmdirty へ durable 化（+ Tier 2 を Tier 1 へ rehydrate）。
+    /// 2. INTENT（`old_len` / `new_len`）を sidecar に durable 記録（追記前）。
+    /// 3. mmap を解放し、アーカイブ末尾へ追記して `sync_all`。
+    /// 4. commit point: vmdirty を削除 → **最後に INTENT を削除**（INTENT を最後に消すことで、
+    ///    回復は「完了（vmdirty 破棄）/未完（truncate ロールバック）」を一意に判定できる）。
+    pub fn commit_incremental(self) -> Result<(), FileMountError> {
+        if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
+            return Ok(());
+        }
+
+        // 1. dirty を vmdirty で完結させ、Tier 2 のみのページを Tier 1 へ（build_incremental が
+        //    全 dirty ページを Tier 1 から読めるように）。FULL commit と同じ前処理。
+        if let Some(t2) = self.tier2.borrow_mut().as_mut() {
+            t2.flush(&mut self.diff.borrow_mut())?;
+            t2.rehydrate_into(&mut self.diff.borrow_mut())?;
+        }
+
+        let old_len = self.archive.len() as u64;
+        let appended = build_incremental(
+            &self.archive,
+            &self.vmidx_image,
+            &self.diff.borrow(),
+            &self.entries.borrow(),
+        )?;
+        let new_len = old_len + appended.len() as u64;
+
+        let archive_path = self.archive_path.clone();
+        let vmdirty_path = self.vmdirty_path.clone();
+        let sidecar = sidecar_dir(&archive_path);
+
+        // mmap を解放してからファイルを変更する（Windows のマップ中ファイル制約回避）。
+        drop(self);
+
+        // 2. INTENT を durable に（追記前 = truncate ロールバックの根拠）。
+        fs::create_dir_all(&sidecar)?;
+        write_commit_intent(&sidecar, old_len, new_len)?;
+
+        // 3. アーカイブ末尾へ追記して fsync（pure append なので親 dir fsync は不要、
+        //    サイズ + データは sync_all が durable 化）。
+        {
+            let mut f = fs::OpenOptions::new().write(true).open(&archive_path)?;
+            f.seek(SeekFrom::Start(old_len))?;
+            f.write_all(&appended)?;
+            f.sync_all()?;
+        }
+
+        // 4. commit point: dirty 状態は新アーカイブに在る → vmdirty を捨て、最後に INTENT を
+        //    消す。サイドカー dir を 1 度 fsync して両削除を durable に。
+        if vmdirty_path.exists() {
+            let _ = fs::remove_file(&vmdirty_path);
+        }
+        let _ = fs::remove_file(commit_intent_path(&sidecar));
+        let _ = fsync_parent_dir(&vmdirty_path);
+        Ok(())
+    }
+
     /// キャッシュミス時の鮮度チェック（ソースへ触れる前）。間隔判定を通過したら
     /// archive.zip を再 stat し、open 時指紋と size/inode/mtime を比較する。差異
     /// （またはファイル消失）で STALE へ遷移し [`ReadError::Stale`]。mtime は同
@@ -710,6 +808,50 @@ fn compact_tmp(vmdirty_path: &Path) -> PathBuf {
     let mut name = vmdirty_path.file_name().unwrap_or_default().to_os_string();
     name.push(".compact");
     vmdirty_path.with_file_name(name)
+}
+
+/// INCREMENTAL commit の INTENT ファイル先頭 4 バイト（"VMIC" 相当の識別子）。
+const INTENT_MAGIC: u32 = 0x564D_4943;
+
+/// INCREMENTAL commit の INTENT ファイルパス（`.vmm/commit.intent`）。追記前に
+/// `old_len` / `new_len` を記録し、commit 成功で最後に削除する。回復はこの有無と
+/// 内容で「完了 / 未完」を判定する（ADR 0012）。
+fn commit_intent_path(sidecar: &Path) -> PathBuf {
+    sidecar.join("commit.intent")
+}
+
+/// INTENT を `magic(4) + old_len(8) + new_len(8)` の 20 バイトで durable に書く
+/// （追記前。ファイル本体 + サイドカー dir を fsync）。
+fn write_commit_intent(sidecar: &Path, old_len: u64, new_len: u64) -> io::Result<()> {
+    let path = commit_intent_path(sidecar);
+    let mut buf = Vec::with_capacity(20);
+    buf.extend_from_slice(&INTENT_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&old_len.to_le_bytes());
+    buf.extend_from_slice(&new_len.to_le_bytes());
+    {
+        let mut f = File::create(&path)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    fsync_parent_dir(&path)?;
+    Ok(())
+}
+
+/// INTENT を読む。無ければ `None`。壊れ / 部分書き（magic 不一致 / 長さ違い）も
+/// `None` 扱い＝INTENT が durable に書けていない＝追記前のクラッシュで、アーカイブは
+/// 無傷なのでロールバック不要。
+fn read_commit_intent(path: &Path) -> io::Result<Option<(u64, u64)>> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if bytes.len() != 20 || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != INTENT_MAGIC {
+        return Ok(None);
+    }
+    let old_len = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+    let new_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    Ok(Some((old_len, new_len)))
 }
 
 /// `data` を `tmp` に書き、**fsync してから** `dst` へ rename で原子置換し、親
@@ -1782,5 +1924,85 @@ mod tests {
         assert_eq!(m3.read("d.bin", 0, 4).unwrap(), b"CCCC");
         assert_eq!(m3.read("b.bin", 0, 1), Err(ReadError::NotFound));
         assert_eq!(m3.read("c.bin", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn incremental_commit_appends_and_reopens_clean() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("inc.zip");
+        let orig = store_zip(&[("keep.txt", b"KEEP"), ("edit.txt", b"0123456789")]);
+        fs::write(&zip_path, &orig).unwrap();
+
+        let m = open_spill(&zip_path, 0);
+        m.write("edit.txt", 0, b"XY").unwrap();
+        m.commit_incremental().expect("incremental commit");
+
+        // append-only: 既存バイトは prefix にそのまま残り、ファイルは伸びる。
+        let grown = fs::read(&zip_path).unwrap();
+        assert!(grown.len() > orig.len());
+        assert_eq!(&grown[..orig.len()], &orig[..]);
+        // 後始末: intent も vmdirty も残らない。
+        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
+        assert!(!vmdirty_path(dir.path(), "inc.zip").exists());
+
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert!(!m2.is_dirty());
+        assert_eq!(m2.read("keep.txt", 0, 4).unwrap(), b"KEEP");
+        assert_eq!(m2.read("edit.txt", 0, 10).unwrap(), b"XY23456789");
+    }
+
+    #[test]
+    fn incremental_commit_rolls_back_incomplete_append() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("rb.zip");
+        let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
+        fs::write(&zip_path, &orig).unwrap();
+        let old_len = orig.len() as u64;
+
+        // 書いて flush（vmdirty durable）、commit せず閉じる。
+        {
+            let m = open_spill(&zip_path, 0);
+            m.write("a.bin", 0, b"ZZ").unwrap();
+            m.flush().expect("flush");
+        }
+
+        // 「追記の途中でクラッシュ」を模す: 不完全な追記の痕跡 + INTENT を手で残す。
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&zip_path).unwrap();
+            f.write_all(&[0xFFu8; 30]).unwrap(); // new_len(=+100) に届かない不完全追記
+        }
+        write_commit_intent(&sidecar_dir(&zip_path), old_len, old_len + 100).unwrap();
+
+        // 再 open: INTENT 未完 → アーカイブを old_len へ truncate（旧へ復帰）、vmdirty を replay。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(fs::metadata(&zip_path).unwrap().len(), old_len); // ガベージが消えた。
+        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
+        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL"); // 旧 + dirty を復元。
+    }
+
+    #[test]
+    fn incremental_commit_discards_stale_vmdirty_when_completed() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("cp.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", b"abcdefgh")])).unwrap();
+
+        // 正常な incremental commit（intent / vmdirty は消え、archive = new）。
+        {
+            let m = open_spill(&zip_path, 0);
+            m.write("a.bin", 0, b"ZZ").unwrap();
+            m.commit_incremental().expect("commit");
+        }
+        let new_len = fs::metadata(&zip_path).unwrap().len();
+
+        // 「追記完了後・後始末前にクラッシュ」を模す: 完了一致の INTENT + stale vmdirty。
+        write_commit_intent(&sidecar_dir(&zip_path), 0, new_len).unwrap();
+        fs::write(vmdirty_path(dir.path(), "cp.zip"), b"stale junk").unwrap();
+
+        // 再 open: INTENT 完了判定 → stale vmdirty を捨て INTENT も消し、新アーカイブを CLEAN で開く。
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert!(!m2.is_dirty());
+        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZcdefgh");
+        assert!(!vmdirty_path(dir.path(), "cp.zip").exists());
+        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
     }
 }
