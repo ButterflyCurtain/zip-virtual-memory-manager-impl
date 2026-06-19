@@ -570,3 +570,68 @@ ADR 0011 のとおり incremental 経路に **穴再利用・近傍シャッフ�
 in-place は当初の方向で、動機はディスク効率の最大化。append-only はその約束（全書き直しを
 しない編集）を継ぎ、空間回収は compaction に委ねる。in-place は削除せず実験 / post-2030
 トラックとして残す（ADR 0011）。
+
+## 0013. M4 刻み3 = INCREMENTAL/FULL 選択ポリシー（bloat 閾値、設計の忠実実装）
+
+- 日付: 2026-06-19
+- ステータス: 採用
+- 文脈: ADR 0011/0012 で M4 = append-only INCREMENTAL + 別機構 FULL compaction と決め、刻み1/2 で
+  `build_incremental` と `FileMount::commit_incremental` を実装した。刻み3 は「いつ INCREMENTAL、
+  いつ FULL を選ぶか」の層。
+
+### 決定
+
+設計仕様 `ZIP_Virtual_Memory_Manager.txt` の **WRITE STRATEGY SELECTION**（"Bloat tracking" /
+"Compaction thresholds" / "Strategy selection"）が既にこのポリシーを厳密に定義している。よって
+刻み3 は**新規設計ではなく仕様の忠実な実装**とする（この層自体は設計との差分なし）。
+
+- **bloat メトリクス（CD だけから求まり追加 I/O 不要）**:
+
+  ```
+  bloat_bytes = file_size − Σ(compressed_size) − cd_size − eocd_size
+  bloat_ratio = file_size / (file_size − bloat_bytes)   （= file_size / live_size）
+  ```
+
+  `archive::Archive::bloat() -> archive::Bloat{ file_size, live_size, bloat_bytes, bloat_ratio }`
+  を新設。LFH のバイトは live に数えない（LFH 長は読まないと分からず "追加 I/O 不要" を守るため。
+  設計どおり近似的に bloat 側へ含む）。最小アーカイブでも ratio は厳密な 1.0 でなく LFH 分だけ
+  わずかに上回るが、データに対して小さく既定閾値（2.0）には届かない。
+
+- **閾値（`OpenOptions` に追加・`FileMount` が保持）**:
+  - `gc_threshold: f64`（既定 **2.0** = アーカイブが live の倍に膨らんだら回収）
+  - `gc_max_bloat_bytes: u64`（既定 `UNLIMITED` = バイト数では発火しない）
+  - 両条件は独立に評価し、一方でも満たせば FULL（設計 "either alone is sufficient"）。
+
+- **API**: `FileMount::commit_auto(self) -> Result<CommitOutcome, FileMountError>` が
+  `bloat_ratio ≥ gc_threshold || bloat_bytes ≥ gc_max_bloat_bytes` で **FULL**（既存 `commit()`）、
+  それ以外は **INCREMENTAL**（既存 `commit_incremental()`）を選ぶ。補助に `should_full_commit()` と
+  `bloat()`。選択は **CD だけを見て**決めるので選んだ片方しか build せず、再圧縮の二度手間は起きない。
+
+### 理由
+
+- 第一目標のディスク効率（ADR 0012）は、通常は安い INCREMENTAL（未変更は追記ゼロ）で進め、
+  dead が積もった時だけ FULL で全回収する、というコピー GC / LSM / SQLite auto-vacuum 同型の
+  閾値方式で達成できる。定常ファイルサイズは `gc_threshold × live` で上界される。
+- メトリクスを CD だけから採るのは「commit のたびに O(1) で判定でき、追加 I/O を要さない」ため
+  （設計が明記）。判定は INCREMENTAL の build より前に済むので、FULL を選ぶ時も incremental の
+  追記分を作って捨てる無駄が無い。
+
+### 命名: 設計との差分（実装側に記録、設計リポは触らない）
+
+設計仕様の `commit()` / `compact()` と、実装の同名 API は意味がずれる。設計リポを書き換えるのではなく
+実装側 `docs/SPEC_DIVERGENCE.md` に差分として ADR リンク付きで残す方針（本リポの流儀）。要点:
+
+- 設計の `commit()` は bloat で INCREMENTAL/FULL を**自動選択**する。実装では役割を分け、
+  `commit()` = 明示 FULL / `commit_incremental()` = 明示 INCREMENTAL を**プリミティブ**として温存し、
+  自動選択は `commit_auto()` に置いた（設計 `force_compact` / `commit_strategy=FULL` 相当は
+  プリミティブの直接呼び出しで表現）。
+- 実装の `compact()` は **vmdirty ジャーナルの compaction**（⑤）で、設計の `compact()`
+  （アーカイブの FULL compaction）とは別物。アーカイブ FULL compaction は `commit()` /
+  `commit_auto()→FULL` が担う。
+
+### 未実装（後続）
+
+- `background_compact`（背景スレッドでの FULL）と `commit(mode=BACKGROUND)` は未実装（M4 範囲外）。
+- 刻み4: content-addressed dedup（XXH3、特許外）/ vmidx 追記拡張。
+- 設計の INCREMENTAL 手順が挙げる **Dead Space Freelist / in-place 穴再利用は不実装**（ADR 0011）。
+  dead は「次の FULL で捨てるだけの未追跡バイト」で、再利用する free block ではない。`SPEC_DIVERGENCE.md` 参照。

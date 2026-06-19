@@ -114,6 +114,26 @@ pub struct Archive<'a> {
     entries: Vec<CdEntry>,
 }
 
+/// アーカイブの bloat 会計（設計 WRITE STRATEGY SELECTION の "Bloat tracking"）。
+/// INCREMENTAL/FULL 選択の指標で、Central Directory だけから求まり追加 I/O は要らない。
+///
+/// `live_size = Σ compressed_size + cd_size + eocd_size`（= EOCD が示す CD 末尾以降の
+/// 末尾領域まで）。`bloat_bytes = file_size − live_size`。LFH のバイトは live に
+/// 数えない（LFH 長は読まないと分からないため、設計どおり bloat 側へ近似的に含む）。
+/// よって最小（dead 無し）アーカイブでも `bloat_ratio` は厳密な 1.0 でなく LFH 分だけ
+/// わずかに上回るが、データに対して小さく既定閾値（2.0）には届かない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bloat {
+    /// アーカイブの総バイト数。
+    pub file_size: u64,
+    /// 参照されている（live な）バイト数の近似 = Σcomp + cd_size + eocd_size。
+    pub live_size: u64,
+    /// 参照されていない（dead な）バイト数 = file_size − live_size。
+    pub bloat_bytes: u64,
+    /// `file_size / live_size`。最小アーカイブで ≈1.0、INCREMENTAL の積み重ねで増える。
+    pub bloat_ratio: f64,
+}
+
 impl<'a> Archive<'a> {
     /// アーカイブ全体のバイト列を parse し、Central Directory を読む。
     pub fn parse(data: &'a [u8]) -> Result<Archive<'a>, ZipError> {
@@ -201,6 +221,28 @@ impl<'a> Archive<'a> {
     pub fn entry_data(&self, entry: &CdEntry) -> Result<&'a [u8], ZipError> {
         let off = self.data_offset(entry)? as usize;
         Ok(&self.data[off..off + entry.compressed_size as usize])
+    }
+
+    /// 現在のアーカイブの bloat 会計（[`Bloat`]、設計 "Bloat tracking"）。CD だけから
+    /// 求まり追加 I/O 不要。INCREMENTAL/FULL 選択の指標に使う。
+    pub fn bloat(&self) -> Bloat {
+        let file_size = self.data.len() as u64;
+        let comp: u64 = self.entries.iter().map(|e| e.compressed_size).sum();
+        // EOCD 以降（Zip64 EOCD/ロケータ・本 EOCD・コメント）= CD 末尾から EOF まで。
+        let eocd_size = file_size.saturating_sub(self.cd_offset + self.cd_size);
+        let live_size = comp + self.cd_size + eocd_size;
+        let bloat_bytes = file_size.saturating_sub(live_size);
+        let bloat_ratio = if live_size == 0 {
+            1.0
+        } else {
+            file_size as f64 / live_size as f64
+        };
+        Bloat {
+            file_size,
+            live_size,
+            bloat_bytes,
+            bloat_ratio,
+        }
     }
 }
 

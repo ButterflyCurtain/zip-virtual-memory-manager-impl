@@ -17,7 +17,7 @@
 //! 既定プロファイルでは fsync しない（Section 6.3 c。vmidx はキャッシュで、
 //! 失われても再構築できる）。クラッシュ安全な durability は後段（M3）。
 
-use crate::archive::Archive;
+use crate::archive::{Archive, Bloat};
 use crate::commit::{build_full, build_incremental, CommitError};
 use crate::difflayer::{DiffLayer, UNLIMITED};
 use crate::entrytable::EntryTable;
@@ -52,6 +52,14 @@ pub struct OpenOptions {
     pub sync: SyncPolicy,
     /// ESTALE チェック間隔（ページキャッシュミス N 回ごと。0 = 無効）。
     pub estale_interval: u32,
+    /// [`FileMount::commit_auto`] が FULL を選ぶ bloat 比の閾値（設計
+    /// `gc_threshold`、既定 **2.0** = アーカイブが live の倍に膨らんだら回収）。
+    /// `bloat_ratio ≥ gc_threshold` で FULL。
+    pub gc_threshold: f64,
+    /// [`FileMount::commit_auto`] が FULL を選ぶ絶対 dead バイト数の閾値（設計
+    /// `gc_max_bloat_bytes`、既定 `UNLIMITED` = バイト数では発火しない）。
+    /// `bloat_bytes ≥ gc_max_bloat_bytes` で FULL。比とは独立に評価する。
+    pub gc_max_bloat_bytes: u64,
 }
 
 impl Default for OpenOptions {
@@ -61,8 +69,21 @@ impl Default for OpenOptions {
             dirty_limit: UNLIMITED,
             sync: SyncPolicy::Sync,
             estale_interval: 1,
+            gc_threshold: 2.0,
+            gc_max_bloat_bytes: UNLIMITED,
         }
     }
+}
+
+/// [`FileMount::commit_auto`] がどの経路を採ったか（設計 WRITE STRATEGY SELECTION）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// dirty も構造変更も無く、何もしなかった。
+    Noop,
+    /// INCREMENTAL（末尾追記）を採った（bloat が閾値未満）。
+    Incremental,
+    /// FULL（全書き直し + rename）を採った（bloat が閾値以上）。
+    Full,
 }
 
 /// 回復プロトコルの判断（設計 Section 3 の caller resolution options）。
@@ -231,6 +252,9 @@ pub struct FileMount {
     /// open 時のソース cd_hash（compaction で新 vmdirty ヘッダに入れる。fingerprint
     /// の一部）。再 stat はせず open 時の値を保持する。
     cd_hash: [u8; 16],
+    /// [`FileMount::commit_auto`] の FULL 発火閾値（設計 gc_threshold / gc_max_bloat_bytes）。
+    gc_threshold: f64,
+    gc_max_bloat_bytes: u64,
 }
 
 impl FileMount {
@@ -413,6 +437,8 @@ impl FileMount {
             stale: Cell::new(false),
             sync: options.sync,
             cd_hash,
+            gc_threshold: options.gc_threshold,
+            gc_max_bloat_bytes: options.gc_max_bloat_bytes,
         })
     }
 
@@ -748,6 +774,56 @@ impl FileMount {
         let _ = fs::remove_file(commit_intent_path(&sidecar));
         let _ = fsync_parent_dir(&vmdirty_path);
         Ok(())
+    }
+
+    /// 現在のアーカイブの bloat 会計（[`Bloat`]、設計 "Bloat tracking"）。CD だけから
+    /// 求まり追加 I/O 不要。open 時の mmap（= commit() 時点のアーカイブ）から算出する。
+    pub fn bloat(&self) -> Bloat {
+        match Archive::parse(&self.archive) {
+            Ok(ar) => ar.bloat(),
+            // open 済みなら parse は通るが、保険として live=file の中立値を返す。
+            Err(_) => {
+                let n = self.archive.len() as u64;
+                Bloat {
+                    file_size: n,
+                    live_size: n,
+                    bloat_bytes: 0,
+                    bloat_ratio: 1.0,
+                }
+            }
+        }
+    }
+
+    /// [`commit_auto`](Self::commit_auto) が FULL（全書き直し）を選ぶか（設計
+    /// "Compaction thresholds"）。`bloat_ratio ≥ gc_threshold` または
+    /// `bloat_bytes ≥ gc_max_bloat_bytes` のどちらか一方でも満たせば true。両条件は
+    /// 独立に評価する。
+    pub fn should_full_commit(&self) -> bool {
+        let b = self.bloat();
+        b.bloat_ratio >= self.gc_threshold || b.bloat_bytes >= self.gc_max_bloat_bytes
+    }
+
+    /// INCREMENTAL / FULL を bloat 閾値で自動選択して commit する（設計
+    /// WRITE STRATEGY SELECTION の `commit()`）。第一目標のディスク効率は、通常は安い
+    /// INCREMENTAL（未変更は追記ゼロ）で進め、dead が積もって
+    /// [`should_full_commit`](Self::should_full_commit) が立った時だけ FULL で全回収する
+    /// （定常サイズを `gc_threshold` 倍の live で上界する）ことで保つ。
+    ///
+    /// 選択は CD だけを見て決めるので、選んだ片方しか build しない（再圧縮の二度手間は
+    /// 起きない）。FULL を強制したい呼び出し側は [`commit`](Self::commit) を、INCREMENTAL を
+    /// 強制したい側は [`commit_incremental`](Self::commit_incremental) を直接呼ぶ。
+    /// マウントを消費する。
+    pub fn commit_auto(self) -> Result<CommitOutcome, FileMountError> {
+        if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
+            return Ok(CommitOutcome::Noop);
+        }
+        if self.should_full_commit() {
+            self.commit()?;
+            Ok(CommitOutcome::Full)
+        } else {
+            self.commit_incremental()?;
+            Ok(CommitOutcome::Incremental)
+        }
     }
 
     /// キャッシュミス時の鮮度チェック（ソースへ触れる前）。間隔判定を通過したら
@@ -1407,6 +1483,7 @@ mod tests {
             dirty_limit,
             sync: SyncPolicy::Sync,
             estale_interval: 1,
+            ..OpenOptions::default()
         }
     }
 
@@ -2004,5 +2081,133 @@ mod tests {
         assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZcdefgh");
         assert!(!vmdirty_path(dir.path(), "cp.zip").exists());
         assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
+    }
+
+    // ───────────── M4 刻み3: INCREMENTAL/FULL 選択ポリシー（bloat 閾値）─────────────
+
+    fn open_with_gc(zip_path: &Path, gc_threshold: f64) -> FileMount {
+        FileMount::open_with_options(
+            zip_path,
+            OpenOptions {
+                gc_threshold,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open with gc")
+    }
+
+    /// クリーン（dead 無し）なアーカイブは bloat_ratio ≈ 1.0 で、既定閾値（2.0）未満。
+    /// よって commit_auto は INCREMENTAL を選ぶ。
+    #[test]
+    fn bloat_ratio_clean_archive_below_threshold() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("clean.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[("a.txt", b"AAAAAAAA"), ("b.txt", b"BBBBBBBBBBBBBBBB")]),
+        )
+        .unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        let b = m.bloat();
+        assert!(b.bloat_ratio < 2.0, "clean ratio {} should be < 2.0", b.bloat_ratio);
+        assert!(b.bloat_ratio >= 1.0);
+        assert!(!m.should_full_commit());
+    }
+
+    /// 閾値未満（クリーン）への小編集は INCREMENTAL を選ぶ: ファイルは末尾追記で伸び、
+    /// 先頭の既存バイトは保たれる（未変更エントリは元オフセットのまま）。
+    #[test]
+    fn commit_auto_picks_incremental_below_threshold() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("auto_inc.zip");
+        let orig = store_zip(&[("keep.txt", b"KEEP"), ("edit.txt", b"0123456789")]);
+        fs::write(&zip_path, &orig).unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        m.write("edit.txt", 0, b"XY").unwrap();
+        assert_eq!(m.commit_auto().expect("commit_auto"), CommitOutcome::Incremental);
+
+        // append-only の痕跡: prefix 保持 + ファイル増。
+        let grown = fs::read(&zip_path).unwrap();
+        assert!(grown.len() > orig.len());
+        assert_eq!(&grown[..orig.len()], &orig[..]);
+
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert!(!m2.is_dirty());
+        assert_eq!(m2.read("keep.txt", 0, 4).unwrap(), b"KEEP");
+        assert_eq!(m2.read("edit.txt", 0, 10).unwrap(), b"XY23456789");
+    }
+
+    /// INCREMENTAL の積み重ねで dead が live を超え bloat_ratio ≥ 2.0 になったら、
+    /// commit_auto は FULL（全書き直し）を選び、dead を回収して最小アーカイブに戻す。
+    #[test]
+    fn commit_auto_picks_full_when_bloated() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("auto_full.zip");
+        // 単一エントリ（= live 全体）を rewrite すると旧コピーがそのまま dead になり、
+        // 1 回の INCREMENTAL で bloat_ratio が 2.0 を超える。
+        let big: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        fs::write(&zip_path, store_zip(&[("big.bin", &big)])).unwrap();
+
+        // 1 回 INCREMENTAL commit して dead を積む。
+        {
+            let m = FileMount::open(&zip_path).expect("open");
+            m.write("big.bin", 0, b"ZZZZ").unwrap();
+            m.commit_incremental().expect("incremental commit");
+        }
+        let bloated_len = fs::metadata(&zip_path).unwrap().len();
+
+        // 再 open: dead が積もり ratio ≥ 2.0 → FULL を選ぶべき。
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert!(
+            m2.should_full_commit(),
+            "bloat_ratio {} should be >= 2.0",
+            m2.bloat().bloat_ratio
+        );
+        m2.write("big.bin", 4, b"WWWW").unwrap();
+        assert_eq!(m2.commit_auto().expect("commit_auto"), CommitOutcome::Full);
+
+        // FULL で回収: ファイルは縮み、再 open 時の ratio は閾値未満（最小化）。
+        let compacted_len = fs::metadata(&zip_path).unwrap().len();
+        assert!(compacted_len < bloated_len, "FULL should shrink the archive");
+
+        let m3 = FileMount::open(&zip_path).expect("reopen after full");
+        assert!(!m3.should_full_commit());
+        assert!(m3.bloat().bloat_ratio < 2.0);
+        assert_eq!(m3.read("big.bin", 0, 8).unwrap(), b"ZZZZWWWW");
+        assert_eq!(m3.read("big.bin", 8, 4).unwrap(), &big[8..12]);
+    }
+
+    /// 閾値以上でも commit_incremental を直接呼べば INCREMENTAL を強制できる
+    /// （commit_auto のプリミティブは温存）。逆に低い gc_threshold で commit_auto は
+    /// クリーンなアーカイブでも FULL を選ぶ。
+    #[test]
+    fn explicit_primitives_override_policy() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("force.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", b"abcdefghij")])).unwrap();
+
+        // gc_threshold=1.0 → クリーン（ratio>1.0）でも FULL 判定。
+        let m = open_with_gc(&zip_path, 1.0);
+        assert!(m.should_full_commit());
+        m.write("a.bin", 0, b"ZZ").unwrap();
+        assert_eq!(m.commit_auto().expect("commit_auto"), CommitOutcome::Full);
+
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m2.read("a.bin", 0, 10).unwrap(), b"ZZcdefghij");
+    }
+
+    /// 変更が無ければ commit_auto は Noop で、ファイルにもサイドカーにも触れない。
+    #[test]
+    fn commit_auto_noop_when_clean() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("noop.zip");
+        let orig = store_zip(&[("a.bin", b"unchanged")]);
+        fs::write(&zip_path, &orig).unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        assert_eq!(m.commit_auto().expect("commit_auto"), CommitOutcome::Noop);
+        assert_eq!(fs::read(&zip_path).unwrap(), orig);
     }
 }
