@@ -348,3 +348,72 @@ vmdirty の `VmdirtyWriter`（Section 7）を実装するにあたり:
   FIFO の write-hit 再スタンプ最適化（正しさ無関係）。
 - 設計テキスト側の Section 3（「自動解決しない」宣言と決定木の `auto`/`silently`
   枝の食い違い）は公開リポで文言を明確化する候補（別 push）。
+
+---
+
+## 0010. ④ エントリ操作を ④a(create/remove/truncate) と ④b(rename) に分割、エントリ表は「現在名キー + source 参照」
+
+- 日付: 2026-06-19
+- ステータス: 採用
+- 選択肢:
+  - 範囲 = (a) 4 操作（create/remove/truncate/rename）を 1 増分 / (b) create/remove/
+    truncate を先に固め、rename を別増分に
+  - rename の同一性モデル = (c) 現在名キー + source 参照（Diff/Tier2 は現在名で
+    キー、エントリ表が各エントリの source 名を持つ）/ (d) 安定 internal identity +
+    現在名オーバーレイ
+
+### 決定
+
+**(b) + (c)**。本増分（④a）で create / remove / truncate と journaling・回復 replay
+を実装し、rename（④b）は別増分に分ける。エントリ表は **現在名キー + source 参照**。
+
+- **エントリ表**（新規 `entrytable.rs`）は immutable な vmidx に被せる
+  オーバーレイ（`Created` / `Tombstone`）。`kind(name, in_vmidx) -> Absent |
+  Created | Source` が実効集合「vmidx ∪ created − tombstone」を判定する。論理サイズ
+  と dirty ページは [`DiffLayer`] 側に残す純データ構造。④b では `Aliased { source }`
+  を足して rename を表現する（それまで `Kind::Source` のソース名 = 現在名）。
+- **read/write/commit の seam**: `mount::resolve_entry` がエントリ表 + vmidx を解決し
+  `ResolvedEntry { source: Option<String>, original_size }` を返す。`read_dirty` /
+  `write_into` / `build_full` は vmidx を名前で引き直さず、この `source`
+  （None = created）を受け取る。rename(④b) は resolve の写像を変えるだけで
+  read/write 本体に触れない。
+- **truncate-shrink の正しさ**: `DiffLayer` に **source high-water**（`source_size`）
+  を持たせる。初期値はソースの元サイズ、truncate-shrink で単調に縮む。縮小で捨てた
+  末尾領域は後で extend してもソースから蘇らずゼロになる（実 FS の truncate 意味論）。
+  read/write/commit のソース読み出し上限はこの `source_size` を使う。
+- **created エントリの commit 既定メソッド = DEFLATE**。空〜任意サイズで素直、ZIP の
+  一般的既定。STORE 固定は大きい created でアーカイブを膨らませる。
+- **回復**: ページとエントリ操作（METADATA）を **sequence 順に統合 replay**
+  （`disk::replay_recovered`）して Diff Layer + エントリ表を復元（設計
+  ENTRY OPERATIONS「replays records strictly in sequence order」）。回復後は新 gen に
+  Create / Remove と各 dirty エントリの RESIZE を **再 journal**してから flush
+  （`rejournal_recovered`）。`source_size < logical` のときは RESIZE(source_size) →
+  RESIZE(logical) の順で 2 件書き、二次クラッシュでも「縮小して捨てた領域は extend
+  してもゼロ」を保つ。これにより M3 ③ の `RecoveryRequired` でエントリ操作を弾く枝を
+  実装で置換した。
+- **journaling は spill 有効時のみ**（`tier2` が `Some` のとき）。spill 無効
+  （`UNLIMITED`）では entry op もページ同様 commit まで non-durable で一貫。
+
+### 理由
+
+- ④a と rename はモジュール性が違う。rename だけが「現在名 ≠ source 名」の分離・
+  Diff/Tier2 の再キー・回復での rename replay を要する。create/remove/truncate は
+  名前アドレッシングが現在名で完結し、journal も METADATA が既に揃っている。先に
+  ここを crash-before/after 込みで緑に固めると、rename を独立に重ねられる。
+- 現在名キー + source 参照は設計の (path, page_index) 名前アドレッシングに忠実で、
+  journal/回復（名前ベース）とも一致する。安定 identity 案は read/write 内部を
+  identity に書き換える侵襲が大きく、journal が名前ベースな点ともズレる。
+- source high-water は journal で表現できる状態（RESIZE の縮小→拡大列）に落とせる
+  最小の追加状態で、truncate の「捨てた領域は蘇らない」を正しく保つ。
+
+### 備考
+
+- 新規モジュール `entrytable.rs`。`mount` に `resolve_entry` / `entry_create` /
+  `entry_remove` / `entry_truncate` / `ResolveError` / `ResolvedEntry` / `EntryError`。
+  `difflayer` に `remove_entry` / `truncate_pages` / `source_size`。`tier2` に
+  `journal_op` / `purge_entry` / `purge_pages_beyond`。`commit::build_full` は
+  `&EntryTable` を取り、tombstone をスキップ・created を新規 LFH/CD で出す。
+- 依存追加なし。`cargo test` 166 緑・警告なし。
+- **未了（④b 以降）**: rename（`Aliased`、Diff/Tier2 の再キー、回復 rename replay、
+  CD-only 改名の INCREMENTAL は M4）、compaction（⑤）、rename 後の親 dir fsync
+  （⑤）、fsyncgate。非 UTF-8 名のエントリ操作は対象外（エントリ表は UTF-8 名のみ）。

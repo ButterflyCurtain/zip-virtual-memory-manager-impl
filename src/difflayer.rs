@@ -41,6 +41,10 @@ struct DirtyEntry {
     /// 現在の論理サイズ。read は超過分を短く返し（EOF）、commit はここまでを
     /// materialise する。
     logical_size: u64,
+    /// 未変更ページをソースから読んでよい先頭バイト数（high-water）。初期値は
+    /// ソースの元 `uncompressed_size`。truncate-shrink で単調に減る（縮小で捨てた
+    /// 領域は、後で extend しても蘇らずゼロになる）。created は 0。
+    source_size: u64,
 }
 
 /// `dirty_limit` 超過で Tier 1 から退避すべき 1 ページ。呼び出し側がこれを
@@ -136,7 +140,14 @@ impl DiffLayer {
             .or_insert_with(|| DirtyEntry {
                 pages: HashMap::new(),
                 logical_size: base_size,
+                source_size: base_size,
             });
+    }
+
+    /// `path` の source_size（未変更ページをソースから読んでよい先頭バイト数）。
+    /// dirty でなければ `None`。
+    pub fn source_size(&self, path: &str) -> Option<u64> {
+        self.entries.get(path).map(|e| e.source_size)
     }
 
     /// 論理サイズを設定する（implicit extension / truncate で更新）。
@@ -215,6 +226,48 @@ impl DiffLayer {
     /// で列挙する。flush（全 spill）が durable 化の順序として使う。
     pub fn resident_pages(&self) -> Vec<(String, u64)> {
         self.order.values().cloned().collect()
+    }
+
+    /// エントリ `path` を丸ごと（全ページ + 論理サイズ）落とす（remove / create
+    /// リスタート用）。FIFO 並びと会計からも当該ページを取り除く。エントリが
+    /// 無ければ何もしない。
+    pub fn remove_entry(&mut self, path: &str) {
+        if let Some(e) = self.entries.remove(path) {
+            let dropped = e.pages.len() as u64;
+            self.dirty_current = self
+                .dirty_current
+                .saturating_sub(dropped * self.page_size);
+            self.order.retain(|_, (p, _)| p != path);
+        }
+    }
+
+    /// `path` を `new_size` へ縮める（truncate-shrink）。`new_size` 以降に完全に
+    /// 収まるページを Tier 1 から落とし、境界ページの末尾（`new_size % page_size`
+    /// 以降）をゼロ埋めする（設計 truncate: "final partial page is zero-padded in
+    /// its tail at commit"。再 extend 時に古い末尾が蘇らないよう即ゼロ化する）。
+    /// FIFO 並びと会計を更新する。エントリが無ければ何もしない。論理サイズ自体は
+    /// 呼び出し側が [`set_logical_size`](Self::set_logical_size) で更新する。
+    pub fn truncate_pages(&mut self, path: &str, new_size: u64) {
+        let ps = self.page_size;
+        let Some(e) = self.entries.get_mut(path) else {
+            return;
+        };
+        // 捨てた末尾はソースからも蘇らせない（source high-water を縮める）。
+        e.source_size = e.source_size.min(new_size);
+        let before = e.pages.len() as u64;
+        e.pages.retain(|&page, _| page * ps < new_size);
+        let dropped = before - e.pages.len() as u64;
+        // 境界ページの末尾をゼロ化（new_size がページ境界でない場合のみ）。
+        let tail = (new_size % ps) as usize;
+        if tail != 0 {
+            if let Some(buf) = e.pages.get_mut(&(new_size / ps)) {
+                for b in &mut buf[tail..] {
+                    *b = 0;
+                }
+            }
+        }
+        self.dirty_current = self.dirty_current.saturating_sub(dropped * ps);
+        self.order.retain(|_, (p, pg)| !(p == path && *pg * ps >= new_size));
     }
 
     /// 全 dirty 状態を捨てる（commit 完了後）。

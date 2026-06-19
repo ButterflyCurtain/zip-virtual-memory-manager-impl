@@ -11,6 +11,7 @@ pub mod archive;
 pub mod commit;
 pub mod difflayer;
 pub mod disk;
+pub mod entrytable;
 pub mod index_build;
 pub mod lock;
 pub mod mount;

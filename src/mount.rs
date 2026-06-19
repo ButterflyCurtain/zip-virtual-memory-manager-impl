@@ -28,10 +28,12 @@
 use crate::archive::{Archive, ZipError};
 use crate::commit::{build_full, CommitError};
 use crate::difflayer::DiffLayer;
+use crate::entrytable::{EntryTable, Kind};
 use crate::index_build::{build_vmidx_eager, BuildError, BuildParams};
 use crate::page::{page_count, page_extent, PageCache, PageConfig, PageKey};
 use crate::provider::{builtin_provider, check_range, ProviderError};
 use crate::tier2::Tier2;
+use crate::vmdirty::MetaOp;
 use crate::vmidx::{
     hash_cd_block, DecodeError, EntryRecord, FingerprintVerdict, ProviderType, SourceStat, Vmidx,
 };
@@ -124,6 +126,85 @@ impl fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
+/// エントリ表 + vmidx からの解決失敗（read / write / entry op の共通入口）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// エントリが存在しない（tombstone または vmidx に無い）。
+    NotFound,
+    /// ソースが COW / 再圧縮できない圧縮種別（STORE / 標準 DEFLATE 以外）。
+    Unsupported(ProviderType),
+    /// vmidx の decode 失敗。
+    Vmidx(DecodeError),
+}
+
+impl From<ResolveError> for ReadError {
+    fn from(e: ResolveError) -> ReadError {
+        match e {
+            ResolveError::NotFound => ReadError::NotFound,
+            ResolveError::Unsupported(p) => ReadError::Unsupported(p),
+            ResolveError::Vmidx(d) => ReadError::Vmidx(d),
+        }
+    }
+}
+
+impl From<ResolveError> for WriteError {
+    fn from(e: ResolveError) -> WriteError {
+        match e {
+            ResolveError::NotFound => WriteError::NotFound,
+            ResolveError::Unsupported(p) => WriteError::Unsupported(p),
+            ResolveError::Vmidx(d) => WriteError::Vmidx(d),
+        }
+    }
+}
+
+/// エントリの「未変更データの出どころ」と元サイズ（エントリ表 + vmidx の解決結果）。
+pub struct ResolvedEntry {
+    /// 未変更ページを読むソース vmidx 名。`None` = created（ソース無し）。
+    /// ④a では Source の場合は現在名に一致する（rename で分岐するのは ④b）。
+    pub source: Option<String>,
+    /// ソースの元 `uncompressed_size`（created は 0）。
+    pub original_size: u64,
+}
+
+/// エントリ操作（create / remove / truncate）の失敗（設計 ENTRY OPERATIONS）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryError {
+    /// create 先が既に存在する（EEXIST）。
+    Exists,
+    /// 対象が存在しない（ENOENT）。
+    NotFound,
+    /// 再圧縮できない圧縮種別の既存エントリを truncate しようとした。
+    Unsupported(ProviderType),
+    /// vmidx の decode 失敗。
+    Vmidx(DecodeError),
+    /// vmdirty への METADATA 追記（journaling）の I/O 失敗。
+    Journal(String),
+}
+
+impl From<ResolveError> for EntryError {
+    fn from(e: ResolveError) -> EntryError {
+        match e {
+            ResolveError::NotFound => EntryError::NotFound,
+            ResolveError::Unsupported(p) => EntryError::Unsupported(p),
+            ResolveError::Vmidx(d) => EntryError::Vmidx(d),
+        }
+    }
+}
+
+impl fmt::Display for EntryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EntryError::Exists => write!(f, "entry op: already exists"),
+            EntryError::NotFound => write!(f, "entry op: not found"),
+            EntryError::Unsupported(p) => write!(f, "entry op: unsupported provider {p:?}"),
+            EntryError::Vmidx(e) => write!(f, "entry op: {e}"),
+            EntryError::Journal(e) => write!(f, "entry op: journal write failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for EntryError {}
+
 /// 1 つのアーカイブに対するマウント。読み取りに加え、Diff Layer Tier 1 を介した
 /// 書き込み（[`write`](Mount::write)）と FULL [`commit`](Mount::commit) を提供する
 /// （設計 WRITE PATH / commit() FLOW の M2 最小形）。ソース ZIP は commit まで
@@ -135,6 +216,8 @@ pub struct Mount<'a> {
     cache: RefCell<PageCache>,
     /// 未コミットの dirty ページ（Tier 1）。read は Diff Layer を最優先で見る。
     diff: RefCell<DiffLayer>,
+    /// セッション内の構造変更（create / remove）を vmidx に被せる表。
+    entries: RefCell<EntryTable>,
 }
 
 impl<'a> Mount<'a> {
@@ -176,6 +259,7 @@ impl<'a> Mount<'a> {
             cfg,
             cache,
             diff,
+            entries: RefCell::new(EntryTable::new()),
         }
     }
 
@@ -188,13 +272,17 @@ impl<'a> Mount<'a> {
     /// dirty なエントリは Diff Layer から（設計 READ PATH の Tier 1 最優先）、
     /// それ以外はページキャッシュ経由（ミス時のみ展開 + read-ahead 充填）。
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
-        if self.diff.borrow().is_dirty(path) {
+        let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
+        // dirty（overlaid / 書き込み済み）または created は Diff Layer から。
+        if self.diff.borrow().is_dirty(path) || resolved.source.is_none() {
             return read_dirty(
                 self.archive,
                 &self.vmidx_image,
                 &self.diff.borrow(),
                 None,
                 path,
+                resolved.source.as_deref(),
+                resolved.original_size,
                 offset,
                 len,
             );
@@ -218,27 +306,72 @@ impl<'a> Mount<'a> {
     /// 書き込みはエントリを伸ばし（implicit extension）、間のページはゼロ埋めされる
     /// （commit で materialise）。`dirty_limit` は M2 では無制限（spill なし）。
     pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), WriteError> {
+        let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
         write_into(
             self.archive,
             &self.vmidx_image,
             &mut self.diff.borrow_mut(),
             None,
             path,
+            resolved.source.as_deref(),
+            resolved.original_size,
             offset,
             data,
         )
     }
 
-    /// dirty なエントリがあるか（commit が実体を持つか）。
+    /// 空のエントリを作る（設計 create()）。既存（未削除）なら [`EntryError::Exists`]。
+    pub fn create(&self, path: &str) -> Result<(), EntryError> {
+        entry_create(
+            &mut self.entries.borrow_mut(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            None,
+            path,
+        )
+    }
+
+    /// エントリを削除する（設計 remove()。tombstone）。存在しなければ
+    /// [`EntryError::NotFound`]。
+    pub fn remove(&self, path: &str) -> Result<(), EntryError> {
+        entry_remove(
+            &mut self.entries.borrow_mut(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            None,
+            path,
+        )
+    }
+
+    /// エントリの論理サイズを変える（設計 truncate()）。縮小は末尾ページを落とし、
+    /// 拡大は gap をゼロ埋め扱いにする。存在しなければ [`EntryError::NotFound`]。
+    pub fn truncate(&self, path: &str, new_size: u64) -> Result<(), EntryError> {
+        entry_truncate(
+            &self.entries.borrow(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            None,
+            path,
+            new_size,
+        )
+    }
+
+    /// dirty なエントリ、または構造変更（create / remove）があるか（commit が実体を
+    /// 持つか）。
     pub fn is_dirty(&self) -> bool {
-        !self.diff.borrow().is_empty()
+        !self.diff.borrow().is_empty() || !self.entries.borrow().is_empty()
     }
 
     /// 全 dirty 変更を反映した新しい ZIP バイト列を返す（FULL commit。設計
     /// commit() FLOW の FULL path）。マウントを消費する: 呼び出し側は返った
     /// バイト列で開き直す（ディスクでは `archive.new.zip` に書いて `rename`）。
     pub fn commit(self) -> Result<Vec<u8>, CommitError> {
-        build_full(self.archive, &self.vmidx_image, &self.diff.borrow())
+        build_full(
+            self.archive,
+            &self.vmidx_image,
+            &self.diff.borrow(),
+            &self.entries.borrow(),
+        )
     }
 }
 
@@ -310,6 +443,122 @@ pub fn read_entry(
         .map_err(ReadError::Provider)
 }
 
+/// エントリ表 + vmidx から `path` の実効状態を解決する（read / write / truncate の
+/// 共通入口）。tombstone・不在は [`ResolveError::NotFound`]、ソースが再圧縮不能な
+/// 圧縮種別なら [`ResolveError::Unsupported`]。created はソース無し
+/// （`original_size = 0`）。Source は ④a ではソース名 = 現在名。
+pub fn resolve_entry(
+    table: &EntryTable,
+    vmidx_image: &[u8],
+    path: &str,
+) -> Result<ResolvedEntry, ResolveError> {
+    let vmidx = Vmidx::parse(vmidx_image).map_err(ResolveError::Vmidx)?;
+    let rec = vmidx.lookup(path).map_err(ResolveError::Vmidx)?;
+    match table.kind(path, rec.is_some()) {
+        Kind::Absent => Err(ResolveError::NotFound),
+        Kind::Created => Ok(ResolvedEntry {
+            source: None,
+            original_size: 0,
+        }),
+        Kind::Source => {
+            let (_, record) = rec.ok_or(ResolveError::NotFound)?;
+            if builtin_provider(record.provider_type).is_none() {
+                return Err(ResolveError::Unsupported(record.provider_type));
+            }
+            Ok(ResolvedEntry {
+                source: Some(path.to_owned()),
+                original_size: record.uncompressed_size,
+            })
+        }
+    }
+}
+
+/// 空のエントリを作る（設計 create()）。実効的に存在する（未削除）なら
+/// [`EntryError::Exists`]。create-after-remove は tombstone を上書きして新規の
+/// 空エントリを始める。`tier2` があれば METADATA CREATE を journal する。
+pub fn entry_create(
+    table: &mut EntryTable,
+    diff: &mut DiffLayer,
+    vmidx_image: &[u8],
+    tier2: Option<&mut Tier2>,
+    path: &str,
+) -> Result<(), EntryError> {
+    let in_vmidx = entry_in_vmidx(vmidx_image, path)?;
+    if table.kind(path, in_vmidx) != Kind::Absent {
+        return Err(EntryError::Exists);
+    }
+    // 残骸（前の remove で消し切れなかったページ）が無いことを保証して新規開始。
+    diff.remove_entry(path);
+    table.mark_created(path);
+    diff.ensure_entry(path, 0);
+    diff.set_logical_size(path, 0);
+    if let Some(t2) = tier2 {
+        t2.journal_op(path, &MetaOp::Create)
+            .map_err(|e| EntryError::Journal(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// エントリを削除する（設計 remove()。tombstone）。存在しなければ
+/// [`EntryError::NotFound`]。Tier 1 ページを落とし、Tier 2 索引を purge して
+/// create-after-remove で古いページを読まないようにする。`tier2` があれば
+/// METADATA REMOVE を journal する。
+pub fn entry_remove(
+    table: &mut EntryTable,
+    diff: &mut DiffLayer,
+    vmidx_image: &[u8],
+    tier2: Option<&mut Tier2>,
+    path: &str,
+) -> Result<(), EntryError> {
+    let in_vmidx = entry_in_vmidx(vmidx_image, path)?;
+    if table.kind(path, in_vmidx) == Kind::Absent {
+        return Err(EntryError::NotFound);
+    }
+    table.mark_tombstone(path);
+    diff.remove_entry(path);
+    if let Some(t2) = tier2 {
+        t2.purge_entry(path);
+        t2.journal_op(path, &MetaOp::Remove)
+            .map_err(|e| EntryError::Journal(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// エントリの論理サイズを `new_size` に変える（設計 truncate()）。縮小は末尾
+/// ページを落とし（境界ページ末尾はゼロ化、Tier 2 索引も purge）、拡大は gap を
+/// ゼロ埋め扱いにする。存在しなければ [`EntryError::NotFound`]。拡大は DATA RECORD
+/// が伸びを表さないので常に METADATA RESIZE を journal する（`tier2` があれば）。
+pub fn entry_truncate(
+    table: &EntryTable,
+    diff: &mut DiffLayer,
+    vmidx_image: &[u8],
+    tier2: Option<&mut Tier2>,
+    path: &str,
+    new_size: u64,
+) -> Result<(), EntryError> {
+    let resolved = resolve_entry(table, vmidx_image, path)?;
+    diff.ensure_entry(path, resolved.original_size);
+    let current = diff.logical_size(path).unwrap_or(resolved.original_size);
+    if new_size < current {
+        diff.truncate_pages(path, new_size);
+    }
+    diff.set_logical_size(path, new_size);
+    if let Some(t2) = tier2 {
+        if new_size < current {
+            t2.purge_pages_beyond(path, new_size);
+        }
+        t2.journal_op(path, &MetaOp::Resize { new_size })
+            .map_err(|e| EntryError::Journal(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// `path` が vmidx に在るか（エントリ表の `kind` 判定の入力）。
+fn entry_in_vmidx(vmidx_image: &[u8], path: &str) -> Result<bool, EntryError> {
+    let vmidx = Vmidx::parse(vmidx_image).map_err(EntryError::Vmidx)?;
+    Ok(vmidx.lookup(path).map_err(EntryError::Vmidx)?.is_some())
+}
+
 /// エントリ `path` の `[offset, offset + data.len())` を Diff Layer に COW で書く
 /// （設計 WRITE PATH）。`tier2` を渡すと書き込み経路は三段になる:
 /// - **Tier 1 ヒット**: 常駐ページを in-place 更新。
@@ -327,27 +576,21 @@ pub fn write_into(
     diff: &mut DiffLayer,
     mut tier2: Option<&mut Tier2>,
     path: &str,
+    source: Option<&str>,
+    original_size: u64,
     offset: u64,
     data: &[u8],
 ) -> Result<(), WriteError> {
     if data.is_empty() {
         return Ok(());
     }
-    // エントリの存在と元サイズ・種別を確認する（M2 は既存エントリの変更のみ）。
-    let (original_size, provider_type) = {
-        let vmidx = Vmidx::parse(vmidx_image).map_err(WriteError::Vmidx)?;
-        let (_, record) = vmidx
-            .lookup(path)
-            .map_err(WriteError::Vmidx)?
-            .ok_or(WriteError::NotFound)?;
-        (record.uncompressed_size, record.provider_type)
-    };
-    if builtin_provider(provider_type).is_none() {
-        return Err(WriteError::Unsupported(provider_type));
-    }
-
+    // 存在確認・種別チェックは呼び出し側の [`resolve_entry`] が済ませている。
+    // `source` = 未変更ページを読むソース名（None = created）、`original_size` =
+    // そのソースの元サイズ（created は 0）。
     let page_size = diff.page_size();
     diff.ensure_entry(path, original_size);
+    // ソース読み出し（COW 復元）の上限は source high-water（truncate-shrink で縮む）。
+    let original_size = diff.source_size(path).unwrap_or(original_size);
     let end = offset + data.len() as u64;
     let new_logical = diff.logical_size(path).unwrap_or(original_size).max(end);
 
@@ -369,13 +612,16 @@ pub fn write_into(
             t2.write_hit(path, page, &buf, new_logical)
                 .map_err(|e| WriteError::Spill(e.to_string()))?;
         } else {
-            // ミス: ソースから COW して Tier 1 に載せる。
+            // ミス: ソースから COW して Tier 1 に載せる。created（source=None）や
+            // ソース末尾超えはゼロ（バッファは既にゼロ初期化）。
             let mut buf = vec![0u8; page_size as usize];
-            if page_start < original_size {
-                let avail = ((original_size - page_start).min(page_size)) as usize;
-                let orig = read_entry(archive, vmidx_image, path, page_start, avail)
-                    .map_err(|e| WriteError::Read(Box::new(e)))?;
-                buf[..avail].copy_from_slice(&orig);
+            if let Some(src) = source {
+                if page_start < original_size {
+                    let avail = ((original_size - page_start).min(page_size)) as usize;
+                    let orig = read_entry(archive, vmidx_image, src, page_start, avail)
+                        .map_err(|e| WriteError::Read(Box::new(e)))?;
+                    buf[..avail].copy_from_slice(&orig);
+                }
             }
             apply_write(&mut buf, page_start, offset, end, data);
             diff.insert_page(path, page, buf);
@@ -419,18 +665,16 @@ pub fn read_dirty(
     diff: &DiffLayer,
     tier2: Option<&Tier2>,
     path: &str,
+    source: Option<&str>,
+    original_size: u64,
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>, ReadError> {
-    let original_size = {
-        let vmidx = Vmidx::parse(vmidx_image).map_err(ReadError::Vmidx)?;
-        let (_, record) = vmidx
-            .lookup(path)
-            .map_err(ReadError::Vmidx)?
-            .ok_or(ReadError::NotFound)?;
-        record.uncompressed_size
-    };
+    // 存在確認は呼び出し側の [`resolve_entry`] が済ませている。`source` = 未変更
+    // ページを読むソース名（None = created）。ソース読み出しの上限は Diff Layer の
+    // source high-water（truncate-shrink で縮む）を優先する。
     let logical = diff.logical_size(path).ok_or(ReadError::NotFound)?;
+    let original_size = diff.source_size(path).unwrap_or(original_size);
     let page_size = diff.page_size();
 
     if len == 0 || offset >= logical {
@@ -460,11 +704,12 @@ pub fn read_dirty(
             // Tier 2 ヒット（vmdirty から読み戻し、page_size までゼロ埋め済み）。
             out.extend_from_slice(&p[in_page..in_page + take]);
         } else {
-            // 未変更ページ。ソース範囲内は読み、超える分はゼロ（gap）。
+            // 未変更ページ。ソースがあれば範囲内を読み、超える分とソース無し
+            // （created）はゼロ（gap / 末尾超え）。
             let orig_end = chunk_end.min(original_size);
-            if pos < orig_end {
+            if let Some(src) = source.filter(|_| pos < orig_end) {
                 let n = (orig_end - pos) as usize;
-                let chunk = read_entry(archive, vmidx_image, path, pos, n)?;
+                let chunk = read_entry(archive, vmidx_image, src, pos, n)?;
                 out.extend_from_slice(&chunk);
                 if n < take {
                     out.resize(out.len() + (take - n), 0);
@@ -1142,6 +1387,150 @@ mod tests {
         let m2 = Mount::open(&new_zip, &params).expect("reopen committed");
         assert_eq!(m2.read("a.txt", 0, 5).unwrap(), b"hello");
         assert_eq!(m2.read("big.bin", 0, data.len()).unwrap(), data);
+    }
+
+    // ───────────────────────── ④ エントリ操作（create/remove/truncate）─────────
+
+    #[test]
+    fn create_write_read_and_commit_new_entry() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"existing", 8);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        // 新規エントリは create 前は存在しない。
+        assert_eq!(mount.read("new.txt", 0, 1), Err(ReadError::NotFound));
+        mount.create("new.txt").unwrap();
+        assert!(mount.is_dirty());
+        // 作りたては空（読みは短い）。
+        assert_eq!(mount.read("new.txt", 0, 10).unwrap(), b"");
+        // 書いて読み戻す。implicit extension で gap はゼロ。
+        mount.write("new.txt", 2, b"hi").unwrap();
+        assert_eq!(mount.read("new.txt", 0, 4).unwrap(), b"\x00\x00hi");
+
+        // commit 後に開き直すと新エントリが在り、既存も保たれる。
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("new.txt", 0, 4).unwrap(), b"\x00\x00hi");
+        assert_eq!(m2.read("a.txt", 0, 8).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn create_existing_entry_fails() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"x", 1);
+        let zip = zb.finish();
+        let mount = Mount::open(&zip, &BuildParams::default()).expect("open");
+        assert_eq!(mount.create("a.txt"), Err(EntryError::Exists));
+        // 二重 create も Exists。
+        mount.create("b.txt").unwrap();
+        assert_eq!(mount.create("b.txt"), Err(EntryError::Exists));
+    }
+
+    #[test]
+    fn remove_hides_entry_and_commit_drops_it() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"keep", 4);
+        zb.add("b.txt", 0, b"gone", 4);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.remove("b.txt").unwrap();
+        assert_eq!(mount.read("b.txt", 0, 4), Err(ReadError::NotFound));
+        assert_eq!(mount.write("b.txt", 0, b"x"), Err(WriteError::NotFound));
+        // 存在しないものの remove は ENOENT。
+        assert_eq!(mount.remove("absent"), Err(EntryError::NotFound));
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 4).unwrap(), b"keep");
+        assert_eq!(m2.read("b.txt", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn remove_then_write_then_remove_clean_entry() {
+        // dirty にしてから remove しても tombstone が勝つ。
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"hello", 5);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+        mount.write("a.txt", 0, b"HELLO").unwrap();
+        mount.remove("a.txt").unwrap();
+        assert_eq!(mount.read("a.txt", 0, 5), Err(ReadError::NotFound));
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn create_after_remove_restarts_fresh() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"original", 8);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        mount.remove("a.txt").unwrap();
+        // remove 後の create は新規の空エントリ（ソースの "original" は見えない）。
+        mount.create("a.txt").unwrap();
+        assert_eq!(mount.read("a.txt", 0, 8).unwrap(), b"");
+        mount.write("a.txt", 0, b"fresh").unwrap();
+        assert_eq!(mount.read("a.txt", 0, 8).unwrap(), b"fresh");
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 5).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn truncate_shrink_and_extend() {
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, b"0123456789", 10);
+        let zip = zb.finish();
+        let params = BuildParams::default();
+        let mount = Mount::open(&zip, &params).expect("open");
+
+        // 縮小: 4 バイトへ。末尾以降は EOF。
+        mount.truncate("a.txt", 4).unwrap();
+        assert_eq!(mount.read("a.txt", 0, 10).unwrap(), b"0123");
+
+        // 拡大: 7 バイトへ。伸びた gap はゼロ。
+        mount.truncate("a.txt", 7).unwrap();
+        assert_eq!(mount.read("a.txt", 0, 10).unwrap(), b"0123\x00\x00\x00");
+
+        // 存在しないものは ENOENT。
+        assert_eq!(mount.truncate("absent", 0), Err(EntryError::NotFound));
+
+        let new_zip = mount.commit().unwrap();
+        let m2 = Mount::open(&new_zip, &params).expect("reopen");
+        // commit 後は size 7（clean エントリは範囲超え read が OutOfRange）。
+        assert_eq!(m2.read("a.txt", 0, 7).unwrap(), b"0123\x00\x00\x00");
+    }
+
+    #[test]
+    fn truncate_shrink_then_reextend_reads_zero_not_stale() {
+        // 縮小後に再拡大したとき、落とした末尾が蘇らずゼロで読めること。
+        let store = vec![b'Z'; 20];
+        let mut zb = ZipBuilder::new();
+        zb.add("a.txt", 0, &store, 20);
+        let zip = zb.finish();
+        // ページ 8 バイト。
+        let cfg = PageConfig {
+            page_size: 8,
+            read_ahead_pages: 0,
+            cache_bytes: 16 << 20,
+        };
+        let params = BuildParams::default();
+        let mount = Mount::open_with_page_config(&zip, &params, cfg).expect("open");
+        // まず dirty にして全域ページを Tier 1 に載せる。
+        mount.write("a.txt", 0, &vec![b'Z'; 20]).unwrap();
+        mount.truncate("a.txt", 3).unwrap();
+        mount.truncate("a.txt", 20).unwrap();
+        let expect: Vec<u8> = b"ZZZ".iter().copied().chain(std::iter::repeat(0).take(17)).collect();
+        assert_eq!(mount.read("a.txt", 0, 20).unwrap(), expect);
     }
 
     #[test]

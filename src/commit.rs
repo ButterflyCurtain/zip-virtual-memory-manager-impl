@@ -22,12 +22,14 @@
 //!
 //! [`disk`]: crate::disk
 
-use crate::archive::{Archive, CdEntry, ZipError};
+use crate::archive::{Archive, ZipError};
 use crate::difflayer::DiffLayer;
+use crate::entrytable::{EntryTable, Kind};
 use crate::mount::{read_entry, ReadError};
 use crate::page::{page_count, page_extent};
 use crate::vmidx::ProviderType;
 use libz_rs_sys as z;
+use std::collections::HashSet;
 use std::fmt;
 use std::os::raw::c_int;
 use std::sync::OnceLock;
@@ -65,28 +67,58 @@ impl fmt::Display for CommitError {
 
 impl std::error::Error for CommitError {}
 
-/// Diff Layer を反映した新しい ZIP バイト列を組み立てる（FULL パス）。
+/// Diff Layer + エントリ表を反映した新しい ZIP バイト列を組み立てる（FULL パス）。
 ///
 /// `archive` はソース ZIP、`vmidx_image` はそれに対応する vmidx 像（変更エントリ
-/// の未変更ページをソースから読むのに使う）、`diff` は Tier 1 の dirty 状態。
+/// の未変更ページをソースから読むのに使う）、`diff` は Tier 1 の dirty 状態、
+/// `table` はセッション内の構造変更（create / remove）。実効的なエントリ集合は
+/// 「vmidx − tombstone ∪ created」で組み立てる:
+///
+/// - tombstone → 出力しない。
+/// - created（vmidx に同名があれば上書き、無ければ新規）→ Diff から組み立て、
+///   既定 DEFLATE で再圧縮して新しい LFH/CD を出す。
+/// - それ以外のソースエントリ → dirty なら再圧縮、未変更なら verbatim コピー。
 pub fn build_full(
     archive: &[u8],
     vmidx_image: &[u8],
     diff: &DiffLayer,
+    table: &EntryTable,
 ) -> Result<Vec<u8>, CommitError> {
     let ar = Archive::parse(archive).map_err(CommitError::Zip)?;
 
     let mut body: Vec<u8> = Vec::new();
     // (local_header_offset, method, crc, comp_size, uncomp_size, name) を CD 用に控える。
     let mut placed: Vec<(u64, u16, u32, u64, u64, Vec<u8>)> = Vec::with_capacity(ar.entries().len());
+    // vmidx ループで created として出した名前（created ループの重複出力を防ぐ）。
+    let mut emitted_created: HashSet<String> = HashSet::new();
 
     for entry in ar.entries() {
-        let dirty_name = std::str::from_utf8(&entry.name)
-            .ok()
-            .filter(|n| diff.is_dirty(n));
+        let name_utf8 = std::str::from_utf8(&entry.name).ok();
 
+        // UTF-8 名のみオーバーレイ対象（非 UTF-8 名は table に入りえない）。
+        if let Some(name) = name_utf8 {
+            match table.kind(name, true) {
+                Kind::Absent => continue, // tombstone → 出力しない
+                Kind::Created => {
+                    // 同名を再 create（リスタート）→ created として組み立てる。
+                    let (method, crc, stored, uncomp) =
+                        build_created(archive, vmidx_image, diff, name)?;
+                    place_entry(&mut body, &mut placed, method, crc, &stored, uncomp, &entry.name)?;
+                    emitted_created.insert(name.to_owned());
+                    continue;
+                }
+                Kind::Source => {}
+            }
+        }
+
+        // 通常のソースエントリ（Kind::Source または非 UTF-8 名）。
+        let dirty_name = name_utf8.filter(|n| diff.is_dirty(n));
         let (method, crc, stored, uncomp_size) = if let Some(name) = dirty_name {
-            let content = assemble_content(archive, vmidx_image, diff, entry, name)?;
+            let logical = diff.logical_size(name).unwrap_or(entry.uncompressed_size);
+            // ソース読み出しの上限は source high-water（truncate-shrink で縮む）。
+            let original = diff.source_size(name).unwrap_or(entry.uncompressed_size);
+            let content =
+                assemble_content(archive, vmidx_image, diff, name, logical, original, Some(name))?;
             let crc = crc32(&content);
             let (method, stored) = match entry.provider_type {
                 ProviderType::Store => (0u16, content.clone()),
@@ -101,15 +133,16 @@ pub fn build_full(
             (entry.method_code, entry.crc32, stored, entry.uncompressed_size)
         };
 
-        let comp_size = stored.len() as u64;
-        let lho = body.len() as u64;
-        if lho > u32::MAX as u64 || comp_size > u32::MAX as u64 || uncomp_size > u32::MAX as u64 {
-            return Err(CommitError::TooLarge);
-        }
+        place_entry(&mut body, &mut placed, method, crc, &stored, uncomp_size, &entry.name)?;
+    }
 
-        write_lfh(&mut body, method, crc, comp_size, uncomp_size, &entry.name);
-        body.extend_from_slice(&stored);
-        placed.push((lho, method, crc, comp_size, uncomp_size, entry.name.clone()));
+    // vmidx に無い created エントリ。
+    for name in table.created_names() {
+        if emitted_created.contains(name) {
+            continue;
+        }
+        let (method, crc, stored, uncomp) = build_created(archive, vmidx_image, diff, name)?;
+        place_entry(&mut body, &mut placed, method, crc, &stored, uncomp, name.as_bytes())?;
     }
 
     // Central Directory。
@@ -139,20 +172,21 @@ pub fn build_full(
     Ok(body)
 }
 
-/// 変更エントリ `name` の論理内容（長さ `logical_size`）を組み立てる。各ページは
-/// Diff Layer 優先、無ければソースの未変更ページ、ソース範囲も超えていれば
-/// ゼロ（implicit extension の gap）。
+/// エントリの論理内容（長さ `logical`）を組み立てる。各ページは Diff Layer 優先、
+/// 無ければソース（`source` = vmidx 名、`None` = created）の未変更ページ、ソース
+/// 範囲を超える分とソース無しはゼロ（implicit extension の gap / created の未書き
+/// 込み）。`name` は Diff Layer のキー（現在名）。
+#[allow(clippy::too_many_arguments)]
 fn assemble_content(
     archive: &[u8],
     vmidx_image: &[u8],
     diff: &DiffLayer,
-    entry: &CdEntry,
     name: &str,
+    logical: u64,
+    original_size: u64,
+    source: Option<&str>,
 ) -> Result<Vec<u8>, CommitError> {
     let ps = diff.page_size();
-    let logical = diff.logical_size(name).unwrap_or(entry.uncompressed_size);
-    let original_size = entry.uncompressed_size;
-
     let mut content = Vec::with_capacity(logical as usize);
     for page in 0..page_count(logical, ps) {
         let (start, len) = page_extent(logical, page, ps);
@@ -161,12 +195,12 @@ fn assemble_content(
         }
         if let Some(p) = diff.page(name, page) {
             content.extend_from_slice(&p[..len]);
-        } else if start < original_size {
+        } else if let Some(src) = source.filter(|_| start < original_size) {
             // 未変更ページ: ソースから読む。論理ページがソース末尾を跨ぐ場合は
             // 残りをゼロで埋める（短い末尾ページ + gap）。
             let avail = ((original_size - start) as usize).min(len);
-            let chunk = read_entry(archive, vmidx_image, name, start, avail)
-                .map_err(CommitError::Read)?;
+            let chunk =
+                read_entry(archive, vmidx_image, src, start, avail).map_err(CommitError::Read)?;
             content.extend_from_slice(&chunk);
             if avail < len {
                 content.resize(content.len() + (len - avail), 0);
@@ -176,6 +210,44 @@ fn assemble_content(
         }
     }
     Ok(content)
+}
+
+/// created エントリ `name` を Diff から組み立て、既定 DEFLATE で圧縮する。
+/// ソースは無い（未書き込みページはゼロ）。戻り値 (method, crc, stored, uncomp)。
+fn build_created(
+    archive: &[u8],
+    vmidx_image: &[u8],
+    diff: &DiffLayer,
+    name: &str,
+) -> Result<(u16, u32, Vec<u8>, u64), CommitError> {
+    let logical = diff.logical_size(name).unwrap_or(0);
+    let content = assemble_content(archive, vmidx_image, diff, name, logical, 0, None)?;
+    let crc = crc32(&content);
+    let stored = deflate(&content)?;
+    Ok((8, crc, stored, content.len() as u64))
+}
+
+/// 1 エントリを body へ書き（LFH + データ）、CD 用情報を `placed` に積む。
+/// 32 ビット ZIP の表現範囲を超えたら [`CommitError::TooLarge`]。
+#[allow(clippy::too_many_arguments)]
+fn place_entry(
+    body: &mut Vec<u8>,
+    placed: &mut Vec<(u64, u16, u32, u64, u64, Vec<u8>)>,
+    method: u16,
+    crc: u32,
+    stored: &[u8],
+    uncomp_size: u64,
+    name: &[u8],
+) -> Result<(), CommitError> {
+    let comp_size = stored.len() as u64;
+    let lho = body.len() as u64;
+    if lho > u32::MAX as u64 || comp_size > u32::MAX as u64 || uncomp_size > u32::MAX as u64 {
+        return Err(CommitError::TooLarge);
+    }
+    write_lfh(body, method, crc, comp_size, uncomp_size, name);
+    body.extend_from_slice(stored);
+    placed.push((lho, method, crc, comp_size, uncomp_size, name.to_vec()));
+    Ok(())
 }
 
 /// 正規形のローカルファイルヘッダ（extra field なし）を書く。

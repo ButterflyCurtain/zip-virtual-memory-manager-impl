@@ -20,13 +20,18 @@
 use crate::archive::Archive;
 use crate::commit::{build_full, CommitError};
 use crate::difflayer::{DiffLayer, UNLIMITED};
+use crate::entrytable::EntryTable;
 use crate::index_build::BuildParams;
-use crate::mount::{read_cached, read_dirty, resolve_index, write_into, OpenError, ReadError, WriteError};
+use crate::mount::{
+    entry_create, entry_remove, entry_truncate, read_cached, read_dirty, resolve_entry,
+    resolve_index, write_into, EntryError, OpenError, ReadError, WriteError,
+};
 use crate::page::{PageCache, PageConfig};
 use crate::tier2::Tier2;
 use crate::vmidx::hash_cd_block;
 use crate::vmdirty::{
-    new_generation_id, now_ns, read_vmdirty, DirtyPage, Header, RecoveryResult, SyncPolicy,
+    new_generation_id, now_ns, read_vmdirty, DirtyPage, EntryOp, Header, MetaOp, RecoveryResult,
+    SyncPolicy,
 };
 use memmap2::Mmap;
 use std::cell::{Cell, RefCell};
@@ -204,6 +209,9 @@ pub struct FileMount {
     cache: RefCell<PageCache>,
     /// 未コミットの dirty ページ（Tier 1）。commit で `archive.zip` に反映する。
     diff: RefCell<DiffLayer>,
+    /// セッション内の構造変更（create / remove）を vmidx に被せる表。回復時は
+    /// vmdirty の METADATA replay で再構成する。
+    entries: RefCell<EntryTable>,
     /// Tier 2 spill ストア（vmdirty ジャーナル）。spill 有効時、または回復で dirty
     /// を読み込んだ時のみ `Some`。`None` は Tier 1 のみ（M2 互換）。
     tier2: RefCell<Option<Tier2>>,
@@ -291,6 +299,7 @@ impl FileMount {
 
         let page_size = options.page.page_size;
         let mut diff = DiffLayer::with_dirty_limit(page_size, options.dirty_limit);
+        let mut table = EntryTable::new();
 
         // 現在の cd_hash（fingerprint 照合 / 新 vmdirty ヘッダ用）。
         let cd_hash = {
@@ -319,18 +328,18 @@ impl FileMount {
                 }
                 RecoveryDecision::RecoverCommitted | RecoveryDecision::RecoverAll => {
                     let all = decision == RecoveryDecision::RecoverAll;
-                    // エントリ操作（METADATA）の replay は本増分では未対応。
-                    let ops_present = !result.committed_ops.is_empty()
-                        || (all && !result.uncommitted_ops.is_empty());
-                    if ops_present {
-                        return Err(FileMountError::RecoveryRequired(Box::new(result)));
-                    }
-                    load_recovered_pages(&mut diff, &image, &result, all);
-                    // 旧 vmdirty を bak へ退避し、新 gen で開始、回復分を flush で durable に。
+                    // ページとエントリ操作を sequence 順に replay し、Diff Layer と
+                    // エントリ表を復元する（設計 ENTRY OPERATIONS の "replays records
+                    // strictly in sequence order"）。
+                    replay_recovered(&mut diff, &mut table, &image, &result, all);
+                    // 旧 vmdirty を bak へ退避し、新 gen で開始。回復した構造変更と
+                    // 論理サイズを再 journal してから flush で durable に
+                    // （新 vmdirty が自己完結し、二次クラッシュでも同じ状態へ戻る）。
                     let bak = vmdirty_bak_path(&sidecar, &result.generation_id);
                     fs::rename(&vmdirty_path, &bak)?;
                     let header = new_vmdirty_header(&fingerprint, &cd_hash, page_size as u32);
                     let mut t2 = Tier2::create(&vmdirty_path, &header, options.sync, page_size)?;
+                    rejournal_recovered(&mut t2, &diff, &table)?;
                     t2.flush(&mut diff)?;
                     tier2 = Some(t2);
                 }
@@ -350,6 +359,7 @@ impl FileMount {
             cfg: options.page,
             cache: RefCell::new(PageCache::from_config(&options.page)),
             diff: RefCell::new(diff),
+            entries: RefCell::new(table),
             tier2: RefCell::new(tier2),
             vmdirty_path,
             archive_path: archive_path.to_path_buf(),
@@ -381,8 +391,10 @@ impl FileMount {
         if self.stale.get() {
             return Err(ReadError::Stale);
         }
-        // dirty なエントリは Diff Layer から（設計 READ PATH の Tier 1 → Tier 2）。
-        if self.diff.borrow().is_dirty(path) {
+        let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
+        // dirty（overlaid / 書き込み済み）または created は Diff Layer から
+        // （設計 READ PATH の Tier 1 → Tier 2）。
+        if self.diff.borrow().is_dirty(path) || resolved.source.is_none() {
             let t2 = self.tier2.borrow();
             return read_dirty(
                 &self.archive,
@@ -390,6 +402,8 @@ impl FileMount {
                 &self.diff.borrow(),
                 t2.as_ref(),
                 path,
+                resolved.source.as_deref(),
+                resolved.original_size,
                 offset,
                 len,
             );
@@ -411,6 +425,7 @@ impl FileMount {
     /// `archive.zip` は触らず Diff Layer Tier 1 に COW で取り込む。反映は
     /// [`commit`](FileMount::commit) まで遅延する。STALE 後は書けない。
     pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), WriteError> {
+        let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
         let mut t2 = self.tier2.borrow_mut();
         write_into(
             &self.archive,
@@ -418,14 +433,55 @@ impl FileMount {
             &mut self.diff.borrow_mut(),
             t2.as_mut(),
             path,
+            resolved.source.as_deref(),
+            resolved.original_size,
             offset,
             data,
         )
     }
 
-    /// dirty な変更があるか。
+    /// 空のエントリを作る（設計 create()）。既存（未削除）なら [`EntryError::Exists`]。
+    /// spill 有効時は METADATA CREATE を vmdirty に journal する。
+    pub fn create(&self, path: &str) -> Result<(), EntryError> {
+        let mut t2 = self.tier2.borrow_mut();
+        entry_create(
+            &mut self.entries.borrow_mut(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            t2.as_mut(),
+            path,
+        )
+    }
+
+    /// エントリを削除する（設計 remove()）。存在しなければ [`EntryError::NotFound`]。
+    pub fn remove(&self, path: &str) -> Result<(), EntryError> {
+        let mut t2 = self.tier2.borrow_mut();
+        entry_remove(
+            &mut self.entries.borrow_mut(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            t2.as_mut(),
+            path,
+        )
+    }
+
+    /// エントリの論理サイズを変える（設計 truncate()）。存在しなければ
+    /// [`EntryError::NotFound`]。
+    pub fn truncate(&self, path: &str, new_size: u64) -> Result<(), EntryError> {
+        let mut t2 = self.tier2.borrow_mut();
+        entry_truncate(
+            &self.entries.borrow(),
+            &mut self.diff.borrow_mut(),
+            &self.vmidx_image,
+            t2.as_mut(),
+            path,
+            new_size,
+        )
+    }
+
+    /// dirty な変更、または構造変更（create / remove）があるか。
     pub fn is_dirty(&self) -> bool {
-        !self.diff.borrow().is_empty()
+        !self.diff.borrow().is_empty() || !self.entries.borrow().is_empty()
     }
 
     /// Tier 1 の全 dirty ページを vmdirty へ durable 化し COMMIT MARKER を書く
@@ -447,7 +503,7 @@ impl FileMount {
     /// vmidx は更新せず残すが、次回 open 時に fingerprint 不一致で再構築される
     /// （vmidx はキャッシュ）。
     pub fn commit(self) -> Result<(), FileMountError> {
-        if self.diff.borrow().is_empty() {
+        if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
             return Ok(());
         }
 
@@ -460,7 +516,12 @@ impl FileMount {
             t2.rehydrate_into(&mut self.diff.borrow_mut())?;
         }
 
-        let new_zip = build_full(&self.archive, &self.vmidx_image, &self.diff.borrow())?;
+        let new_zip = build_full(
+            &self.archive,
+            &self.vmidx_image,
+            &self.diff.borrow(),
+            &self.entries.borrow(),
+        )?;
 
         // archive.new.zip に書いてから rename で差し替える。Windows では mmap 保持中の
         // ファイルを切り詰め上書きできないが、別名 write → rename は通る（新 inode、
@@ -577,30 +638,114 @@ fn vmdirty_source_changed(bytes: &[u8], fp: &StatFingerprint, cd_hash: &[u8; 16]
     }
 }
 
-/// 回復で選んだページ（committed、`all` なら uncommitted も）を sequence 順に
-/// replay して Diff Layer Tier 1 に復元する。`logical_size` は設計 Section 2 の
-/// max ルール（`base = vmidx の uncompressed_size`、各ページで
-/// `max(logical, page_index×page_size + data_len)`）で再構成する。
-fn load_recovered_pages(diff: &mut DiffLayer, vmidx_image: &[u8], result: &RecoveryResult, all: bool) {
-    let mut pages: Vec<&DirtyPage> = result.committed_pages.iter().collect();
-    if all {
-        pages.extend(result.uncommitted_pages.iter());
+/// 回復で選んだページとエントリ操作（committed、`all` なら uncommitted も）を
+/// **sequence 順に**統合 replay して Diff Layer Tier 1 とエントリ表を復元する
+/// （設計 ENTRY OPERATIONS: "replays records strictly in sequence order"）。
+/// ページの `logical_size` は設計 Section 2 の max ルール（`base = vmidx の
+/// uncompressed_size`、`max(logical, page_index×page_size + data_len)`）、
+/// METADATA は create/remove/resize をそのまま適用する。
+fn replay_recovered(
+    diff: &mut DiffLayer,
+    table: &mut EntryTable,
+    vmidx_image: &[u8],
+    result: &RecoveryResult,
+    all: bool,
+) {
+    enum Item<'a> {
+        Page(&'a DirtyPage),
+        Op(&'a EntryOp),
     }
-    pages.sort_by_key(|p| p.sequence);
+    let mut items: Vec<(u64, Item)> = Vec::new();
+    for p in &result.committed_pages {
+        items.push((p.sequence, Item::Page(p)));
+    }
+    for o in &result.committed_ops {
+        items.push((o.sequence, Item::Op(o)));
+    }
+    if all {
+        for p in &result.uncommitted_pages {
+            items.push((p.sequence, Item::Page(p)));
+        }
+        for o in &result.uncommitted_ops {
+            items.push((o.sequence, Item::Op(o)));
+        }
+    }
+    items.sort_by_key(|(seq, _)| *seq);
 
     let ps = diff.page_size();
-    for p in pages {
-        let base = original_size(vmidx_image, &p.entry_name).unwrap_or(0);
-        diff.ensure_entry(&p.entry_name, base);
-        let candidate = p.page_index.saturating_mul(ps) + p.data.len() as u64;
-        let cur = diff.logical_size(&p.entry_name).unwrap_or(base);
-        diff.set_logical_size(&p.entry_name, cur.max(candidate));
-        // ページは page_size まで右ゼロ埋めして載せる（短いテールページも均一に）。
-        let mut buf = vec![0u8; ps as usize];
-        let n = p.data.len().min(ps as usize);
-        buf[..n].copy_from_slice(&p.data[..n]);
-        diff.insert_page(&p.entry_name, p.page_index, buf);
+    for (_, item) in items {
+        match item {
+            Item::Page(p) => {
+                let base = original_size(vmidx_image, &p.entry_name).unwrap_or(0);
+                diff.ensure_entry(&p.entry_name, base);
+                let candidate = p.page_index.saturating_mul(ps) + p.data.len() as u64;
+                let cur = diff.logical_size(&p.entry_name).unwrap_or(base);
+                diff.set_logical_size(&p.entry_name, cur.max(candidate));
+                // ページは page_size まで右ゼロ埋めして載せる（短いテールも均一に）。
+                let mut buf = vec![0u8; ps as usize];
+                let n = p.data.len().min(ps as usize);
+                buf[..n].copy_from_slice(&p.data[..n]);
+                diff.insert_page(&p.entry_name, p.page_index, buf);
+            }
+            Item::Op(o) => match &o.op {
+                MetaOp::Create => {
+                    // 新規の空エントリで始める（create-after-remove のリスタート含む）。
+                    diff.remove_entry(&o.entry_name);
+                    table.mark_created(&o.entry_name);
+                    diff.ensure_entry(&o.entry_name, 0);
+                    diff.set_logical_size(&o.entry_name, 0);
+                }
+                MetaOp::Remove => {
+                    table.mark_tombstone(&o.entry_name);
+                    diff.remove_entry(&o.entry_name);
+                }
+                MetaOp::Resize { new_size } => {
+                    let base = original_size(vmidx_image, &o.entry_name).unwrap_or(0);
+                    diff.ensure_entry(&o.entry_name, base);
+                    let cur = diff.logical_size(&o.entry_name).unwrap_or(base);
+                    if *new_size < cur {
+                        diff.truncate_pages(&o.entry_name, *new_size);
+                    }
+                    diff.set_logical_size(&o.entry_name, *new_size);
+                }
+                // RENAME（④b）は ④a の vmdirty には現れない。
+                MetaOp::Rename { .. } => {}
+            },
+        }
     }
+}
+
+/// 回復した状態を新しい vmdirty 世代へ再 journal する（flush でページを書く前）。
+/// 構造変更（create / remove）と各 dirty エントリのサイズ（RESIZE）を先に書いて
+/// おくことで、新 vmdirty 単体から同じ状態を復元できる（拡大は DATA RECORD が
+/// 伸びを表さないので RESIZE が要る）。
+///
+/// source high-water（truncate-shrink で縮んだソース読み出し上限）が現在の論理
+/// サイズより小さいときは、先に RESIZE(source_size)（縮小）を書いてから
+/// RESIZE(logical)（拡大）を書く。これで二次クラッシュ後の replay でも「縮小して
+/// 捨てた領域は extend してもゼロ」という不変条件が保たれる。
+fn rejournal_recovered(t2: &mut Tier2, diff: &DiffLayer, table: &EntryTable) -> io::Result<()> {
+    for name in table.created_names() {
+        t2.journal_op(name, &MetaOp::Create)?;
+    }
+    for name in table.tombstones() {
+        t2.journal_op(name, &MetaOp::Remove)?;
+    }
+    let sizes: Vec<(String, u64, u64)> = diff
+        .dirty_paths()
+        .map(|n| {
+            let logical = diff.logical_size(n).unwrap_or(0);
+            let source = diff.source_size(n).unwrap_or(logical);
+            (n.to_owned(), source, logical)
+        })
+        .collect();
+    for (name, source, logical) in sizes {
+        if source < logical {
+            t2.journal_op(&name, &MetaOp::Resize { new_size: source })?;
+        }
+        t2.journal_op(&name, &MetaOp::Resize { new_size: logical })?;
+    }
+    Ok(())
 }
 
 /// vmidx からエントリの元 `uncompressed_size` を引く（回復の logical_size の base）。
@@ -1117,6 +1262,123 @@ mod tests {
             matches!(res, Err(FileMountError::RecoveryRequired(_))),
             "expected RecoveryRequired on conflict"
         );
+    }
+
+    // ───────────────────────── ④ エントリ操作（disk + spill + 回復）─────────────
+
+    #[test]
+    fn entry_ops_persist_through_commit() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("eo.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[("keep.txt", b"keep"), ("drop.txt", b"drop"), ("big.txt", b"0123456789")]),
+        )
+        .unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        m.create("new.txt").unwrap();
+        m.write("new.txt", 0, b"made").unwrap();
+        m.remove("drop.txt").unwrap();
+        m.truncate("big.txt", 4).unwrap();
+        assert!(m.is_dirty());
+        m.commit().expect("commit");
+
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m2.read("keep.txt", 0, 4).unwrap(), b"keep");
+        assert_eq!(m2.read("new.txt", 0, 4).unwrap(), b"made");
+        assert_eq!(m2.read("drop.txt", 0, 1), Err(ReadError::NotFound));
+        // commit 後の big.txt はサイズ 4（clean エントリは範囲超え read が OutOfRange）。
+        assert_eq!(m2.read("big.txt", 0, 4).unwrap(), b"0123");
+    }
+
+    #[test]
+    fn entry_ops_only_commit_rewrites_archive() {
+        // ページ書き込みは無く構造変更（remove）だけでも commit が走ること。
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("eo2.zip");
+        fs::write(&zip_path, store_zip(&[("a.txt", b"a"), ("b.txt", b"b")])).unwrap();
+        let m = FileMount::open(&zip_path).expect("open");
+        m.remove("b.txt").unwrap();
+        assert!(m.is_dirty());
+        m.commit().expect("commit");
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m2.read("a.txt", 0, 1).unwrap(), b"a");
+        assert_eq!(m2.read("b.txt", 0, 1), Err(ReadError::NotFound));
+    }
+
+    #[test]
+    fn recover_created_entry_after_flush_then_crash() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("rc.zip");
+        fs::write(&zip_path, store_zip(&[("data.bin", b"abcdefgh")])).unwrap();
+
+        // セッション 1: create + write + flush（durable）→ commit せず crash。
+        {
+            let m = open_spill(&zip_path, 0); // 即 spill
+            m.create("made.bin").unwrap();
+            m.write("made.bin", 0, &[0x55u8; 8]).unwrap();
+            m.flush().expect("flush");
+        }
+        assert!(vmdirty_path(dir.path(), "rc.zip").exists());
+
+        // セッション 2: commit 境界あり → auto recover_committed。created が復活。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(m2.read("made.bin", 0, 8).unwrap(), vec![0x55u8; 8]);
+        assert_eq!(m2.read("data.bin", 0, 8).unwrap(), b"abcdefgh");
+        assert_eq!(count_baks(dir.path(), "rc.zip"), 1);
+
+        // 回復後 commit すると新 archive に反映され、開き直しても残る。
+        m2.commit().expect("commit recovered");
+        let m3 = FileMount::open(&zip_path).expect("reopen clean");
+        assert_eq!(m3.read("made.bin", 0, 8).unwrap(), vec![0x55u8; 8]);
+        assert_eq!(m3.read("data.bin", 0, 8).unwrap(), b"abcdefgh");
+    }
+
+    #[test]
+    fn recover_removed_entry_after_flush_then_crash() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("rr.zip");
+        fs::write(&zip_path, store_zip(&[("keep.bin", b"keep"), ("gone.bin", b"gone")])).unwrap();
+
+        {
+            let m = open_spill(&zip_path, 0);
+            m.remove("gone.bin").unwrap();
+            m.flush().expect("flush");
+        }
+
+        // 回復で tombstone が復活 → gone.bin は ENOENT。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(m2.read("gone.bin", 0, 1), Err(ReadError::NotFound));
+        assert_eq!(m2.read("keep.bin", 0, 4).unwrap(), b"keep");
+        m2.commit().expect("commit recovered");
+        let m3 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m3.read("gone.bin", 0, 1), Err(ReadError::NotFound));
+        assert_eq!(m3.read("keep.bin", 0, 4).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn recover_truncate_extend_restores_logical_size() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("rt.zip");
+        let original: Vec<u8> = (0..8u8).collect();
+        fs::write(&zip_path, store_zip(&[("data.bin", &original)])).unwrap();
+
+        // truncate-extend は DATA RECORD が伸びを表さない（RESIZE METADATA のみ）。
+        {
+            let m = open_spill(&zip_path, 2 * 8);
+            m.truncate("data.bin", 20).unwrap();
+            m.flush().expect("flush");
+        }
+
+        // 回復で論理サイズ 20 が戻り、伸びた gap はゼロ、元データは保たれる。
+        let m2 = open_spill(&zip_path, 2 * 8);
+        let mut expect = original.clone();
+        expect.resize(20, 0);
+        assert_eq!(m2.read("data.bin", 0, 20).unwrap(), expect);
+        m2.commit().expect("commit recovered");
+        let m3 = FileMount::open(&zip_path).expect("reopen");
+        assert_eq!(m3.read("data.bin", 0, 20).unwrap(), expect);
     }
 
     #[test]

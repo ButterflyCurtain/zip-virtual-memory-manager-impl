@@ -23,7 +23,7 @@
 //! までゼロ埋めして均一なページを返す。
 
 use crate::difflayer::DiffLayer;
-use crate::vmdirty::{self, DataLoc, Header, SyncPolicy, VmdirtyWriter};
+use crate::vmdirty::{self, DataLoc, Header, MetaOp, SyncPolicy, VmdirtyWriter};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -168,6 +168,30 @@ impl Tier2 {
             }
         }
         Ok(())
+    }
+
+    /// エントリ操作（create / remove / truncate）を METADATA RECORD として 1 件
+    /// 追記し、割り当てた `sequence_num` を返す（設計 ENTRY OPERATIONS。DATA と
+    /// 同じ連番空間）。索引には影響しない（構造変更は呼び出し側のエントリ表
+    /// /Diff Layer に反映済み）。
+    pub fn journal_op(&mut self, entry: &str, op: &MetaOp) -> io::Result<u64> {
+        self.writer.append_metadata(entry, op)
+    }
+
+    /// エントリ `entry` の Tier 2 索引を丸ごと外す（remove 用）。ディスク上の
+    /// 旧 DATA RECORD は dead として残る（compaction は ⑤）。以降 [`has`](Self::has)
+    /// は false を返し、create-after-remove で古いページを誤って読まない。
+    pub fn purge_entry(&mut self, entry: &str) {
+        self.index.remove(entry);
+    }
+
+    /// `entry` の `new_size` 以降に完全に収まるページを Tier 2 索引から外す
+    /// （truncate-shrink 用）。再 extend 時に古い末尾ページが蘇らないようにする。
+    pub fn purge_pages_beyond(&mut self, entry: &str, new_size: u64) {
+        let ps = self.page_size;
+        if let Some(pages) = self.index.get_mut(entry) {
+            pages.retain(|&page, _| page * ps < new_size);
+        }
     }
 
     /// ディスク上に在る dirty ページの異なり数（COMMIT MARKER の `page_count`、
