@@ -640,3 +640,118 @@ API へ改名し、差分を解消した。`commit()` を主入口にできる�
 - 刻み4: content-addressed dedup（XXH3、特許外）/ vmidx 追記拡張。
 - 設計の INCREMENTAL 手順が挙げる **Dead Space Freelist / in-place 穴再利用は不実装**（ADR 0011）。
   dead は「次の FULL で捨てるだけの未追跡バイト」で、再利用する free block ではない。`SPEC_DIVERGENCE.md` 参照。
+
+---
+
+## 0014. VMM-native in-place commit の ZIP CRC-32 取扱い: per-block CRC キャッシュ + CD/LFH の crc32 point-write
+
+- 日付: 2026-06-21
+- ステータス: 採用（設計方針。実装は M5+ VMM-native DEFLATE 着手時）
+- 文脈: 設計レビューで、VMM-native in-place commit と STORE 同サイズ in-place 書き戻しの両方で
+  ZIP 標準の CRC-32（CD entry / LFH の crc32 フィールド、ISO-HDLC）の取扱いが**仕様にも実装にも
+  記述されていない**ことが判明した。block 内のページを編集すれば uncompressed バイトが変わるので
+  entry CRC は必然的に変わるが、設計テキストは "No CD update" と書いており、サードパーティの
+  unzip/7-Zip が CRC エラーを返す → 互換表の "fully compatible" 主張と矛盾する。設計リポ側は
+  本セッションで CRC-32 maintenance サブセクションを追加し "No CD structural update" へ書き換え
+  済み（コミット `406f558`）。本 ADR はその採用方針を実装側に記録する。
+
+### 決定
+
+VMM-native in-place commit と STORE 同サイズ in-place 書き戻しで entry CRC-32 を維持する方法として、
+以下を採る:
+
+1. **vmidx の DEFLATE_VMM checkpoint に `block_crc32: u32`（ISO-HDLC）を追加**。
+   checkpoint サイズ 24 → 28 バイト。設計仕様で更新済み（コミット `406f558`）。
+2. **clean ブロックの CRC は vmidx キャッシュから再利用**、dirty ブロックのみ再計算。
+3. **entry CRC は `crc32_combine` で per-block CRC を合成**（zlib の `crc32_combine()` 相当の
+   閉形 GF(2) 演算）。clean ブロックの uncompressed バイトを読み戻す必要が無い。
+4. **CD entry の crc32 フィールド（CD entry offset 16, 4 bytes）と LFH の crc32 フィールド
+   （LFH offset 14, 4 bytes）のみを point-write**。CD 構造・順序・サイズ・オフセット・EOCD は
+   一切変更しない。これが "No CD structural update" の意味。
+5. **STORE 同サイズ in-place 書き戻し**も同じ point-write 経路。per-page CRC キャッシュは任意
+   （I/O-bound なので entry 全体を再 CRC でも実用範囲）。
+6. **クラッシュ安全性**は既存の block 完了 journaling barrier（VMM-native in-place commit
+   step 1b）と vmdirty 再生で吸収。block 上書きと CRC point-write を冪等に再実行する。
+
+### 理由
+
+選択肢を以下の 3 つで評価した:
+
+- **(a) per-block CRC キャッシュ + CD/LFH point-write**（採用）
+- **(b) Data descriptor 強制（GPBF bit 3）**: LFH の crc32 を 0 にしてデータ末尾に data descriptor を
+  置く。**CD 側の crc32 は依然として更新必要**（一部 extractor は CD のみ検査）。データ末尾の
+  data descriptor 位置も in-place commit ごとに変動するため、padding と data descriptor の
+  相互作用がさらに複雑化する。利得が無い。
+- **(c) CRC を更新せず stale を許容**: 互換表 "fully compatible" と本文 "readable by any
+  third-party tool without modification" と矛盾する。本プロジェクトの第一目標と相反する。
+
+(a) を採る根拠:
+
+1. **設計原理の対称性**: 本アーキの中核は Z_FULL_FLUSH による**ブロック単位の独立性**と vmidx の
+   per-block メタデータ。CRC-32 はちょうど同じ「ブロック単位で独立にキャッシュできる量」で、
+   既存の checkpoint が `(compressed_offset, uncompressed_offset, capacity)` を抱えているのに
+   CRC だけ抱えていないのが**非対称**だった。block_crc32 追加は同じ原理を一段揃える。
+2. **計算コストが in-place 経路の利得を壊さない**: dirty ブロックの CRC は再圧縮で uncompressed
+   バイト列が手元にある時点でついでに計算される（実質追加コストゼロ）。clean ブロックはキャッシュ
+   読みのみで I/O ゼロ。`crc32_combine` は閉形演算で O(log L) または O(1)（テーブル展開すれば）。
+3. **CD への副作用は最小**: 4 バイトの point-write 2 箇所のみ。append/relocation/EOCD rewrite は
+   発生しない。設計の "in-place の旨味" は維持される。
+4. **クラッシュ安全が既存メカニズムで成立**: vmdirty の block 完了 journaling barrier (step 1b)
+   と generation_id ベースの sequence 再生で、block 上書き + CRC point-write の冪等再実行が
+   可能。新しい WAL 機構は不要。
+5. **vmidx 増分が小さい**: 100 GB DEFLATE / 1 MB 間隔で 2.7 MB（24 bytes 時の 2.2 MB から 0.5 MB
+   増）。実用上の影響は無い。
+
+### 実装メモ（M5+ VMM-native 着手時）
+
+- **CRC-32 ISO-HDLC のクレート**: vmidx と vmdirty は `crc32c` クレートで CRC-32C（Castagnoli、
+  ADR 0002）を使う。ZIP の CRC-32 は別ポリノミアル（ISO-HDLC）なので**別クレートが必要**。
+  IMPLEMENTATION_NOTES が「zlib の `crc32()` は ISO-HDLC、CRC-32C と混同しない」と既に釘を
+  刺している。候補:
+  - `crc32fast` クレート（純 Rust、SSE4.2 アクセラレーション、`hash_one` あり）
+  - `flate2` 内部の `crc32` 関数（既に依存に入っているが、`flate2` の公開 API は限定的）
+  - `libz-rs-sys` の `crc32`（既に依存に入っており ADR 0004、`crc32_combine` も提供）
+
+  ADR 0004 で既に `libz-rs-sys` を採用しているため、**第一候補は `libz-rs-sys::crc32` と
+  `crc32_combine`** とする。新規依存追加を回避でき、`crc32_combine` が標準で揃う点で有利。
+  実装時に `libz-rs-sys` のシンボルエクスポートを確認し、出ていなければ `crc32fast` +
+  自前の `crc32_combine` 実装（zlib のアルゴリズムの移植、~50 行）に切り替える。
+
+- **vmidx checkpoint レイアウト変更**: `DEFLATE_VMM` の checkpoint encode/decode を
+  24 → 28 バイトに拡張。`vmidx` の format バージョンを上げる必要があるかは要検討
+  （現状 VMM-native は未実装なので互換性問題は起きない）。
+
+- **in-place commit 手順での追加ステップ**:
+  1. block recompress 時に block_crc32 を計算（`libz-rs-sys::crc32` を block の uncompressed
+     バイト列に適用）。
+  2. clean ブロックの block_crc32 を vmidx から読む。
+  3. `crc32_combine(crc1, crc2, len2)` を block 順に畳んで entry_crc を得る。
+  4. CD entry の絶対オフセット計算（`cd_offset + entry_cd_offset_within_cd + 16`）と LFH の
+     絶対オフセット（`lfh_offset + 14`）に entry_crc を 4 バイト LE で point-write。
+  5. fdatasync。
+
+- **STORE 同サイズ in-place 書き戻し**: per-page CRC キャッシュは v1 で不要、entry 全体を
+  再 CRC で十分（uncompressed バイトは既に手元）。`crc32_combine` 不要。
+
+- **テスト**: IMPLEMENTATION_NOTES が指す「全クラッシュ境界で stock extractor が clean に
+  open できる」プロパティテストを VMM-native の in-place 経路にも掛ける。`unzip -t` /
+  Python `zipfile.testzip()` / 7-Zip CLI のいずれかで CRC 検証を回す。
+
+### 設計差分
+
+無し。設計仕様側を**先に**更新した（コミット `406f558`）ので、本 ADR は仕様準拠の実装方針を
+記録するもの。SPEC_DIVERGENCE.md には追加しない。
+
+### 関連
+
+- 設計仕様の更新コミット: `zip-virtual-memory-manager` リポの `406f558`
+  「仕様レビューによる整合性修正と in-place commit の CRC-32 取扱い明文化」。
+- ADR 0002（CRC-32C / `crc32c` クレート）、ADR 0004（`libz-rs-sys`）。
+- IMPLEMENTATION_NOTES.md「CRC-32C is Castagnoli, not zlib's crc32()」の注意。
+
+### 未了
+
+- 実装は M5+ VMM-native DEFLATE 着手時。M4 刻み4（dedup / vmidx 追記拡張）→ M5 の順で進む。
+- `libz-rs-sys` の `crc32`/`crc32_combine` の Rust シンボル確認は実装着手時に行う。
+- vmidx format version bump の要否判断（現状 VMM-native 未実装なので、初出時に新レイアウトで
+  出せば bump 不要の可能性が高い）。
