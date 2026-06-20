@@ -755,3 +755,37 @@ VMM-native in-place commit と STORE 同サイズ in-place 書き戻しで entry
 - `libz-rs-sys` の `crc32`/`crc32_combine` の Rust シンボル確認は実装着手時に行う。
 - vmidx format version bump の要否判断（現状 VMM-native 未実装なので、初出時に新レイアウトで
   出せば bump 不要の可能性が高い）。
+
+### 追記 (2026-06-21、設計レビュー第2陣を反映)
+
+設計仕様側コミット `e3b61dd` (Tier 1) + `88ff7ef` (Tier 2) で in-place 経路の
+不変条件と STORE in-place の CRC バリアが明文化された。本 ADR の実装方針は
+そのまま有効。M5+ 着手時に追加で守るべき点を 3 つ記録する。
+
+1. **in-place の Applicability チェックを entry 単位で行う** (設計 #4/#5)。
+   - dirty entry ごとに `entry.logical_size == vmidx.uncompressed_size` を
+     確認 (commit step 1 の前)。
+   - 一致しない entry (truncate-shrink / implicit extension) は in-place を
+     スキップし、INCREMENTAL append の overflow fallback (step 2d と同経路) に
+     回す。一致する entry のみ in-place で進む。判定は entry 単位で、
+     commit 全体ではない。
+   - block 境界跨ぎ shrink は末尾 BFINAL の再アンカが必要なため in-place で
+     扱わない。これも上の `logical_size` 一致チェックで自然に弾かれる。
+
+2. **STORE 同サイズ in-place の CRC バリアを明示する** (設計 #6)。
+   - 既に "全 dirty page を vmdirty に COMMIT MARKER + fdatasync で先に
+     durable 化" は flush() STRICT (commit() 第一段) で成立しているが、
+     これが crash safety の前提であることをコードコメントとテストに
+     反映する。
+   - データ overwrite と CRC point-write の **両方の後**に fdatasync を
+     置き、その後で vmdirty を削除する順序を厳守 (ADR 本文 4 と同じ順序、
+     データ書き込みと CRC point-write を分けて 2 回 fdatasync するのではなく
+     両方完了後 1 回でよい)。
+
+3. **ENOSPC during VMM-native in-place commit の扱い** (設計 Class 2 補完)。
+   - step 1b の block 完了 journaling barrier (clean page を vmdirty に
+     追記する段) が唯一 ENOSPC を出す経路。
+   - ENOSPC → commit() を失敗させ vmdirty は retained。COMMIT MARKER 無しで
+     終わるので recovery は uncommitted 扱いで自然処理。archive.zip は不変。
+   - 既存の vmdirty 書き込み path の ENOSPC 経路 (M3 ③ で配線済み) が
+     そのまま再利用できる。
