@@ -52,3 +52,22 @@
   `open_with_recovery`。
 - **理由 / ADR**: [ADR 0009](DECISIONS.md)。これは設計テキスト側の文言が自己矛盾している箇所で、
   公開リポでの文言明確化が候補（別 push）。実装の解釈は決定木の `auto`/`silently` 枝に一致する。
+
+## 4. vmdirty の durability を O_DSYNC ではなく明示 `sync_data()` で表現
+
+- **設計**: `vmdirty_Journal_Spec` Section 4.1「fsync policy」と Section 7「VmdirtyWriter」は
+  「`vmdirty is opened with O_DSYNC`」と記述する。Sync モードでは各書き込みが復帰前に durable
+  になることを `O_DSYNC` で保証する設計。
+- **実装**: `O_DSYNC` を使わず、書き込みごとに明示 `File::sync_data()` を呼ぶ方式で同じ
+  durability を実現する（`vmdirty.rs:587-628`、Sync モード）。Lazy モードは COMMIT MARKER の
+  ときだけ `sync_data()`。
+- **理由 / ADR**: [ADR 0007](DECISIONS.md)。Windows と Unix で `O_DSYNC` 相当を FFI 無しに
+  統一するため。本リポの「純 Rust を基本に、必要な所だけ C へ」(ADR 0004) 方針に整合する。
+- **耐久性に違いはない** (`sync_data()` ≒ `fdatasync()`)が、性質が異なる:
+  `O_DSYNC` は OS 強制 (どの書き込み経路も自動同期)、明示 `sync_data()` は呼び忘れたら静かに
+  保証が崩れる規律ベース。**現在の VmdirtyWriter は単一の `appendRecord` / `appendCommitMarker`
+  経由に閉じているため呼び忘れリスクは低い**が、将来コードが増えるときは新しい書き込み経路に
+  必ず `sync_data()` を入れる規律を維持する必要がある。
+- **fsyncgate**: `sync_data()` の失敗は retryable ではない (IMPLEMENTATION_NOTES の
+  「2018 fsyncgate」)。上位で ERROR 状態に倒す配線は M3 ③ 完了時点では未配線で、
+  HANDOFF.md の「未了」に残っている。
