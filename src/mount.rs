@@ -2,8 +2,9 @@
 //!
 //! [`Mount`] は archive.zip のバイト列（呼び出し側が mmap 済み）と、それに対応
 //! する vmidx 像、[`PageCache`] を束ね、`read(path, offset, len)` を提供する。
-//! 設計のレイヤのうち Diff Layer はまだ無く、読み取りは「ページキャッシュ →
-//! シーク索引 + ソース ZIP」の 2 段:
+//! 読み取りは設計 READ PATH の三段:「Tier 1 (Diff Layer) → Tier 2 (vmdirty) →
+//! ソース ZIP (ページキャッシュ経由)」。書き込み経路は [`write_into`]、その
+//! 読み戻しは [`read_dirty`] が担う:
 //!
 //! - [`read_cached`]: 要求範囲の各ページをキャッシュから取り、ミスしたら
 //!   [`fill_run`] で目標ページ + read-ahead ページ分をまとめて展開・充填する。

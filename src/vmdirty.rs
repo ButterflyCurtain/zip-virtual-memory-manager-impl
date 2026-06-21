@@ -1,23 +1,27 @@
-//! vmdirty ジャーナル（追記専用のバイナリ形式 + 回復読み取り）。
+//! vmdirty ジャーナル（追記専用のバイナリ形式 + 回復読み取り + 書き込み配線）。
 //!
 //! Diff Layer Tier 1（メモリ内）から Tier 2（ディスク）へ spill した dirty
 //! ページを durable に保持する唯一のコピー。プロセスクラッシュを跨いで生き残り、
 //! VMM に「完全で検証可能な回復基盤」を与える。設計: docs
 //! `ZIP_Virtual_Memory_Manager_vmdirty_Journal_Spec`。
 //!
-//! このモジュールが受け持つのは **形式と回復読み取り** のみ:
-//! - [`Header`]（FILE HEADER 88B）と 3 種のレコード
+//! このモジュールが受け持つのは:
+//! - **形式 codec**: [`Header`]（FILE HEADER 88B）と 3 種のレコード
 //!   （[`encode_data_record`] / [`encode_commit_marker`] /
 //!   [`encode_metadata_record`]）の encode、いずれも末尾に CRC-32C。
-//! - [`read_vmdirty`]: open() 時に 1 度だけ走る回復読み取り walk（Section 2）。
-//!   ヘッダを検証し、レコードを順に辿り、COMMIT MARKER 境界で committed /
-//!   uncommitted を分類した [`RecoveryResult`] を返す。
+//! - **回復読み取り**: [`read_vmdirty`] は open() 時に 1 度だけ走る walk
+//!   （Section 2）。ヘッダを検証し、レコードを順に辿り、COMMIT MARKER 境界で
+//!   committed / uncommitted を分類した [`RecoveryResult`] を返す。
+//! - **耐久化書き込み**: [`VmdirtyWriter`] が `sync_data()` ベースで O_DSYNC を
+//!   近似する Sync/Lazy の 2 モードを提供（ADR 0007 / SPEC_DIVERGENCE.md #4）。
+//!   各レコードは 1 回の `write_all` で書かれ、Sync モードでは復帰前に
+//!   `sync_data` で durable、Lazy モードでは COMMIT MARKER のときだけ
+//!   `sync_data` する。
 //!
-//! まだ持たないのは: 実ファイル I/O（O_DSYNC / fdatasync、`VmdirtyWriter`）、
-//! Tier 1↔Tier 2 の spill ポリシー、generation_id の生成（CSPRNG）、compaction。
-//! それらは disk / mount 層の配線と一緒に後続の増分で足す。回復読み取りは
-//! コーデックと同じく `&[u8]` 上で完結させ（呼び出し側が vmdirty を読み込む）、
-//! 本リポの「mmap/バイト列は外から渡す」方針に揃える。
+//! まだ持たないのは: spill ポリシーの一部 (FIFO write-hit 再スタンプ最適化、
+//! 正しさには無関係)、background async-spill。それらは後続の増分で足す。
+//! 回復読み取りはコーデックと同じく `&[u8]` 上で完結させ（呼び出し側が
+//! vmdirty を読み込む）、本リポの「mmap/バイト列は外から渡す」方針に揃える。
 //!
 //! 全整数はリトルエンディアン、全オフセットはファイル先頭から。CRC は全フィールド
 //! **CRC-32C（Castagnoli）**。commit のエントリ CRC（ISO-HDLC）とは別物。
