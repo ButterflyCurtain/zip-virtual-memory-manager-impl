@@ -789,3 +789,121 @@ VMM-native in-place commit と STORE 同サイズ in-place 書き戻しで entry
      終わるので recovery は uncommitted 扱いで自然処理。archive.zip は不変。
    - 既存の vmdirty 書き込み path の ENOSPC 経路 (M3 ③ で配線済み) が
      そのまま再利用できる。
+
+---
+
+## 0015. コード品質・テスト深度の棚卸し計画 (外部レビュー反映)
+
+- 日付: 2026-06-21
+- ステータス: 計画 (実施は M5 と並行 / 一部は機能実装に先んじて着手)
+- 文脈: 外部レビュー + 内部追加調査で「コードベースが crash-safe ストレージ層
+  として主張するには test infra と panic 面が浅い」という指摘を受けた。本 ADR は
+  指摘を **棚卸しメソドロジと優先順** として受け止める。本 ADR 自体は方針記録で、
+  本コミットには実コード変更を含まない。各項目はそれぞれ後続コミットで進める。
+
+### 受け止めた指摘
+
+1. **`.unwrap()` 397 / `.expect()` 204 = 計 601 箇所**。crash-safe を謳う以上、
+   「到達不能な不変条件」と「外部入力で踏みうる」を分類する必要がある。
+2. **mount.rs の `write_into` / `read_dirty` / `read_cached` の引数 9/9/8 個**。
+   名前付き struct にまとめるべき。clippy の `too_many_arguments` が出る。
+3. **commit.rs の `Vec<(u64, u16, u32, u64, u64, Vec<u8>)>` が 5 箇所**
+   (line 94, 240, 362, 384, 464) で同じ匿名タプルを使い回している。
+   名前付き struct + コンストラクタへ。
+4. **テストはすべて in-process unit テスト** (`#[cfg(test)] mod tests`)。
+   integration test ディレクトリ無し、`proptest` / `cargo-fuzz` / loom 無し。
+   crash 整合性を主張する以上、性質ベース / fault injection / 簡易シミュレーション
+   のいずれかは必要。
+
+### 決定 (方針 + 優先順位)
+
+**Phase A (短期、M4 残務と並行): 外形整理**
+
+A-1. **`mount.rs` の引数群を struct 化** — `write_into` / `read_dirty` /
+     `read_cached` をそれぞれ `WriteCtx<'_>` / `ReadCtx<'_>` 相当の名前付き struct で
+     受ける。中身の処理は触らない (refactor のみ)。clippy `too_many_arguments`
+     warning が消える + ドキュメントコメントが書きやすくなる。
+
+A-2. **`commit.rs` の 6-tuple を struct 化** — `PlacedEntry { offset: u64,
+     method: u16, crc32: u32, comp_size: u64, uncomp_size: u64, name: Vec<u8> }`
+     的な struct を導入し、5 箇所すべてを置換。`name` の所有を含めるかは実装時
+     判断 (現状 6-tuple は所有を含むが、struct 化のついでに参照取りに直せる
+     場所があれば分ける)。
+
+A-3. **`provider/deflate.rs:421` の `panic!("read at {offset} failed")`** が
+     production 経路なのかテスト経路なのかを確認 (周辺コンテキスト依存)。
+     production ならエラー返却に置換、テストならコメントで明示。
+     `vmidx/checkpoint.rs:166` の `unreachable!` は不変条件が静的に成立する
+     ことを doc 化。
+
+A-4. **モジュールヘッダ docコメント** — 既に修正済み (コミット `258a5c7`)。
+     継続的に「実装が進んだら該当コメントを更新」を PR レビューで効かせる。
+
+**Phase B (中期、M5 着手前か並行): unwrap/expect 棚卸し**
+
+B-1. **`rg '\.unwrap\(\)|\.expect\('` の全 601 箇所を 3 分類**:
+     - (i) **到達不能 (`safe-by-construction`)**: 数学的・型的に panic 不能。
+       例: `rd_u16` (archive.rs:413) の `b.get(off..off+2).map(|s| u16::from_le_bytes(s.try_into().unwrap()))` は
+       `get(off..off+2)` が長さ 2 を返すので `[u8; 2]` への try_into は不能失敗。
+       → コメントで `// SAFETY: get(off..off+2) guarantees len == 2` を残す。
+     - (ii) **不変条件 (`invariant`)**: 直前の検査で保証される。
+       → assert! か unwrap_or_else でエラー化 (パフォーマンス影響を見て選ぶ)。
+     - (iii) **外部入力依存 (`external`)**: 攻撃者が踏みうる。
+       → `?` でエラー伝播に置換。
+     計測は CSV (`file:line, category, rationale`) で残し、ADR 0015-supplement
+     として記録。
+
+B-2. **テストコードの unwrap/expect** は対象外 (テストは panic で fail させて
+     よい)。`grep -l '#\[cfg(test)\]'` でテストブロック内かどうかを文脈判定。
+
+**Phase C (中期〜長期、新規依存追加を伴う): テスト深度**
+
+C-1. **`proptest` を導入** — Cargo.toml の `[dev-dependencies]` に追加 (ADR
+     依存連番に登録)。性質ベーステストの最初の標的:
+     - `archive.rs::parse` — 任意のバイト列で panic しない (ARCHIVE_MALFORMED
+       か Truncated を返す)。これは UNTRUSTED ARCHIVES の B (HANDOFF.md) と
+       直結し、防御未実装の現状を proptest が浮かび上がらせる。
+     - `vmdirty::encode_data_record` / `read_vmdirty` ラウンドトリップ。
+     - `entrytable::apply_rename` の連鎖 rename 畳み込み (ADR 0010 ④b)。
+
+C-2. **`cargo-fuzz` の評価** — proptest が一通り揃った後。`archive.rs` と
+     `vmdirty::read_vmdirty` を harness に。crash 入力をコーパスに溜める。
+     proptest との重複領域は多いが、long-running fuzz は別チャネル。
+
+C-3. **Crash injection テスト** — 設計の crash-before/crash-after 境界
+     (IMPLEMENTATION_NOTES が「テストオラクル」と呼ぶもの) を fault injector で
+     実演する deterministic simulation を 1 つ書く。第一目標は INCREMENTAL
+     commit (ADR 0012) と FULL commit の `durable_replace` の境界:
+     - INTENT 記録 / 追記 / COMMIT 記録の各点で擬似クラッシュ → 再 open →
+       正しい状態へ復旧 / ロールバックが起きるか。
+     - vmdirty Section 2 の回復 walk が「最初の失敗で停止」を守るか。
+     完全な deterministic simulation framework (loom 等) ではなく、まずは
+     `cfg(test)` でフックされる fault injection trait + integration test
+     ディレクトリで十分。
+
+### 理由
+
+- 段階分けの根拠: A は機能を増やさず外形だけ揃える純粋 refactor で、A 単独で
+  「読みやすい」「PR レビューしやすい」が成立する。M5 (VMM-native DEFLATE,
+  ADR 0014) 着手前にやっておくと、その上に乗る変更が clean に見えやすい。
+- B は機能変更を伴わないが「panic しない契約」を初めて明文化する作業。
+  外部レビューで指摘された「crash-safe を謳うなら panic 面の棚卸しを」への
+  直接の回答。1 PR 1 ファイルでも進められる粒度。
+- C は test infra 投資で初期コストが大きい。proptest は 1 つ書けばパターンが
+  確立するので最初のテストを書く工数で「方法論を確立する」価値がある。
+
+### 既存 ADR との関係
+
+- ADR 0001-0007: 言語・クレート選定。本 ADR は dev-dependency の proptest /
+  arbitrary 追加を C-1 で予告する (連番 0016 以降で個別記録)。
+- ADR 0014: VMM-native in-place CRC 設計。M5 で実装着手するときは A-1/A-2
+  refactor 後の signature で書く。
+- IMPLEMENTATION_NOTES.md「全クラッシュ境界で stock extractor が clean に
+  open できる」プロパティテスト — C-3 はこれの第一歩。
+
+### 未了 (本 ADR は計画記録なので、すべて「これから着手」)
+
+- A-1 / A-2 / A-3 の refactor PR 群 (M4 残務と並行)
+- B-1 の棚卸し CSV と ADR 0015-supplement
+- C-1 proptest 導入 + 最初のラウンドトリップテスト
+- C-2 / C-3 は C-1 の経験を見てから判断
