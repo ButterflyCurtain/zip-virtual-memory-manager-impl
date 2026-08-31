@@ -1351,6 +1351,31 @@ mod tests {
         assert_eq!(second.read("only.txt", 2, 3).unwrap(), b"cde");
     }
 
+    /// 中断した FULL commit の置き去り `archive.zip.new` は、次の `open()` で黙って
+    /// 掃除される（設計 SIDECAR FILES と vmdirty Journal Spec の `VmmMount.open` が
+    /// ともに "orphan … is removed silently at next open()" と要求している）。
+    ///
+    /// 中身が「完成した ZIP」でも採用はしない。rename されていない以上 commit は
+    /// 成功しておらず、`archive.zip` が唯一の正。
+    #[test]
+    fn orphan_commit_tmp_is_removed_at_open() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("orph.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", &[0x11u8; 8])])).unwrap();
+
+        // 中断した commit が残した .new（完成しているが別内容）。
+        let orphan = dir.path().join("orph.zip.new");
+        fs::write(&orphan, store_zip(&[("a.bin", &[0x99u8; 8])])).unwrap();
+
+        let m = FileMount::open(&zip_path).expect("open");
+        assert!(
+            !orphan.exists(),
+            "orphan archive.zip.new must be removed silently at open()"
+        );
+        // 採用されていない = 元の内容が読める。
+        assert_eq!(m.read("a.bin", 0, 8).unwrap(), vec![0x11u8; 8]);
+    }
+
     #[test]
     fn corrupt_sidecar_is_rebuilt() {
         let dir = TempDir::new();
