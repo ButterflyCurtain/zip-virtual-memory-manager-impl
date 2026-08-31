@@ -1623,6 +1623,36 @@ mod tests {
         assert_eq!(m2.read("keep.txt", 0, 9).unwrap(), b"unchanged");
     }
 
+    /// **回帰テスト（重い方）**: `flush()` のあとに書き足してから commit しても、
+    /// アーカイブの内容が壊れないこと。
+    ///
+    /// `VmdirtyWriter::pos` が COMMIT MARKER 分だけ進んでいなかったため、marker より
+    /// 後に Tier 2 へ落ちたページの `data_offset` がずれる。commit は
+    /// `rehydrate_into` でその索引を使って Tier 2 のページを読み戻すので、
+    /// **ずれたオフセットの中身がそのまま新しい ZIP に焼き込まれる**（黙ってアーカイブが
+    /// 壊れる）。tier2 側の単体テストは読み戻しのずれを、こちらは実害を押さえる。
+    #[test]
+    fn commit_after_flush_then_more_writes_is_not_corrupted() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("fm.zip");
+        fs::write(&zip_path, store_zip(&[("data.bin", &[0u8; 64])])).unwrap();
+
+        // ページ 8B / 上限 2 ページ。
+        let m = open_spill(&zip_path, 2 * 8);
+        m.write("data.bin", 0, &[0x11u8; 16]).unwrap();
+        m.flush().expect("flush"); // ← ここで COMMIT MARKER が入る
+        // marker より後に書いたぶんが Tier 2 へ spill される。
+        m.write("data.bin", 16, &[0x22u8; 32]).unwrap();
+        m.commit_full().expect("commit");
+
+        let m2 = FileMount::open(&zip_path).expect("reopen");
+        let got = m2.read("data.bin", 0, 64).unwrap();
+        let mut want = vec![0u8; 64];
+        want[..16].fill(0x11);
+        want[16..48].fill(0x22);
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn recover_committed_after_flush_then_crash() {
         let dir = TempDir::new();
