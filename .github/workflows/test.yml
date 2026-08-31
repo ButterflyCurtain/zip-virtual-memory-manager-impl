@@ -1,0 +1,62 @@
+# テスト専用 CI。
+#
+# ローカルの Rust ツールチェーンが失われた（CARGO_HOME/RUSTUP_HOME が D: を指したまま
+# ドライブごと消えた）ため、`cargo test` を回せる唯一の場所がここになる。目的は
+# 「205 テスト緑・警告なし」を常時確認できる状態を保つこと。
+#
+# キャッシュについて: GitHub Actions のキャッシュは **7 日間参照が無いと evict** され、
+# リポジトリ全体で 10 GB を超えても古いものから落ちる。作業が空いても消えないよう、
+# 週 1 の schedule で空回しして温存する（`Swatinem/rust-cache` がキーを回す）。
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 毎週月曜 03:00 UTC。キャッシュの 7 日 evict を回避するためのウォームアップ。
+    - cron: "0 3 * * 1"
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows が本来の開発環境（inode=0 / seek_read などの cfg 分岐が効く側）。
+        # Linux は Unix 側の分岐（pread / 親 dir fsync）を初めて踏む経路なので、
+        # 落ちたらそれ自体が情報。
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc -vV
+          cargo -vV
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # OS ごとに分ける。ジョブ名を混ぜないことでブランチ間でも共有される。
+          shared-key: test-${{ matrix.os }}
+
+      - name: cargo test
+        run: cargo test --locked
+
+      # 警告なしがこのリポジトリの基準（HANDOFF）。ADR 0015 Phase A は
+      # `too_many_arguments` を潰す作業なので、その回帰もここで止める。
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
