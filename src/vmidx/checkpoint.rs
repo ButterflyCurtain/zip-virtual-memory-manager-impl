@@ -138,8 +138,13 @@ impl Checkpoint {
         }
     }
 
-    /// `provider` に応じて記録 1 件をデコードする。`b` の長さは当該プロバイダの
-    /// 記録長以上であることを前提とする（呼び出し側が保証）。
+    /// `provider` に応じて記録 1 件をデコードする。
+    ///
+    /// 呼び出し側の保証（唯一の呼び出し元は [`CheckpointChunk::decode`]）:
+    /// 1. `record_size(provider).is_some()` — `decode` は `rsize` を
+    ///    [`DecodeError::ChunkNoCheckpointFormat`] で先に弾いてから本関数へ入る。
+    ///    ゆえに Store / Unsupported 枝は到達不能で `unreachable!` にしてある。
+    /// 2. `b.len() >= rsize` — `decode` が `rsize` 幅で切り出して渡す。
     fn decode_record(provider: ProviderType, b: &[u8]) -> Checkpoint {
         match provider {
             ProviderType::Deflate => {
