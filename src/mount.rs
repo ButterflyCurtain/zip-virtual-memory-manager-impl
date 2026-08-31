@@ -278,25 +278,22 @@ impl<'a> Mount<'a> {
         // ソース名が現在名と異なるので（`source != Some(path)`）ここに入り、
         // read_dirty がソース名でソース ZIP を読む。
         if self.diff.borrow().is_dirty(path) || resolved.source.as_deref() != Some(path) {
-            return read_dirty(
-                self.archive,
-                &self.vmidx_image,
-                &self.diff.borrow(),
-                None,
+            let ctx = EntryCtx {
+                archive: self.archive,
+                vmidx_image: &self.vmidx_image,
                 path,
-                resolved.source.as_deref(),
-                resolved.original_size,
-                offset,
-                len,
-            );
+                source: resolved.source.as_deref(),
+                original_size: resolved.original_size,
+            };
+            return read_dirty(&ctx, &self.diff.borrow(), None, offset, len);
         }
         let mut cache = self.cache.borrow_mut();
+        let mut io = PageIo { cache: &mut cache, cfg: &self.cfg };
         // メモリ上マウントには再 stat 対象のファイルが無いので鮮度チェックは no-op。
         read_cached(
             self.archive,
             &self.vmidx_image,
-            &mut cache,
-            &self.cfg,
+            &mut io,
             path,
             offset,
             len,
@@ -310,17 +307,14 @@ impl<'a> Mount<'a> {
     /// （commit で materialise）。`dirty_limit` は M2 では無制限（spill なし）。
     pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), WriteError> {
         let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
-        write_into(
-            self.archive,
-            &self.vmidx_image,
-            &mut self.diff.borrow_mut(),
-            None,
+        let ctx = EntryCtx {
+            archive: self.archive,
+            vmidx_image: &self.vmidx_image,
             path,
-            resolved.source.as_deref(),
-            resolved.original_size,
-            offset,
-            data,
-        )
+            source: resolved.source.as_deref(),
+            original_size: resolved.original_size,
+        };
+        write_into(&ctx, &mut self.diff.borrow_mut(), None, offset, data)
     }
 
     /// 空のエントリを作る（設計 create()）。既存（未削除）なら [`EntryError::Exists`]。
@@ -652,6 +646,26 @@ fn entry_in_vmidx(vmidx_image: &[u8], path: &str) -> Result<bool, EntryError> {
     Ok(vmidx.lookup(path).map_err(EntryError::Vmidx)?.is_some())
 }
 
+/// dirty 経路（Tier 1 / Tier 2 / ソースの三段）が 1 エントリを触るのに要る文脈。
+///
+/// [`resolve_entry`] の結果をそのまま載せる想定で、`path` は Diff Layer のキー
+/// （＝現在名）、`source` は未変更ページを引くソース名（`None` = created）、
+/// `original_size` はそのソースの元サイズ（created は 0）。rename 後は
+/// `path != source` になりうる（④b の別名）。
+#[derive(Clone, Copy)]
+pub struct EntryCtx<'a> {
+    /// ソース ZIP 全体のバイト列。
+    pub archive: &'a [u8],
+    /// `archive` に対応する vmidx 像。
+    pub vmidx_image: &'a [u8],
+    /// Diff Layer / エントリ表のキー（現在名）。
+    pub path: &'a str,
+    /// 未変更ページを読むソースエントリ名。`None` = created（ソース無し）。
+    pub source: Option<&'a str>,
+    /// ソースの元サイズ。Diff に high-water があればそちらが優先される。
+    pub original_size: u64,
+}
+
 /// エントリ `path` の `[offset, offset + data.len())` を Diff Layer に COW で書く
 /// （設計 WRITE PATH）。`tier2` を渡すと書き込み経路は三段になる:
 /// - **Tier 1 ヒット**: 常駐ページを in-place 更新。
@@ -664,16 +678,13 @@ fn entry_in_vmidx(vmidx_image: &[u8], path: &str) -> Result<bool, EntryError> {
 /// `dirty_limit` を超えていれば最古から spill する。`tier2 = None` は M2 互換の
 /// Tier 1 のみ（spill なし）。
 pub fn write_into(
-    archive: &[u8],
-    vmidx_image: &[u8],
+    ctx: &EntryCtx<'_>,
     diff: &mut DiffLayer,
     mut tier2: Option<&mut Tier2>,
-    path: &str,
-    source: Option<&str>,
-    original_size: u64,
     offset: u64,
     data: &[u8],
 ) -> Result<(), WriteError> {
+    let EntryCtx { archive, vmidx_image, path, source, original_size } = *ctx;
     if data.is_empty() {
         return Ok(());
     }
@@ -753,16 +764,13 @@ fn apply_write(buf: &mut [u8], page_start: u64, offset: u64, end: u64, data: &[u
 /// 未変更ページ、ソース範囲も超えていればゼロ（implicit extension の gap）。
 /// `logical_size` を超える読みは短く返す（EOF セマンティクス）。
 pub fn read_dirty(
-    archive: &[u8],
-    vmidx_image: &[u8],
+    ctx: &EntryCtx<'_>,
     diff: &DiffLayer,
     tier2: Option<&Tier2>,
-    path: &str,
-    source: Option<&str>,
-    original_size: u64,
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>, ReadError> {
+    let EntryCtx { archive, vmidx_image, path, source, original_size } = *ctx;
     // 存在確認は呼び出し側の [`resolve_entry`] が済ませている。`source` = 未変更
     // ページを読むソース名（None = created）。Diff にエントリが無いのは「1 度も
     // 書いていない別名」（純粋な rename）だけで、論理サイズ・source high-water とも
@@ -818,6 +826,15 @@ pub fn read_dirty(
     Ok(out)
 }
 
+/// ページキャッシュ経路（LAYER 2a）が要る二点セット。キャッシュ本体と、
+/// read-ahead 幅などの設定は常に一緒に運ばれるのでまとめる。
+pub struct PageIo<'a> {
+    /// バイト量バウンドの LRU ページキャッシュ。ページ境界も `cache` が決める。
+    pub cache: &'a mut PageCache,
+    /// ページ設定（`read_ahead_pages` を [`fill_run`] が見る）。
+    pub cfg: &'a PageConfig,
+}
+
 /// ページキャッシュ経由で 1 エントリの `[offset, offset + len)` を読む。
 /// 要求範囲がまたぐ各ページについて、常駐していればキャッシュから、ミスなら
 /// [`fill_run`] で目標ページ + read-ahead 分を展開・充填してから取り出す。
@@ -831,8 +848,7 @@ pub fn read_dirty(
 pub fn read_cached<F>(
     archive: &[u8],
     vmidx_image: &[u8],
-    cache: &mut PageCache,
-    cfg: &PageConfig,
+    io: &mut PageIo<'_>,
     path: &str,
     offset: u64,
     len: usize,
@@ -853,7 +869,7 @@ where
         return Ok(Vec::new());
     }
 
-    let page_size = cache.page_size();
+    let page_size = io.cache.page_size();
     let total_pages = page_count(record.uncompressed_size, page_size);
     let end = offset + len as u64;
 
@@ -865,7 +881,7 @@ where
         let page_start = page * page_size;
         let in_page = (pos - page_start) as usize;
 
-        if let Some(data) = cache.get(key) {
+        if let Some(data) = io.cache.get(key) {
             // ヒット。末尾ページは短く、data.len() が当該ページの実長。
             let take = (data.len() - in_page).min((end - pos) as usize);
             out.extend_from_slice(&data[in_page..in_page + take]);
@@ -881,7 +897,7 @@ where
         // 当該ページはランの先頭なので、退避方針に依らず確実に取れる戻り値
         // バイト列から直接切り出す（ラン > キャッシュ容量でも前進できる）。
         let (bytes, run_start) =
-            fill_run(archive, &vmidx, cache, cfg, &record, entry, page, total_pages)?;
+            fill_run(archive, &vmidx, io, &record, entry, page, total_pages)?;
         debug_assert_eq!(run_start, page_start);
         let page_len = page_extent(record.uncompressed_size, page, page_size).1;
         let take = (page_len - in_page).min((end - pos) as usize);
@@ -902,17 +918,16 @@ where
 /// キャッシュへの充填と独立に戻り値でランを返すのは、ランがキャッシュ容量を
 /// 超えるとき目標ページ自身が充填中に退避されうるため。呼び出し側は戻り値から
 /// 目標ページを取り出し、キャッシュは将来のヒット用に充填する。
-#[allow(clippy::too_many_arguments)]
 fn fill_run(
     archive: &[u8],
     vmidx: &Vmidx,
-    cache: &mut PageCache,
-    cfg: &PageConfig,
+    io: &mut PageIo<'_>,
     record: &EntryRecord,
     entry: usize,
     target_page: u64,
     total_pages: u64,
 ) -> Result<(Vec<u8>, u64), ReadError> {
+    let PageIo { cache, cfg } = io;
     let provider = builtin_provider(record.provider_type)
         .ok_or(ReadError::Unsupported(record.provider_type))?;
     let page_size = cache.page_size();

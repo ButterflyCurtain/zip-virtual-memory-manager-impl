@@ -24,7 +24,8 @@ use crate::entrytable::EntryTable;
 use crate::index_build::BuildParams;
 use crate::mount::{
     entry_create, entry_remove, entry_rename, entry_truncate, read_cached, read_dirty,
-    resolve_entry, resolve_index, write_into, EntryError, OpenError, ReadError, WriteError,
+    resolve_entry, resolve_index, write_into, EntryCtx, EntryError, OpenError, PageIo, ReadError,
+    WriteError,
 };
 use crate::page::{PageCache, PageConfig};
 use crate::tier2::Tier2;
@@ -475,24 +476,21 @@ impl FileMount {
         // Tier 1 → Tier 2）。別名はソース名が現在名と異なるのでここに入る。
         if self.diff.borrow().is_dirty(path) || resolved.source.as_deref() != Some(path) {
             let t2 = self.tier2.borrow();
-            return read_dirty(
-                &self.archive,
-                &self.vmidx_image,
-                &self.diff.borrow(),
-                t2.as_ref(),
+            let ctx = EntryCtx {
+                archive: &self.archive,
+                vmidx_image: &self.vmidx_image,
                 path,
-                resolved.source.as_deref(),
-                resolved.original_size,
-                offset,
-                len,
-            );
+                source: resolved.source.as_deref(),
+                original_size: resolved.original_size,
+            };
+            return read_dirty(&ctx, &self.diff.borrow(), t2.as_ref(), offset, len);
         }
         let mut cache = self.cache.borrow_mut();
+        let mut io = PageIo { cache: &mut cache, cfg: &self.cfg };
         read_cached(
             &self.archive,
             &self.vmidx_image,
-            &mut cache,
-            &self.cfg,
+            &mut io,
             path,
             offset,
             len,
@@ -506,17 +504,14 @@ impl FileMount {
     pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), WriteError> {
         let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
         let mut t2 = self.tier2.borrow_mut();
-        write_into(
-            &self.archive,
-            &self.vmidx_image,
-            &mut self.diff.borrow_mut(),
-            t2.as_mut(),
+        let ctx = EntryCtx {
+            archive: &self.archive,
+            vmidx_image: &self.vmidx_image,
             path,
-            resolved.source.as_deref(),
-            resolved.original_size,
-            offset,
-            data,
-        )
+            source: resolved.source.as_deref(),
+            original_size: resolved.original_size,
+        };
+        write_into(&ctx, &mut self.diff.borrow_mut(), t2.as_mut(), offset, data)
     }
 
     /// 空のエントリを作る（設計 create()）。既存（未削除）なら [`EntryError::Exists`]。
