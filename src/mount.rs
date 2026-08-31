@@ -15,8 +15,8 @@
 //!   4. `nearest_checkpoint(record, run_start)` を起点に `provider.read_range` で
 //!      ラン全体を 1 回で展開し、ページに切ってキャッシュへ入れる
 //!
-//! ラン一括展開により、read-ahead は「目標 + N ページ」を 1 回の checkpoint 復元
-//! + 前進デコードで賄う（設計 READ PATH の read-ahead 償却。デコーダ状態を跨いで
+//! ラン一括展開により、read-ahead は「目標 + N ページ」を 1 回の checkpoint 復元 +
+//! 前進デコードで賄う（設計 READ PATH の read-ahead 償却。デコーダ状態を跨いで
 //! 持ち回る最適化はさらに後段）。[`read_entry`] は索引だけを使う無キャッシュの
 //! 下位プリミティブとして残す。
 //!
