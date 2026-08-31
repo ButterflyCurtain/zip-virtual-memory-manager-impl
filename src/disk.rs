@@ -379,6 +379,14 @@ impl FileMount {
         // ないので掃除する（vmdirty 本体だけが正、orphan は無視）。
         let _ = fs::remove_file(compact_tmp(&vmdirty_path));
 
+        // 中断した FULL commit の置き去り（`archive.zip.new`）も同様に掃除する
+        // （設計 SIDECAR FILES と Journal Spec の `VmmMount.open`: "orphan … is
+        // removed silently at next open()"）。**完成した中身でも採用しない** —
+        // rename されていない以上 commit は成功しておらず、`archive.zip` が唯一の正。
+        // 注: 仕様の前提「アクティブなマウントが無いとき」は lock 層（未実装）が
+        // 入るまで検証できない。`vmdirty.compact` の掃除と同じ制約。
+        let _ = fs::remove_file(commit_tmp(archive_path));
+
         // 完了済み INCREMENTAL commit の後始末: dirty 状態は新アーカイブに在るので
         // 残った vmdirty は stale。replay せず捨てる（CLEAN な新アーカイブとして開く）。
         if discard_vmdirty_after_commit && vmdirty_path.exists() {
