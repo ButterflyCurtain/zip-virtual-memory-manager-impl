@@ -662,7 +662,7 @@ impl VmdirtyWriter {
         let seq = self.next_seq;
         let record_start = self.pos;
         let rec = encode_data_record(&self.generation_id, seq, entry_name, page_index, data);
-        self.write_record(&rec)?;
+        self.append_raw(&rec, false)?;
         self.next_seq += 1;
         // DATA RECORD: magic(4)+gen(16)+seq(8)+name_len(2)+name(N)+page_index(8)
         //              +data_len(4) = 42 + N バイト後に data フィールドが始まる。
@@ -678,7 +678,7 @@ impl VmdirtyWriter {
     pub fn append_metadata(&mut self, entry_name: &str, op: &MetaOp) -> io::Result<u64> {
         let seq = self.next_seq;
         let rec = encode_metadata_record(&self.generation_id, seq, entry_name, op);
-        self.write_record(&rec)?;
+        self.append_raw(&rec, false)?;
         self.next_seq += 1;
         Ok(seq)
     }
@@ -688,17 +688,23 @@ impl VmdirtyWriter {
     /// dirty ページ総数。書き終えると Sync/Lazy を問わず durable。
     pub fn append_commit_marker(&mut self, commit_sequence: u64, page_count: u64) -> io::Result<()> {
         let marker = encode_commit_marker(&self.generation_id, commit_sequence, page_count);
-        self.file.write_all(&marker)?;
-        self.file.sync_data()?;
-        Ok(())
+        // COMMIT MARKER は Sync / Lazy を問わず durable にする（設計 4.2 の flush 境界）。
+        self.append_raw(&marker, true)
     }
 
-    /// 1 レコードを 1 回の `write_all` で書き、Sync モードなら `sync_data`。
-    /// 書いた分だけ `pos`（追記位置）を進める。
-    fn write_record(&mut self, rec: &[u8]) -> io::Result<()> {
-        self.file.write_all(rec)?;
-        self.pos += rec.len() as u64;
-        if self.sync == SyncPolicy::Sync {
+    /// 追記の唯一の出口。1 回の `write_all` で書き、書いた分だけ `pos` を進め、
+    /// `force_sync`（COMMIT MARKER）か `Sync` モードなら `sync_data` する。
+    ///
+    /// **追記は必ずここを通すこと。** `pos` の不変条件「= 現在のファイル長」を
+    /// 保つ場所を 1 箇所に閉じ込めるため。かつて `append_commit_marker` だけが
+    /// これを迂回して `write_all` しており、marker の 40 バイト分 `pos` が実位置
+    /// より手前に取り残されていた。その結果 marker 以降の DATA RECORD が返す
+    /// `data_offset` がずれ、Tier 2 の読み戻しと（`rehydrate_into` 経由で）
+    /// commit が書くアーカイブの中身が黙って壊れていた。
+    fn append_raw(&mut self, bytes: &[u8], force_sync: bool) -> io::Result<()> {
+        self.file.write_all(bytes)?;
+        self.pos += bytes.len() as u64;
+        if force_sync || self.sync == SyncPolicy::Sync {
             self.file.sync_data()?;
         }
         Ok(())
