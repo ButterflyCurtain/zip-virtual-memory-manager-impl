@@ -395,6 +395,38 @@ mod tests {
         assert_eq!(pages, vec![(1, 0x01), (2, 0x99)]);
     }
 
+    /// **回帰テスト**: COMMIT MARKER の直後に追記した DATA RECORD が正しく
+    /// 読み戻せること。
+    ///
+    /// `VmdirtyWriter::pos` の不変条件は「次に書くレコードのファイルオフセット
+    /// （= 現在のファイル長）」だが、`append_commit_marker` だけが `write_record`
+    /// を通さず直接 `write_all` していたため、marker の 40 バイト分 `pos` が実位置
+    /// より手前に取り残されていた。すると marker 以降の DATA RECORD が返す
+    /// `data_offset` が 40 バイトずれ、Tier 2 から読み戻したページが**黙って壊れる**。
+    ///
+    /// 到達経路は複数ある: `flush()` は繰り返し呼べる（呼んだ後も書き続けられる）し、
+    /// `compact_journal` が作る新しい Tier 2 も COMMIT MARKER で終わってから
+    /// live として使われ続ける。
+    #[test]
+    fn data_record_after_commit_marker_reads_back_correctly() {
+        let tf = TempFile::new("marker_pos");
+        let mut t = tier2(tf.path(), 8);
+        let mut d = DiffLayer::with_dirty_limit(8, 0);
+
+        put(&mut d, "a", 0, 0xA0, 8);
+        t.spill_over_limit(&mut d).unwrap();
+
+        // Tier 1 は空なので flush() が書くのは COMMIT MARKER だけ。
+        t.flush(&mut d).unwrap();
+
+        // marker より後ろに置かれる DATA RECORD。
+        t.write_hit("b", 0, &[0xBB; 8], 8).unwrap();
+
+        assert_eq!(t.read_page("b", 0).unwrap().unwrap(), vec![0xBB; 8]);
+        // 先に書いたページも壊れていない。
+        assert_eq!(t.read_page("a", 0).unwrap().unwrap(), vec![0xA0; 8]);
+    }
+
     #[test]
     fn flush_keeps_tier1_and_writes_commit_marker() {
         let tf = TempFile::new("flush");
