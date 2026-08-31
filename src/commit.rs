@@ -67,6 +67,49 @@ impl fmt::Display for CommitError {
 
 impl std::error::Error for CommitError {}
 
+/// 出力する 1 エントリの中身。`stored` は**圧縮済み**バイト列（未変更エントリの
+/// verbatim コピー、または再圧縮の結果）で、`crc32`/`uncomp_size` は**展開後**の
+/// 論理内容に対する値。圧縮サイズは `stored.len()` が唯一の真実なので持たない。
+struct EntryPayload {
+    /// 生の ZIP 圧縮メソッドコード（0=STORE / 8=DEFLATE）。
+    method: u16,
+    /// 展開後内容の CRC-32（ISO-HDLC。ジャーナルの CRC-32C とは別物）。
+    crc32: u32,
+    /// 圧縮済みバイト列。
+    stored: Vec<u8>,
+    /// 展開後の論理サイズ。
+    uncomp_size: u64,
+}
+
+/// 出力 ZIP に配置し終えた 1 エントリの、Central Directory 用レコード。
+///
+/// `local_header_offset` は**出力ファイル先頭からの絶対オフセット**。FULL では
+/// 組み立て中バッファ内の位置、INCREMENTAL では追記ベース込みの位置、未変更
+/// エントリ（[`record_in_place`]）では元アーカイブの値をそのまま引き継ぐ。
+struct PlacedEntry {
+    local_header_offset: u64,
+    method: u16,
+    crc32: u32,
+    comp_size: u64,
+    uncomp_size: u64,
+    name: Vec<u8>,
+}
+
+impl PlacedEntry {
+    /// `lho` に配置した `payload` を、CD 用レコードにする。圧縮サイズは
+    /// `payload.stored` の実長から採る。
+    fn new(lho: u64, payload: &EntryPayload, name: &[u8]) -> PlacedEntry {
+        PlacedEntry {
+            local_header_offset: lho,
+            method: payload.method,
+            crc32: payload.crc32,
+            comp_size: payload.stored.len() as u64,
+            uncomp_size: payload.uncomp_size,
+            name: name.to_vec(),
+        }
+    }
+}
+
 /// Diff Layer + エントリ表を反映した新しい ZIP バイト列を組み立てる（FULL パス）。
 ///
 /// `archive` はソース ZIP、`vmidx_image` はそれに対応する vmidx 像（変更エントリ
@@ -90,8 +133,8 @@ pub fn build_full(
     let ar = Archive::parse(archive).map_err(CommitError::Zip)?;
 
     let mut body: Vec<u8> = Vec::new();
-    // (local_header_offset, method, crc, comp_size, uncomp_size, name) を CD 用に控える。
-    let mut placed: Vec<(u64, u16, u32, u64, u64, Vec<u8>)> = Vec::with_capacity(ar.entries().len());
+    // 配置済みエントリを CD 用に控える。
+    let mut placed: Vec<PlacedEntry> = Vec::with_capacity(ar.entries().len());
     // vmidx ループで created として出した名前（created ループの重複出力を防ぐ）。
     let mut emitted_created: HashSet<String> = HashSet::new();
 
@@ -109,9 +152,8 @@ pub fn build_full(
                 Kind::Absent => continue, // tombstone → 出力しない
                 Kind::Created => {
                     // 同名を再 create（リスタート）→ created として組み立てる。
-                    let (method, crc, stored, uncomp) =
-                        build_created(archive, vmidx_image, diff, name)?;
-                    place_entry(&mut body, &mut placed, method, crc, &stored, uncomp, &entry.name)?;
+                    let payload = build_created(archive, vmidx_image, diff, name)?;
+                    place_entry(&mut body, &mut placed, &payload, &entry.name)?;
                     emitted_created.insert(name.to_owned());
                     continue;
                 }
@@ -121,7 +163,7 @@ pub fn build_full(
 
         // 通常のソースエントリ（Kind::Source または非 UTF-8 名）。
         let dirty_name = name_utf8.filter(|n| diff.is_dirty(n));
-        let (method, crc, stored, uncomp_size) = if let Some(name) = dirty_name {
+        let payload = if let Some(name) = dirty_name {
             let logical = diff.logical_size(name).unwrap_or(entry.uncompressed_size);
             // ソース読み出しの上限は source high-water（truncate-shrink で縮む）。
             let original = diff.source_size(name).unwrap_or(entry.uncompressed_size);
@@ -133,15 +175,19 @@ pub fn build_full(
                 ProviderType::Deflate => (8u16, deflate(&content)?),
                 other => return Err(CommitError::Unsupported(other)),
             };
-            let uncomp = content.len() as u64;
-            (method, crc, stored, uncomp)
+            EntryPayload { method, crc32: crc, stored, uncomp_size: content.len() as u64 }
         } else {
             // 未変更: 圧縮ストリームを verbatim でコピー（CRC・サイズは CD から）。
             let stored = ar.entry_data(entry).map_err(CommitError::Zip)?.to_vec();
-            (entry.method_code, entry.crc32, stored, entry.uncompressed_size)
+            EntryPayload {
+                method: entry.method_code,
+                crc32: entry.crc32,
+                stored,
+                uncomp_size: entry.uncompressed_size,
+            }
         };
 
-        place_entry(&mut body, &mut placed, method, crc, &stored, uncomp_size, &entry.name)?;
+        place_entry(&mut body, &mut placed, &payload, &entry.name)?;
     }
 
     // vmidx に無い created エントリ。
@@ -149,8 +195,8 @@ pub fn build_full(
         if emitted_created.contains(name) {
             continue;
         }
-        let (method, crc, stored, uncomp) = build_created(archive, vmidx_image, diff, name)?;
-        place_entry(&mut body, &mut placed, method, crc, &stored, uncomp, name.as_bytes())?;
+        let payload = build_created(archive, vmidx_image, diff, name)?;
+        place_entry(&mut body, &mut placed, &payload, name.as_bytes())?;
     }
 
     // 別名エントリ（rename ターゲット）。現在名で出力し、未変更データはソース名の
@@ -163,7 +209,7 @@ pub fn build_full(
             .iter()
             .find(|e| e.name == source.as_bytes())
             .ok_or(CommitError::Read(ReadError::NotFound))?;
-        let (method, crc, stored, uncomp) = if diff.is_dirty(current) {
+        let payload = if diff.is_dirty(current) {
             let logical = diff
                 .logical_size(current)
                 .unwrap_or(src_entry.uncompressed_size);
@@ -178,25 +224,25 @@ pub fn build_full(
                 ProviderType::Deflate => (8u16, deflate(&content)?),
                 other => return Err(CommitError::Unsupported(other)),
             };
-            (method, crc, stored, content.len() as u64)
+            EntryPayload { method, crc32: crc, stored, uncomp_size: content.len() as u64 }
         } else {
             // 未変更: ソースの圧縮ストリームを verbatim コピー（CRC・サイズは CD）。
             let stored = ar.entry_data(src_entry).map_err(CommitError::Zip)?.to_vec();
-            (
-                src_entry.method_code,
-                src_entry.crc32,
+            EntryPayload {
+                method: src_entry.method_code,
+                crc32: src_entry.crc32,
                 stored,
-                src_entry.uncompressed_size,
-            )
+                uncomp_size: src_entry.uncompressed_size,
+            }
         };
-        place_entry(&mut body, &mut placed, method, crc, &stored, uncomp, current.as_bytes())?;
+        place_entry(&mut body, &mut placed, &payload, current.as_bytes())?;
     }
 
     // Central Directory。
     let cd_offset = body.len() as u64;
     let mut cd: Vec<u8> = Vec::new();
-    for (lho, method, crc, comp_size, uncomp_size, name) in &placed {
-        write_cdfh(&mut cd, *method, *crc, *comp_size, *uncomp_size, *lho, name);
+    for entry in &placed {
+        write_cdfh(&mut cd, entry);
     }
     let cd_size = cd.len() as u64;
     body.extend_from_slice(&cd);
@@ -237,8 +283,7 @@ pub fn build_incremental(
     let base = archive.len() as u64; // 追記開始の絶対オフセット。
 
     let mut body: Vec<u8> = Vec::new(); // 末尾に追記する LFH+データ（後で CD/EOCD も足す）。
-    let mut placed: Vec<(u64, u16, u32, u64, u64, Vec<u8>)> =
-        Vec::with_capacity(ar.entries().len());
+    let mut placed: Vec<PlacedEntry> = Vec::with_capacity(ar.entries().len());
     let mut emitted_created: HashSet<String> = HashSet::new();
 
     for entry in ar.entries() {
@@ -251,9 +296,8 @@ pub fn build_incremental(
             match table.kind(name, true) {
                 Kind::Absent => continue, // tombstone / rename 元 → 新 CD から外す。
                 Kind::Created => {
-                    let (method, crc, stored, uncomp) =
-                        build_created(archive, vmidx_image, diff, name)?;
-                    place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, &entry.name)?;
+                    let payload = build_created(archive, vmidx_image, diff, name)?;
+                    place_appended(&mut body, &mut placed, base, &payload, &entry.name)?;
                     emitted_created.insert(name.to_owned());
                     continue;
                 }
@@ -274,8 +318,9 @@ pub fn build_incremental(
                 ProviderType::Deflate => (8u16, deflate(&content)?),
                 other => return Err(CommitError::Unsupported(other)),
             };
-            let uncomp = content.len() as u64;
-            place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, &entry.name)?;
+            let payload =
+                EntryPayload { method, crc32: crc, stored, uncomp_size: content.len() as u64 };
+            place_appended(&mut body, &mut placed, base, &payload, &entry.name)?;
         } else {
             // 未変更 → 追記せず、元の local header offset で新 CD に載せる。
             record_in_place(&mut placed, entry)?;
@@ -287,8 +332,8 @@ pub fn build_incremental(
         if emitted_created.contains(name) {
             continue;
         }
-        let (method, crc, stored, uncomp) = build_created(archive, vmidx_image, diff, name)?;
-        place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, name.as_bytes())?;
+        let payload = build_created(archive, vmidx_image, diff, name)?;
+        place_appended(&mut body, &mut placed, base, &payload, name.as_bytes())?;
     }
 
     // 別名（rename ターゲット）。LFH の名前を現在名にするため、未変更でも LFH+データを
@@ -299,7 +344,7 @@ pub fn build_incremental(
             .iter()
             .find(|e| e.name == source.as_bytes())
             .ok_or(CommitError::Read(ReadError::NotFound))?;
-        let (method, crc, stored, uncomp) = if diff.is_dirty(current) {
+        let payload = if diff.is_dirty(current) {
             let logical = diff
                 .logical_size(current)
                 .unwrap_or(src_entry.uncompressed_size);
@@ -314,24 +359,24 @@ pub fn build_incremental(
                 ProviderType::Deflate => (8u16, deflate(&content)?),
                 other => return Err(CommitError::Unsupported(other)),
             };
-            (method, crc, stored, content.len() as u64)
+            EntryPayload { method, crc32: crc, stored, uncomp_size: content.len() as u64 }
         } else {
             let stored = ar.entry_data(src_entry).map_err(CommitError::Zip)?.to_vec();
-            (
-                src_entry.method_code,
-                src_entry.crc32,
+            EntryPayload {
+                method: src_entry.method_code,
+                crc32: src_entry.crc32,
                 stored,
-                src_entry.uncompressed_size,
-            )
+                uncomp_size: src_entry.uncompressed_size,
+            }
         };
-        place_appended(&mut body, &mut placed, base, method, crc, &stored, uncomp, current.as_bytes())?;
+        place_appended(&mut body, &mut placed, base, &payload, current.as_bytes())?;
     }
 
     // 新 Central Directory（全 live エントリ）。CD は追記分の直後 = base + body.len()。
     let cd_offset = base + body.len() as u64;
     let mut cd: Vec<u8> = Vec::new();
-    for (lho, method, crc, comp_size, uncomp_size, name) in &placed {
-        write_cdfh(&mut cd, *method, *crc, *comp_size, *uncomp_size, *lho, name);
+    for entry in &placed {
+        write_cdfh(&mut cd, entry);
     }
     let cd_size = cd.len() as u64;
     body.extend_from_slice(&cd);
@@ -356,48 +401,33 @@ pub fn build_incremental(
 
 /// 追記領域へ 1 エントリを書き（LFH+データ）、その**絶対** local header offset
 /// （`base + 追記内位置`）を CD 用に記録する。32 ビット超過は [`CommitError::TooLarge`]。
-#[allow(clippy::too_many_arguments)]
 fn place_appended(
     body: &mut Vec<u8>,
-    placed: &mut Vec<(u64, u16, u32, u64, u64, Vec<u8>)>,
+    placed: &mut Vec<PlacedEntry>,
     base: u64,
-    method: u16,
-    crc: u32,
-    stored: &[u8],
-    uncomp_size: u64,
+    payload: &EntryPayload,
     name: &[u8],
 ) -> Result<(), CommitError> {
-    let comp_size = stored.len() as u64;
-    let lho = base + body.len() as u64;
-    if lho > u32::MAX as u64 || comp_size > u32::MAX as u64 || uncomp_size > u32::MAX as u64 {
-        return Err(CommitError::TooLarge);
-    }
-    write_lfh(body, method, crc, comp_size, uncomp_size, name);
-    body.extend_from_slice(stored);
-    placed.push((lho, method, crc, comp_size, uncomp_size, name.to_vec()));
-    Ok(())
+    write_placed(body, placed, base + body.len() as u64, payload, name)
 }
 
 /// 未変更エントリを元の local header offset のまま新 CD に載せる（追記しない＝
 /// 既存バイトをそのまま再利用）。
-fn record_in_place(
-    placed: &mut Vec<(u64, u16, u32, u64, u64, Vec<u8>)>,
-    entry: &CdEntry,
-) -> Result<(), CommitError> {
+fn record_in_place(placed: &mut Vec<PlacedEntry>, entry: &CdEntry) -> Result<(), CommitError> {
     if entry.local_header_offset > u32::MAX as u64
         || entry.compressed_size > u32::MAX as u64
         || entry.uncompressed_size > u32::MAX as u64
     {
         return Err(CommitError::TooLarge);
     }
-    placed.push((
-        entry.local_header_offset,
-        entry.method_code,
-        entry.crc32,
-        entry.compressed_size,
-        entry.uncompressed_size,
-        entry.name.clone(),
-    ));
+    placed.push(PlacedEntry {
+        local_header_offset: entry.local_header_offset,
+        method: entry.method_code,
+        crc32: entry.crc32,
+        comp_size: entry.compressed_size,
+        uncomp_size: entry.uncompressed_size,
+        name: entry.name.clone(),
+    });
     Ok(())
 }
 
@@ -442,80 +472,90 @@ fn assemble_content(
 }
 
 /// created エントリ `name` を Diff から組み立て、既定 DEFLATE で圧縮する。
-/// ソースは無い（未書き込みページはゼロ）。戻り値 (method, crc, stored, uncomp)。
+/// ソースは無い（未書き込みページはゼロ）。
 fn build_created(
     archive: &[u8],
     vmidx_image: &[u8],
     diff: &DiffLayer,
     name: &str,
-) -> Result<(u16, u32, Vec<u8>, u64), CommitError> {
+) -> Result<EntryPayload, CommitError> {
     let logical = diff.logical_size(name).unwrap_or(0);
     let content = assemble_content(archive, vmidx_image, diff, name, logical, 0, None)?;
     let crc = crc32(&content);
     let stored = deflate(&content)?;
-    Ok((8, crc, stored, content.len() as u64))
+    Ok(EntryPayload { method: 8, crc32: crc, stored, uncomp_size: content.len() as u64 })
 }
 
 /// 1 エントリを body へ書き（LFH + データ）、CD 用情報を `placed` に積む。
 /// 32 ビット ZIP の表現範囲を超えたら [`CommitError::TooLarge`]。
-#[allow(clippy::too_many_arguments)]
 fn place_entry(
     body: &mut Vec<u8>,
-    placed: &mut Vec<(u64, u16, u32, u64, u64, Vec<u8>)>,
-    method: u16,
-    crc: u32,
-    stored: &[u8],
-    uncomp_size: u64,
+    placed: &mut Vec<PlacedEntry>,
+    payload: &EntryPayload,
     name: &[u8],
 ) -> Result<(), CommitError> {
-    let comp_size = stored.len() as u64;
-    let lho = body.len() as u64;
-    if lho > u32::MAX as u64 || comp_size > u32::MAX as u64 || uncomp_size > u32::MAX as u64 {
+    write_placed(body, placed, body.len() as u64, payload, name)
+}
+
+/// [`place_entry`] / [`place_appended`] の共通部。`lho`（出力先頭からの絶対
+/// オフセット）に LFH + データを書き、CD 用レコードを積む。両者の違いは
+/// INCREMENTAL が追記ベースを足すかどうかだけ。
+fn write_placed(
+    body: &mut Vec<u8>,
+    placed: &mut Vec<PlacedEntry>,
+    lho: u64,
+    payload: &EntryPayload,
+    name: &[u8],
+) -> Result<(), CommitError> {
+    let entry = PlacedEntry::new(lho, payload, name);
+    if entry.local_header_offset > u32::MAX as u64
+        || entry.comp_size > u32::MAX as u64
+        || entry.uncomp_size > u32::MAX as u64
+    {
         return Err(CommitError::TooLarge);
     }
-    write_lfh(body, method, crc, comp_size, uncomp_size, name);
-    body.extend_from_slice(stored);
-    placed.push((lho, method, crc, comp_size, uncomp_size, name.to_vec()));
+    write_lfh(body, &entry);
+    body.extend_from_slice(&payload.stored);
+    placed.push(entry);
     Ok(())
 }
 
 /// 正規形のローカルファイルヘッダ（extra field なし）を書く。
-fn write_lfh(out: &mut Vec<u8>, method: u16, crc: u32, comp: u64, uncomp: u64, name: &[u8]) {
+fn write_lfh(out: &mut Vec<u8>, e: &PlacedEntry) {
     push_u32(out, LFH_SIG);
     push_u16(out, 20); // version needed
     push_u16(out, 0); // flags
-    push_u16(out, method);
+    push_u16(out, e.method);
     push_u16(out, 0); // mod time
     push_u16(out, 0); // mod date
-    push_u32(out, crc);
-    push_u32(out, comp as u32);
-    push_u32(out, uncomp as u32);
-    push_u16(out, name.len() as u16);
+    push_u32(out, e.crc32);
+    push_u32(out, e.comp_size as u32);
+    push_u32(out, e.uncomp_size as u32);
+    push_u16(out, e.name.len() as u16);
     push_u16(out, 0); // extra len
-    out.extend_from_slice(name);
+    out.extend_from_slice(&e.name);
 }
 
 /// 正規形の Central Directory ファイルヘッダ（extra / comment なし）を書く。
-#[allow(clippy::too_many_arguments)]
-fn write_cdfh(out: &mut Vec<u8>, method: u16, crc: u32, comp: u64, uncomp: u64, lho: u64, name: &[u8]) {
+fn write_cdfh(out: &mut Vec<u8>, e: &PlacedEntry) {
     push_u32(out, CDFH_SIG);
     push_u16(out, 20); // version made by
     push_u16(out, 20); // version needed
     push_u16(out, 0); // flags
-    push_u16(out, method);
+    push_u16(out, e.method);
     push_u16(out, 0); // mod time
     push_u16(out, 0); // mod date
-    push_u32(out, crc);
-    push_u32(out, comp as u32);
-    push_u32(out, uncomp as u32);
-    push_u16(out, name.len() as u16);
+    push_u32(out, e.crc32);
+    push_u32(out, e.comp_size as u32);
+    push_u32(out, e.uncomp_size as u32);
+    push_u16(out, e.name.len() as u16);
     push_u16(out, 0); // extra len
     push_u16(out, 0); // comment len
     push_u16(out, 0); // disk start
     push_u16(out, 0); // internal attrs
     push_u32(out, 0); // external attrs
-    push_u32(out, lho as u32);
-    out.extend_from_slice(name);
+    push_u32(out, e.local_header_offset as u32);
+    out.extend_from_slice(&e.name);
 }
 
 #[inline]
