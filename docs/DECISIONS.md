@@ -901,9 +901,33 @@ C-3. **Crash injection テスト** — 設計の crash-before/crash-after 境界
 - IMPLEMENTATION_NOTES.md「全クラッシュ境界で stock extractor が clean に
   open できる」プロパティテスト — C-3 はこれの第一歩。
 
-### 未了 (本 ADR は計画記録なので、すべて「これから着手」)
+### Phase A の実施結果 (2026-08-31 追記)
 
-- A-1 / A-2 / A-3 の refactor PR 群 (M4 残務と並行)
+Phase A は完了した (ブランチ `adr0015/phase-a`、`cargo test` 203 緑 /
+windows-latest + ubuntu-latest)。計画からの差分:
+
+- **A-1**: `WriteCtx` / `ReadCtx` の 2 つではなく `EntryCtx` 1 つに統合した。
+  `write_into` と `read_dirty` が要る文脈 (archive / vmidx_image / path /
+  source / original_size) が完全に一致し、分ける理由が無かったため。
+  `read_cached` は性質が違うので `PageIo{cache, cfg}` を別に立てた。
+  対象 3 関数は 9/9/8 引数 → 5/5/7 引数。`fill_run` も 8 → 7。
+- **A-2**: `PlacedEntry` の offset フィールドは `archive::CdEntry` に合わせて
+  `local_header_offset` とした。加えて出力 1 エントリの中身を表す
+  `EntryPayload` を分け、`place_entry` / `place_appended` の重複本体を
+  `write_placed` に寄せた。
+- **A-3**: `provider/deflate.rs:421` の `panic!` は **テスト経路**だった
+  (`#[test] fn seek_via_checkpoint_matches_original` の中) ので変更不要。
+  `vmidx/checkpoint.rs` の `unreachable!` は不変条件を doc 化した。
+- **副産物**: `too_many_arguments` は 3 件とも消えた。ただし clippy を CI に
+  入れた結果、**それ以外の既存指摘が lib 9 件 + lib test 27 件**あることが
+  判明した (collapsible_if / needless_update / needless_option_as_deref /
+  useless_vec / manual_is_multiple_of / doc_lazy_continuation ほか)。
+  Phase A の想定外だったため CI では clippy を**非ブロッキング**にしてある。
+  → **A-5 として棚卸し対象に追加**する (Phase B の前でも後でもよい)。
+
+### 未了
+
+- **A-5** clippy 既存指摘 36 件の棚卸しと、CI での `-D warnings` ブロッキング化
 - B-1 の棚卸し CSV と ADR 0015-supplement
 - C-1 proptest 導入 + 最初のラウンドトリップテスト
 - C-2 / C-3 は C-1 の経験を見てから判断
