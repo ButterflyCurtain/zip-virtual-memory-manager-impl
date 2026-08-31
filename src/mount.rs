@@ -6,7 +6,7 @@
 //! ソース ZIP (ページキャッシュ経由)」。書き込み経路は [`write_into`]、その
 //! 読み戻しは [`read_dirty`] が担う:
 //!
-//! - [`read_cached`]: 要求範囲の各ページをキャッシュから取り、ミスしたら
+//! - [`read_cached`] — 要求範囲の各ページをキャッシュから取り、ミスしたら
 //!   [`fill_run`] で目標ページ + read-ahead ページ分をまとめて展開・充填する。
 //! - [`fill_run`]（キャッシュミス時）:
 //!   1. vmidx を `lookup(path)` してエントリを引く（呼び出し側で済ませて渡す）
@@ -719,13 +719,13 @@ pub fn write_into(
             // ミス: ソースから COW して Tier 1 に載せる。created（source=None）や
             // ソース末尾超えはゼロ（バッファは既にゼロ初期化）。
             let mut buf = vec![0u8; page_size as usize];
-            if let Some(src) = source {
-                if page_start < original_size {
-                    let avail = ((original_size - page_start).min(page_size)) as usize;
-                    let orig = read_entry(archive, vmidx_image, src, page_start, avail)
-                        .map_err(|e| WriteError::Read(Box::new(e)))?;
-                    buf[..avail].copy_from_slice(&orig);
-                }
+            if let Some(src) = source
+                && page_start < original_size
+            {
+                let avail = ((original_size - page_start).min(page_size)) as usize;
+                let orig = read_entry(archive, vmidx_image, src, page_start, avail)
+                    .map_err(|e| WriteError::Read(Box::new(e)))?;
+                buf[..avail].copy_from_slice(&orig);
             }
             apply_write(&mut buf, page_start, offset, end, data);
             diff.insert_page(path, page, buf);
@@ -734,11 +734,11 @@ pub fn write_into(
     diff.set_logical_size(path, new_logical);
 
     // 書き込み後、上限超過なら最古から Tier 2 へ退避する。
-    if let Some(t2) = tier2.as_deref_mut() {
-        if diff.over_limit() {
-            t2.spill_over_limit(diff)
-                .map_err(|e| WriteError::Spill(e.to_string()))?;
-        }
+    if let Some(t2) = tier2
+        && diff.over_limit()
+    {
+        t2.spill_over_limit(diff)
+            .map_err(|e| WriteError::Spill(e.to_string()))?;
     }
     Ok(())
 }
@@ -1220,7 +1220,6 @@ mod tests {
             page_size: 4096,
             read_ahead_pages: 8,
             cache_bytes: 16 << 20,
-            ..PageConfig::default()
         };
         let zip = deflate_zip(&data);
         let params = BuildParams {
@@ -1256,7 +1255,6 @@ mod tests {
             page_size: 4096,
             read_ahead_pages: 0,
             cache_bytes: 16 << 20,
-            ..PageConfig::default()
         };
         let zip = deflate_zip(&data);
         let params = BuildParams {
@@ -1276,7 +1274,6 @@ mod tests {
             page_size: 4096,
             read_ahead_pages: 8,
             cache_bytes: 16 << 20,
-            ..PageConfig::default()
         };
         let zip = deflate_zip(&data);
         let params = BuildParams::default();
@@ -1309,7 +1306,6 @@ mod tests {
             page_size: 4096,
             read_ahead_pages: 8,
             cache_bytes: 2 * 4096,
-            ..PageConfig::default()
         };
         let zip = deflate_zip(&data);
         let params = BuildParams {
@@ -1337,7 +1333,6 @@ mod tests {
             page_size: 16,
             read_ahead_pages: 2,
             cache_bytes: 16 << 20,
-            ..PageConfig::default()
         };
         let mount = Mount::open_with_page_config(&zip, &BuildParams::default(), cfg).expect("open");
         assert_eq!(mount.read("notes.txt", 0, store.len()).unwrap(), store);
@@ -1636,10 +1631,10 @@ mod tests {
         let params = BuildParams::default();
         let mount = Mount::open_with_page_config(&zip, &params, cfg).expect("open");
         // まず dirty にして全域ページを Tier 1 に載せる。
-        mount.write("a.txt", 0, &vec![b'Z'; 20]).unwrap();
+        mount.write("a.txt", 0, &[b'Z'; 20]).unwrap();
         mount.truncate("a.txt", 3).unwrap();
         mount.truncate("a.txt", 20).unwrap();
-        let expect: Vec<u8> = b"ZZZ".iter().copied().chain(std::iter::repeat(0).take(17)).collect();
+        let expect: Vec<u8> = b"ZZZ".iter().copied().chain(std::iter::repeat_n(0, 17)).collect();
         assert_eq!(mount.read("a.txt", 0, 20).unwrap(), expect);
     }
 

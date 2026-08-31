@@ -349,7 +349,7 @@ mod tests {
     }
 
     /// `offset` 以下で最大の uncompressed_offset を持つチェックポイントを採る。
-    fn nearest<'a>(cps: &'a [Checkpoint], offset: u64) -> Option<&'a Checkpoint> {
+    fn nearest(cps: &[Checkpoint], offset: u64) -> Option<&Checkpoint> {
         cps.iter()
             .filter(|c| c.uncompressed_offset() <= offset)
             .max_by_key(|c| c.uncompressed_offset())

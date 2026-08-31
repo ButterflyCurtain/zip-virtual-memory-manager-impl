@@ -547,8 +547,9 @@ mod tests {
         let mut image = build_sample();
         let v = Vmidx::parse(&image).expect("parse ok");
         // 0 番レコードの reserved 近辺の 1 バイトを反転（name_hash には触れない）。
+        // `v` は Drop を持たない借用ビューなので、最後の使用（直上の行）で
+        // 借用が終わる。明示的な drop は不要。
         let off = v.header().entry_table_offset as usize + 80; // reserved2 領域
-        drop(v);
         image[off] ^= 0x01;
         let v = Vmidx::parse(&image).expect("header still parses");
         match v.entry(0) {

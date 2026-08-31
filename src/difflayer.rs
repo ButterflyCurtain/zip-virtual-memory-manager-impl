@@ -229,15 +229,15 @@ impl DiffLayer {
             let Some((_, (entry_name, page_index))) = self.order.pop_first() else {
                 break; // Tier 1 が空（dirty_limit < page_size でもここで止まる）
             };
-            if let Some(e) = self.entries.get_mut(&entry_name) {
-                if let Some(data) = e.pages.remove(&page_index) {
-                    self.dirty_current -= self.page_size;
-                    victims.push(SpilledPage {
-                        entry_name,
-                        page_index,
-                        data,
-                    });
-                }
+            if let Some(e) = self.entries.get_mut(&entry_name)
+                && let Some(data) = e.pages.remove(&page_index)
+            {
+                self.dirty_current -= self.page_size;
+                victims.push(SpilledPage {
+                    entry_name,
+                    page_index,
+                    data,
+                });
             }
         }
         victims
@@ -280,11 +280,11 @@ impl DiffLayer {
         let dropped = before - e.pages.len() as u64;
         // 境界ページの末尾をゼロ化（new_size がページ境界でない場合のみ）。
         let tail = (new_size % ps) as usize;
-        if tail != 0 {
-            if let Some(buf) = e.pages.get_mut(&(new_size / ps)) {
-                for b in &mut buf[tail..] {
-                    *b = 0;
-                }
+        if tail != 0
+            && let Some(buf) = e.pages.get_mut(&(new_size / ps))
+        {
+            for b in &mut buf[tail..] {
+                *b = 0;
             }
         }
         self.dirty_current = self.dirty_current.saturating_sub(dropped * ps);

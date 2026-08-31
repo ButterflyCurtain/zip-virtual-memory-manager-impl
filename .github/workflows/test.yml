@@ -56,13 +56,10 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
-  # clippy は現状 **非ブロッキング**。初回導入時点で lib 12 件 + lib test 30 件の
-  # 既存指摘があり（collapsible_if / needless_update / useless_vec /
-  # manual_is_multiple_of / doc_lazy_continuation ほか）、これを全部直すのは
-  # ADR 0015 Phase A の範囲を超える。棚卸しが済んだら -D warnings をブロッキングに
-  # 戻す。rustc の「警告なし」基準（HANDOFF）は cargo test 側で担保されている。
+  # clippy はブロッキング（ADR 0015 A-5 で既存指摘 28 件を解消済み）。
+  # rustc の「警告なし」基準（HANDOFF）と揃えて、以降の劣化をここで止める。
   clippy:
-    name: clippy (non-blocking)
+    name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,5 +75,4 @@ jobs:
           shared-key: clippy-ubuntu-latest
 
       - name: cargo clippy
-        continue-on-error: true
         run: cargo clippy --locked --all-targets -- -D warnings

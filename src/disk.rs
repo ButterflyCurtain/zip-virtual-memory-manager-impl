@@ -868,7 +868,7 @@ impl FileMount {
         }
         let tick = self.miss_tick.get().wrapping_add(1);
         self.miss_tick.set(tick);
-        if tick % self.estale_interval != 0 {
+        if !tick.is_multiple_of(self.estale_interval) {
             return Ok(());
         }
         match fs::metadata(&self.archive_path) {
@@ -1377,7 +1377,6 @@ mod tests {
             page_size: 8,
             read_ahead_pages: 0,
             cache_bytes: 16 << 20,
-            ..PageConfig::default()
         };
         FileMount::open_with_page_config(zip_path, cfg).expect("open")
     }
@@ -1558,7 +1557,7 @@ mod tests {
 
         // 上限 2 ページ = 16B。64B（8 ページ）書くと 6 ページが Tier 2 へ spill。
         let m = open_spill(&zip_path, 2 * 8);
-        m.write("data.bin", 0, &vec![0xFFu8; 64]).unwrap();
+        m.write("data.bin", 0, &[0xFFu8; 64]).unwrap();
         assert!(vmdirty_path(dir.path(), "s.zip").exists(), "spill creates vmdirty");
 
         // Tier 1（常駐）と Tier 2（spill 済み）双方から正しく読み戻せる。
@@ -1634,7 +1633,7 @@ mod tests {
         // セッション 1: 書いて flush（durable）→ commit せずに「クラッシュ」（drop）。
         {
             let m = open_spill(&zip_path, 2 * 8);
-            m.write("data.bin", 0, &vec![0x11u8; 64]).unwrap();
+            m.write("data.bin", 0, &[0x11u8; 64]).unwrap();
             m.flush().expect("flush");
         }
         // vmdirty は残っている（commit していない）。
@@ -1662,7 +1661,7 @@ mod tests {
         // セッション 1: spill するが flush しない（COMMIT MARKER 無し）→ crash。
         {
             let m = open_spill(&zip_path, 0);
-            m.write("data.bin", 0, &vec![0x22u8; 64]).unwrap();
+            m.write("data.bin", 0, &[0x22u8; 64]).unwrap();
         }
 
         // 既定ハンドラ: last_commit_seq==0 かつ未コミットあり → Abort = RecoveryRequired。
@@ -1688,11 +1687,11 @@ mod tests {
 
         {
             let m = open_spill(&zip_path, 2 * 8);
-            m.write("data.bin", 0, &vec![0x33u8; 64]).unwrap();
+            m.write("data.bin", 0, &[0x33u8; 64]).unwrap();
             m.flush().expect("flush");
         }
         // ソース ZIP をサイズの違う内容へ差し替える（cd_hash / size 不一致 = CONFLICT）。
-        replace_archive(&zip_path, store_zip(&[("data.bin", &vec![0u8; 80])]));
+        replace_archive(&zip_path, store_zip(&[("data.bin", &[0u8; 80])]));
 
         // 既定ハンドラは CONFLICT で Abort。
         let res = FileMount::open_with_options(&zip_path, spill_options(2 * 8));
@@ -1944,7 +1943,7 @@ mod tests {
     fn compaction_shrinks_journal_and_preserves_state() {
         let dir = TempDir::new();
         let zip_path = dir.path().join("comp.zip");
-        fs::write(&zip_path, store_zip(&[("a.bin", &vec![0u8; 8])])).unwrap();
+        fs::write(&zip_path, store_zip(&[("a.bin", &[0u8; 8])])).unwrap();
 
         let m = open_spill(&zip_path, 0); // 即 spill
         // 同じページを繰り返し書く → 旧 DATA RECORD が dead として積む。
@@ -1971,7 +1970,7 @@ mod tests {
     fn compaction_result_survives_crash_and_recovers() {
         let dir = TempDir::new();
         let zip_path = dir.path().join("compr.zip");
-        fs::write(&zip_path, store_zip(&[("a.bin", &vec![0u8; 8])])).unwrap();
+        fs::write(&zip_path, store_zip(&[("a.bin", &[0u8; 8])])).unwrap();
 
         {
             let m = open_spill(&zip_path, 0);

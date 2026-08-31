@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(t.read_page("a", 0).unwrap().unwrap(), vec![0x01; 8]);
 
         // Tier 2 ページへ write hit: 新しい内容で上書き。
-        t.write_hit("a", 0, &vec![0x99; 8], 8).unwrap();
+        t.write_hit("a", 0, &[0x99; 8], 8).unwrap();
         assert_eq!(t.read_page("a", 0).unwrap().unwrap(), vec![0x99; 8]);
 
         // 回復 walk では sequence 順に 2 レコード（古い→新しい）。
