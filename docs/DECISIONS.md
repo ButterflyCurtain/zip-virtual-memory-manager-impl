@@ -927,7 +927,259 @@ windows-latest + ubuntu-latest)。計画からの差分:
 
 ### 未了
 
-- **A-5** clippy 既存指摘 36 件の棚卸しと、CI での `-D warnings` ブロッキング化
+- ~~**A-5** clippy 既存指摘の棚卸しと、CI での `-D warnings` ブロッキング化~~
+  → **完了**。28 件を解消し、CI の clippy をブロッキングに戻した（`ef4563c` / `66792c0`）。
 - B-1 の棚卸し CSV と ADR 0015-supplement
 - C-1 proptest 導入 + 最初のラウンドトリップテスト
 - C-2 / C-3 は C-1 の経験を見てから判断
+
+> **実施順の変更（ADR 0016）**: 本 ADR は Phase B → Phase C の順で書いているが、
+> **ADR 0016 で C → B に入れ替えた**。601 箇所の unwrap/expect を人手で三分類するより、
+> proptest / fuzz に「実際に踏める unwrap」を先に探させたほうが安く、かつ正確なため。
+> 現在の本筋は C-3（クラッシュ注入テスト）。
+
+---
+
+## 0016. 開発順序の組み替え: 門 → 証明 → 構造 → 機能
+
+- 日付: 2026-09-01
+- ステータス: 採用
+- 文脈: 二つの事情が重なった。(1) 開発機の `D:` ドライブが消失し、`CARGO_HOME=D:\cargo` /
+  `RUSTUP_HOME=D:\rustup` が宙吊りになったため**ローカルに Rust ツールチェーンが無い**
+  （`C:` の空きも 1.4 GB で入れ直せない）。以後の検証は GitHub Actions が唯一の経路になった。
+  (2) ADR 0015 が「crash-safe を謳うには test infra と panic 面が浅い」という指摘を
+  棚卸し計画として受け止めたまま、実施順は「M4 刻み4 が次の本筋」のままになっていた。
+  この機に、何を先にやるべきかを原則から引き直す。
+
+### 決定
+
+**原則: 主張は、拡張する前に裏打ちする。** このリポジトリの主張は「ZIP をクラッシュ
+セーフな仮想メモリのバッキングストアにする」の一点なので、順序はそこから決まる。
+
+0. **門**: CI（`cargo test` × windows/ubuntu + clippy `-D warnings`）。以降のコードが
+   劣化しない土台。→ **完了**（ADR 0015 Phase A + A-5）。
+1. **クラッシュ注入テスト（ADR 0015 C-3）**。← 現在ここ
+2. **proptest（C-1）**: `archive::parse` が任意バイト列で panic しないこと。
+3. **unwrap/expect 棚卸し（ADR 0015 Phase B）**。
+4. **lock 層（Concurrent Access）**。
+5. **Zip64 出力**（`commit.rs` の 4 箇所）。
+6. **UNTRUSTED ARCHIVES 防御**（`ArchiveLimits` + `parse_with_limits`）。
+7. **機能: M4 刻み4（dedup）/ M5（ADR 0014 の VMM-native in-place）**。
+8. **example CLI / ドキュメント**。
+
+### 理由
+
+- **1 が最初に来る理由**: 中心的な主張がクラッシュ安全なのに、実際にクラッシュ境界で
+  落として再 open するテストが 1 つも無かった（203 テストは全部 in-process unit で、
+  `tests/` ディレクトリすら無い）。ここに投資すると**以降の全機能（dedup / in-place /
+  lock）が同じハーネスで検証できる**ので、投資が後段すべてに効く。
+- **4 が機能（7）より前に来る理由**: lock 層は open / commit / 回復の各フローに
+  割り込む**構造に触る最後の大物**。先に機能を積むと lock 導入で全部書き直しになる。
+- **8 が最後でよい理由**: 1 の integration test が実質「動く証拠」になるので、
+  見せるための工数はそこで大半が済んでいる。
+
+### 既存計画との差分（2 点）
+
+1. **ADR 0015 の B → C を C → B に入れ替えた。** 601 箇所の unwrap/expect を人手で
+   三分類するより、proptest / fuzz に「実際に踏める unwrap」を先に探させたほうが安く、
+   かつ正確。機械が実弾を教えてくれた後で、残りを机上で分類する。
+2. **M4 刻み4 を「次の本筋」から 7 番へ下げた。** 土台が固まる前に機能を足すと
+   1 と 4 で全部触り直しになるため。刻み1-3 が完了しているので中断による損失は無い。
+
+### 検証（この順序が正しかったことの実測）
+
+Step 1 に着手した初日に、**サイレントなデータ破損バグを 1 件発見・修正した**
+（`6612fcf` / `5ee4b61` の red テスト 2 本 → `9e4fd33` の修正）。
+`VmdirtyWriter::pos` の不変条件は「= 現在のファイル長」だが、
+`append_commit_marker` だけが `write_record` を通さず直接 `write_all` していたため、
+COMMIT MARKER 40 バイト分 `pos` が実位置より手前に取り残されていた。結果:
+
+1. marker 以降に追記した DATA RECORD の `data_offset` がずれ、Tier 2 の読み戻しが壊れる。
+2. commit は `rehydrate_into` でその索引を使ってページを Tier 1 へ戻し、`build_full` が
+   それを新しい ZIP に焼き込む。つまり**ユーザーデータの代わりにジャーナルの
+   レコードヘッダがアーカイブに入る**。実測で `[0x11; 16]` を書いた領域が
+   `[75, 144, 164, 211, 248, 221, 235, 6, ...]` になっていた。
+
+既存 203 テストが素通りしていたのは、**回復経路が無事だった**から。`read_vmdirty` の
+walk は実ファイル位置からオフセットを再計算するので、クラッシュ後に復元される状態は
+正しい。壊れるのは in-session の索引だけ、つまり「クラッシュしなかった場合」にだけ壊れる。
+修正は追記の出口を `append_raw(bytes, force_sync)` 1 本に統一し、`pos` を進める場所を
+そこだけに閉じ込めた（同じ迂回が二度と書けない形にした）。
+
+もし順序を組み替えず M4 刻み4 へ進んでいたら、このバグは dedup で増えた
+`write_hit` 経路の上に積み重なっていた。
+
+### 開発の回し方（ローカルに cargo が無い前提）
+
+- **コードを書いたら push して CI で確認する。** コンパイルエラーも CI で初めて分かる。
+- バグ修正は「**先に red なテストを push して再現を示し、次のコミットで直す**」。
+  ローカルで回せない以上、CI のログが唯一の証拠になる。
+- CI のキャッシュは 7 日参照が無いと evict されるので、週 1 の schedule で温存する。
+
+### 関連
+
+- ADR 0015: Phase A / A-5 は本 ADR の Step 0。B/C の順序は本 ADR で入れ替えた。
+- ADR 0017: Step 1 の監査から出た仕様矛盾の決着。
+- `HANDOFF.md` の「次の着手候補」は本 ADR に合わせて書き換えてある。
+
+### 未了
+
+- Step 1 の本体（fault injection の seam と、seam 不要のジャーナル異常系）。
+- Step 2 以降はすべて未着手。
+
+---
+
+## 0017. FULL commit のクラッシュ窓を commit intent で判定可能にする（設計仕様を修正する）
+
+- 日付: 2026-09-01
+- ステータス: 採用（設計リポ側の修正 + 実装の一般化。どちらも未着手）
+- 文脈: ADR 0016 Step 1（クラッシュ注入テスト）の前段として、設計仕様が定めるクラッシュ点と
+  再 open 時の期待状態を洗い出したところ、**仕様が自己矛盾している**箇所が見つかった。
+  HANDOFF に「残」として挙がっていた「アーカイブ durable 後・vmdirty 削除 durable 前」の
+  クラッシュ窓（新アーカイブ + 旧 vmdirty で CONFLICT に見える）が、まさにその箇所。
+
+### 発見: 仕様が三通りの答えを持っている
+
+1. **vmdirty Journal Spec の決定木と provenance 節 → CONFLICT。**
+   `open()` は最初の関門で fingerprint（`source_file_size` / `source_inode` /
+   `source_cd_hash`）を照合し、「Fingerprint mismatches → vmdirty is stale (source
+   changed). CONFLICT state. Caller must resolve.」。決定木では
+   `offer: discard() | abort()` のみ。**現在の実装はこちら**（`DefaultRecoveryHandler`
+   → `Abort` → `FileMountError::RecoveryRequired`）。
+2. **本体仕様の BACKGROUND COMMIT → replay してよい。**
+   「Crash after RENAME, before vmdirty deletion: … Recovery at next open() **applies
+   vmdirty pages to the compacted archive.zip. This is correct**: FULL compaction does
+   not alter logical content; any dirty page … results in an idempotent overwrite with
+   the same data.」
+3. **本体仕様の同期 FULL commit → 沈黙。**
+   「Crash before rename / Crash after rename」しか書いておらず、生き残った vmdirty に
+   ついて何も言わない。
+
+FULL commit の `rename` は size / inode / cd_hash の**三つとも**変えるので、(1) の関門が
+必ず先に発火する。**(2) は (1) の下では到達不能**であり、両者は調停されていない。
+
+### 消去法: 先に潰れる選択肢
+
+**(B) 順序を変えて窓を無くす — 原理的に不可能。**
+vmdirty を先に削除してから rename すると、その間のクラッシュで dirty ページが失われる
+（commit 時点で `rehydrate_into` は済んでいるが、その中身はメモリ上にしかない）。
+`vmdirty.bak.{gen}` へ先に rename する変種も同じで、「旧アーカイブ + .bak だけ」の状態を
+次の open は clean な旧アーカイブとしか読めず、dirty セッションが黙って消える。
+**独立した 2 つのオブジェクトを一緒に変えねばならない以上、intent レコード無しには解けない。**
+
+**(C) fingerprint 関門を緩めて冪等 replay を許す（＝仕様 (2) を採る）— 不健全。**
+
+- ページについては (2) の主張は正しい。既に焼かれたページを同じ内容で上書きするだけ。
+- しかしジャーナルには **METADATA レコード（CREATE / REMOVE / RENAME / RESIZE）**が入る。
+  RENAME を rename 済みのアーカイブへ replay すると、alias が引くべきソース名が既に無い。
+  RESIZE-shrink も source high-water の意味論があり、再適用が無害とは言えない。
+  **(2) の段落はエントリ操作（④a/④b、ADR 0010）が入る前に書かれており、前提が古い。**
+- 加えて fingerprint 関門を一般に緩めると「他人が編集したアーカイブに stale なページを
+  適用する」という、関門が防いでいた当の事故を招く。「自分の commit による変化」だけを
+  緩めるにはそれを識別する手段が要る ＝ 結局 (A) に戻る。
+
+**(A2) アーカイブ側に commit epoch を持たせる — 却下。**
+権威ある場所はアーカイブ自身なので EOCD コメント欄に置くことになるが、ZIP として合法でも
+ユーザーから見えるメタデータを汚し、素の再構築とバイト同一でなくなる。
+
+**(A3) vmdirty ヘッダの flag を「superseded」に落としてから rename — 却下。**
+flag を立てた直後・rename 前のクラッシュで、実際には superseded でないジャーナルを
+superseded と印してしまいデータを失う。「commit 進行中、期待結果は X」と書くならそれは
+(A1) そのもの。なお header CRC が flags を覆うため、in-place な flag 書き換えと CRC の
+関係は仕様が沈黙している（`RECOVERY_PENDING` ビットに既に存在する瑕疵）。
+
+### 決定
+
+**(A1) アーカイブを変える前に、期待される変化後の状態を durable に記録する**
+（write-ahead intent）。`open()` の判断を 1 ビットの fingerprint 比較から 3 分岐にする。
+
+| 実アーカイブの状態 | 判定 |
+|---|---|
+| = intent が記録した**変化後** fingerprint | commit は完了した → ジャーナルを捨てて CLEAN でマウント（**利用者への質問不要**） |
+| = intent が記録した**変化前** fingerprint | commit は起きなかった → 通常の回復プロトコル |
+| どちらでもない | 本物の CONFLICT（外部改変）→ 従来どおり discard / abort を提示 |
+
+**窓が無くなるのではなく、窓の中のどの状態も判定可能になる**、という性質の解決である。
+intent の書き込み自体にもクラッシュ点はあるが、その範囲のどの状態も曖昧でなくなる。
+
+### intent レコードに載せるもの
+
+- magic
+- **変化前** fingerprint（`source_file_size` + `source_cd_hash`）
+- **変化後** fingerprint（同上。FULL は `build_full` がメモリ上に新 ZIP を作り終えているので
+  rename 前に算出できる。追加 I/O は不要）
+- モード（FULL / INCREMENTAL）
+- INCREMENTAL 用の `old_len` / `new_len`（truncate ロールバックに要る。ADR 0012 の現行 intent）
+- CRC-32C
+
+`inode` を載せないのは、Windows 実装で `inode = 0` 固定であり（`HANDOFF.md` の gotcha）、
+移植性のある判定材料にならないため。size + cd_hash で十分。
+
+### 設計リポ側の編集箇所
+
+1. `SIDECAR FILES` のファイル一覧に intent ファイルを追加（寿命と orphan 規則つき）。
+   現行一覧は `vmidx` / `vmlock` / `vmdirty` / `vmdirty.bak.{id}` / `vmdirty.compact` /
+   `archive.new.zip` のみ。
+2. レコード形式の新節（上記フィールド）。
+3. `commit() FLOW`: 「intent を書く → fsync → 親 dir fsync → **それから**アーカイブを変える」
+   というバリアを明記する。
+4. Journal Spec Section 3 の決定木: fingerprint 関門の**前**に intent チェックを置き、
+   上の 3 分岐にする。
+5. Journal Spec の provenance 節: 「Fingerprint mismatches → CONFLICT」を
+   「→ intent を参照し、どちらの fingerprint とも一致しないときだけ CONFLICT」へ。
+6. BACKGROUND COMMIT の「after RENAME」段落を intent の言葉で書き直す。
+   **「冪等だから replay してよい」という主張は落とす**（上記 (C) の理由により、
+   エントリ操作がある今は成り立たない）。
+
+### 実装への影響
+
+- 既存の `commit.intent`（ADR 0012、INCREMENTAL 専用・長さだけ）を**この形式へ一般化**し、
+  FULL commit（`durable_replace`）も同じバリアを通す。
+- `open_with_recovery` の先頭で行っている「intent を読んで truncate ロールバック」を、
+  3 分岐の判定に置き換える。
+- rename の前に durability バリアが 1 本増える。
+
+### 副次的に閉じるもの
+
+1. **`completed` 判定の穴。** 現行は `size == new_len && Archive::parse().is_ok()` で
+   判定しているが、`find_eocd` は後方走査なので、**末尾がゼロだと旧 EOCD を拾って
+   parse が通り、誤って「完了」と判定して vmdirty を捨てる**（＝ロールバックすべき
+   ケースをロールフォワードしてしまう）。cd_hash 一致を条件にすればゼロ末尾は弾かれる。
+2. **未記録の設計差分。** `commit.intent` は ADR 0012 で実装が発明したもので、仕様の
+   サイドカー一覧に存在しない。本 ADR の編集でこの差分自体が解消される。
+
+### 設計リポを触る方針について
+
+`SPEC_DIVERGENCE.md` は「**意図的な差分**を実装側に残す」ための場所であって、
+**仕様側の欠陥・自己矛盾はここに溜めない**。上流を直す。前例として DEFLATE
+チェックポイントの `bits` 追加（設計リポ `4aa0aa0`）と、in-place commit の CRC-32
+maintenance 節の追加（同 `406f558`、ADR 0014）がある。本件は後者と同種で、
+仕様が自分自身と矛盾している以上、実装側に「差分」として記録しても意味を成さない。
+
+### 同じ監査で挙がった別件（本 ADR の対象外・要対応）
+
+1. **orphan `archive.new.zip` が `open()` で削除されない。** 仕様は本体・Journal Spec の
+   2 箇所で「無ければ silently remove」と要求している。`vmdirty.compact` の掃除は
+   実装済みだが `.new` だけ抜けている。1 行修正で済む。
+2. commit 後に vmidx の fingerprint を更新しない（仕様は refresh を要求）。vmidx は
+   cache なので安全側だが、次回 open で索引全体を作り直すコストを払っている。
+3. `.vmm` の `mkdir` 後に親 dir fsync をしていない（仕様は要求）。
+4. compaction の `rename` 失敗時、実装は temp パスへジャーナリングを続ける
+   （仕様は沈黙）。その後のクラッシュで書き込みが失われる。
+
+### 関連
+
+- ADR 0012: `commit.intent` の初出（INCREMENTAL 専用）。本 ADR はその一般化。
+- ADR 0010: エントリ操作（④a/④b）。(C) が成り立たなくなった原因。
+- ADR 0007: `O_DSYNC` → `sync_data()`。durability バリアの実現手段。
+- ADR 0016: この監査を Step 1 として位置づけた順序。
+
+### 未了
+
+- 設計リポ側の編集 1〜6。
+- 実装側の一般化（intent 形式、FULL への適用、3 分岐判定）。
+- 上記「別件」1〜4。
+- 監査で作ったクラッシュ点カタログ（(a) INCREMENTAL 9 点 / (b) FULL 8 点 /
+  (c) ジャーナル 11 点 / (d) compaction 9 点）をテストへ落とす作業。seam 不要で書けるものが
+  多く（ジャーナルの torn record / 壊れヘッダ / marker 無し / 空ジャーナル、compaction の
+  orphan 掃除）、そこから着手する。
