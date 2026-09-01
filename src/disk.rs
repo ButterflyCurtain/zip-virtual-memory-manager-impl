@@ -761,6 +761,8 @@ impl FileMount {
             },
         )?;
 
+        fault_point("full:after_intent")?;
+
         let tmp = commit_tmp(&self.archive_path);
         durable_replace(&tmp, &self.archive_path, &new_zip)?;
 
@@ -852,14 +854,18 @@ impl FileMount {
         fs::create_dir_all(&sidecar)?;
         write_commit_intent(&sidecar, &intent)?;
 
+        fault_point("inc:after_intent")?;
+
         // 3. アーカイブ末尾へ追記して fsync（pure append なので親 dir fsync は不要、
         //    サイズ + データは sync_all が durable 化）。
         {
             let mut f = fs::OpenOptions::new().write(true).open(&archive_path)?;
             f.seek(SeekFrom::Start(old_len))?;
             f.write_all(&appended)?;
+            fault_point("inc:after_append_write")?;
             f.sync_all()?;
         }
+        fault_point("inc:after_append_sync")?;
 
         // 4. commit point: dirty 状態は新アーカイブに在る → vmdirty を捨て、最後に
         //    INTENT を消す（順序の理由は [`finish_commit_cleanup`]）。
@@ -1093,6 +1099,65 @@ impl CommitIntent {
     }
 }
 
+/// 疑似クラッシュ注入（ADR 0016 Step 1）。テストビルドでのみ動く。
+///
+/// 耐久性バリア（write / sync / rename / unlink）の**手前**に [`fault_point`] を置き、
+/// 「N 個目のバリアを越えるところでプロセスが死んだ」状態を作る。実際に abort する
+/// 代わりに `Err` を返し、呼び出し元が `?` でそのまま脱出することでクラッシュ後の
+/// ディスク状態を再現する。
+///
+/// **これが妥当なのは、このクレートに後始末をする `Drop` 実装が無いから**
+/// （`FileMount` / `Tier2` / `VmdirtyWriter` のいずれも持たない）。エラー脱出と
+/// プロセス消滅がディスクに残す状態は等しい。将来 `Drop` で何かを消す実装を
+/// 足すなら、この前提は崩れる。
+///
+/// 一度発火したらカウンタは 0 のまま留まり、以降の全バリアが失敗する。これも
+/// クラッシュの模写として正しい（死んだ後に何かが起きることはない）。
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    use std::io;
+
+    thread_local! {
+        /// あと何個バリアを通したら死ぬか。`None` = 注入なし。
+        static COUNTDOWN: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// `pass` 個のバリアを通し、その次で死ぬ。
+    pub(crate) fn arm(pass: u32) {
+        COUNTDOWN.with(|c| c.set(Some(pass)));
+    }
+
+    /// 注入を解除する。テストは必ず解除してから後片付けを読むこと。
+    pub(crate) fn disarm() {
+        COUNTDOWN.with(|c| c.set(None));
+    }
+
+    pub(crate) fn point(label: &'static str) -> io::Result<()> {
+        COUNTDOWN.with(|c| match c.get() {
+            None => Ok(()),
+            Some(0) => Err(io::Error::other(format!("fault injected at {label}"))),
+            Some(n) => {
+                c.set(Some(n - 1));
+                Ok(())
+            }
+        })
+    }
+}
+
+/// 耐久性バリアの手前に置くチェックポイント。リリースビルドでは何もしない。
+#[cfg(test)]
+fn fault_point(label: &'static str) -> io::Result<()> {
+    fault::point(label)
+}
+
+/// 耐久性バリアの手前に置くチェックポイント。リリースビルドでは何もしない。
+#[cfg(not(test))]
+#[inline(always)]
+fn fault_point(_label: &'static str) -> io::Result<()> {
+    Ok(())
+}
+
 /// commit 成功後の後始末。**vmdirty を先に消してその削除を durable にしてから、
 /// INTENT を消す。**
 ///
@@ -1111,6 +1176,9 @@ fn finish_commit_cleanup(vmdirty_path: &Path, sidecar: &Path) {
     if vmdirty_path.exists() {
         let _ = fs::remove_file(vmdirty_path);
         let _ = fsync_parent_dir(vmdirty_path);
+    }
+    if fault_point("cleanup:after_vmdirty_unlink").is_err() {
+        return;
     }
     let intent_path = commit_intent_path(sidecar);
     let _ = fs::remove_file(&intent_path);
@@ -1183,10 +1251,13 @@ fn durable_replace(tmp: &Path, dst: &Path, data: &[u8]) -> io::Result<()> {
     {
         let mut f = File::create(tmp)?;
         f.write_all(data)?;
+        fault_point("full:after_tmp_write")?;
         // データ + メタデータ（サイズ）の双方を安定ストレージへ。
         f.sync_all()?;
     }
+    fault_point("full:after_tmp_sync")?;
     fs::rename(tmp, dst)?;
+    fault_point("full:after_rename")?;
     fsync_parent_dir(dst)?;
     Ok(())
 }
@@ -2367,6 +2438,120 @@ mod tests {
         assert_eq!(fs::metadata(&zip_path).unwrap().len(), old_len); // ガベージが消えた。
         assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
         assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL"); // 旧 + dirty を復元。
+    }
+
+    /// アーカイブ内の STORE エントリの生バイトを取り出す（`store_zip` /
+    /// `build_full` はどちらも STORE で出すので圧縮バイト = 論理内容）。
+    fn store_entry_bytes(zip: &[u8], name: &str) -> Vec<u8> {
+        let ar = Archive::parse(zip).expect("valid zip");
+        let e = ar
+            .entries()
+            .iter()
+            .find(|e| e.name == name.as_bytes())
+            .expect("entry present");
+        ar.entry_data(e).expect("entry data").to_vec()
+    }
+
+    /// **クラッシュ注入（ADR 0016 Step 1 の本体）**: FULL commit の耐久性バリアを
+    /// 手前から 1 つずつ落として、どこで死んでも壊れないことを確かめる。
+    ///
+    /// IMPLEMENTATION_NOTES が「唯一の不変条件」と呼ぶもの —— *どのクラッシュ点でも
+    /// `archive.zip` は普通の展開ソフトで clean に開けなければならない* —— を、
+    /// 自前の `Archive::parse` で近似して全バリアに対して主張する（第三者ツールでの
+    /// 検証は別途）。あわせて「中身は旧か新のどちらかで、中間は存在しない」ことと、
+    /// 「再 open が CONFLICT で詰まない」ことを見る。
+    ///
+    /// 最後の点は ADR 0017 の回帰でもある: intent が無かった頃は
+    /// `full:after_rename` で死ぬと「新アーカイブ + 旧 vmdirty」になり、指紋不一致で
+    /// `RecoveryRequired` に落ちていた。
+    #[test]
+    fn full_commit_survives_crash_at_every_barrier() {
+        const BARRIERS: u32 = 5; // after_intent / after_tmp_write / after_tmp_sync
+                                 // / after_rename / cleanup:after_vmdirty_unlink
+        let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
+
+        for n in 0..=BARRIERS {
+            let dir = TempDir::new();
+            let zip_path = dir.path().join("cr.zip");
+            fs::write(&zip_path, &orig).unwrap();
+
+            {
+                let m = open_spill(&zip_path, 0);
+                m.write("a.bin", 0, b"ZZ").unwrap();
+                fault::arm(n);
+                let _ = m.commit_full(); // 注入した点で Err になる（= そこで死んだ）
+                fault::disarm();
+            }
+
+            // 1) どの点で死んでも archive.zip は妥当な ZIP のまま。
+            let bytes = fs::read(&zip_path).unwrap();
+            assert!(
+                Archive::parse(&bytes).is_ok(),
+                "barrier {n}: archive.zip is not a valid ZIP after the crash"
+            );
+
+            // 2) 中身は旧か新のどちらか。中間状態は無い。
+            let content = store_entry_bytes(&bytes, "a.bin");
+            assert!(
+                content == b"ORIGINAL" || content == b"ZZIGINAL",
+                "barrier {n}: unexpected content {content:?}"
+            );
+
+            // 3) 再 open できる（CONFLICT で詰まない）。
+            let reopened = FileMount::open_with_options(&zip_path, spill_options(0));
+            assert!(
+                reopened.is_ok(),
+                "barrier {n}: reopen failed: {:?}",
+                reopened.err()
+            );
+            // 4) 置き去りの archive.zip.new は open が掃除する。
+            assert!(
+                !dir.path().join("cr.zip.new").exists(),
+                "barrier {n}: orphan archive.zip.new survived open()"
+            );
+        }
+    }
+
+    /// 同じことを INCREMENTAL commit のバリアに対して。追記が途中で切れた場合は
+    /// `pre_size` への巻き戻しで旧アーカイブに戻る（ADR 0012 + 0017）。
+    #[test]
+    fn incremental_commit_survives_crash_at_every_barrier() {
+        const BARRIERS: u32 = 3; // after_intent / after_append_write / after_append_sync
+        let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
+
+        for n in 0..=BARRIERS {
+            let dir = TempDir::new();
+            let zip_path = dir.path().join("ic.zip");
+            fs::write(&zip_path, &orig).unwrap();
+
+            {
+                let m = open_spill(&zip_path, 0);
+                m.write("a.bin", 0, b"ZZ").unwrap();
+                fault::arm(n);
+                let _ = m.commit_incremental();
+                fault::disarm();
+            }
+
+            // 再 open が巻き戻し / ロールフォワードを済ませてから中身を見る。
+            let reopened = FileMount::open_with_options(&zip_path, spill_options(0));
+            assert!(
+                reopened.is_ok(),
+                "barrier {n}: reopen failed: {:?}",
+                reopened.err()
+            );
+            drop(reopened);
+
+            let bytes = fs::read(&zip_path).unwrap();
+            assert!(
+                Archive::parse(&bytes).is_ok(),
+                "barrier {n}: archive.zip is not a valid ZIP after the crash"
+            );
+            let content = store_entry_bytes(&bytes, "a.bin");
+            assert!(
+                content == b"ORIGINAL" || content == b"ZZIGINAL",
+                "barrier {n}: unexpected content {content:?}"
+            );
+        }
     }
 
     /// **クラッシュ窓 b6（ADR 0017）**: FULL commit の `rename` が durable になった
