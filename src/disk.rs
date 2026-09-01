@@ -1111,36 +1111,43 @@ impl CommitIntent {
 /// プロセス消滅がディスクに残す状態は等しい。将来 `Drop` で何かを消す実装を
 /// 足すなら、この前提は崩れる。
 ///
-/// 一度発火したらカウンタは 0 のまま留まり、以降の全バリアが失敗する。これも
-/// クラッシュの模写として正しい（死んだ後に何かが起きることはない）。
+/// 発火は**ラベル指定**にしてある。「手前から N 個目」で数える方式にすると、
+/// バリアを 1 つ足しただけで既存テストが黙って別の点を試すようになる（テストは
+/// 通り続けるのに、意図した点を踏まなくなる）。ラベルで名指しすれば、点が増えても
+/// 各テストが何を試しているかは変わらない。
+///
+/// 一度発火したら同じラベルはその後も失敗し続ける。これもクラッシュの模写として
+/// 正しい（死んだ後に何かが起きることはない）。
 #[cfg(test)]
 pub(crate) mod fault {
     use std::cell::Cell;
     use std::io;
 
     thread_local! {
-        /// あと何個バリアを通したら死ぬか。`None` = 注入なし。
-        static COUNTDOWN: Cell<Option<u32>> = const { Cell::new(None) };
+        /// (狙うラベル, あと何回通過を見逃すか)。`None` = 注入なし。
+        static ARMED: Cell<Option<(&'static str, u32)>> = const { Cell::new(None) };
     }
 
-    /// `pass` 個のバリアを通し、その次で死ぬ。
-    pub(crate) fn arm(pass: u32) {
-        COUNTDOWN.with(|c| c.set(Some(pass)));
+    /// `label` の `nth` 回目（0 始まり）の通過で死ぬ。他のラベルは素通しする。
+    pub(crate) fn arm_at(label: &'static str, nth: u32) {
+        ARMED.with(|c| c.set(Some((label, nth))));
     }
 
     /// 注入を解除する。テストは必ず解除してから後片付けを読むこと。
     pub(crate) fn disarm() {
-        COUNTDOWN.with(|c| c.set(None));
+        ARMED.with(|c| c.set(None));
     }
 
     pub(crate) fn point(label: &'static str) -> io::Result<()> {
-        COUNTDOWN.with(|c| match c.get() {
-            None => Ok(()),
-            Some(0) => Err(io::Error::other(format!("fault injected at {label}"))),
-            Some(n) => {
-                c.set(Some(n - 1));
+        ARMED.with(|c| match c.get() {
+            Some((want, 0)) if want == label => {
+                Err(io::Error::other(format!("fault injected at {label}")))
+            }
+            Some((want, n)) if want == label => {
+                c.set(Some((want, n - 1)));
                 Ok(())
             }
+            _ => Ok(()),
         })
     }
 }
@@ -2440,6 +2447,25 @@ mod tests {
         assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL"); // 旧 + dirty を復元。
     }
 
+    /// FULL commit が通る耐久性バリア（実行順）。**なにも起きない場合**を最後に
+    /// 混ぜてあるので、全点で死んでも死ななくても不変条件が成り立つことを見る。
+    const FULL_COMMIT_BARRIERS: &[&str] = &[
+        "full:after_intent",
+        "full:after_tmp_write",
+        "full:after_tmp_sync",
+        "full:after_rename",
+        "cleanup:after_vmdirty_unlink",
+        "never:no-crash",
+    ];
+
+    /// INCREMENTAL commit が通る耐久性バリア（実行順）。
+    const INCREMENTAL_COMMIT_BARRIERS: &[&str] = &[
+        "inc:after_intent",
+        "inc:after_append_write",
+        "inc:after_append_sync",
+        "never:no-crash",
+    ];
+
     /// アーカイブ内の STORE エントリの生バイトを取り出す（`store_zip` /
     /// `build_full` はどちらも STORE で出すので圧縮バイト = 論理内容）。
     fn store_entry_bytes(zip: &[u8], name: &str) -> Vec<u8> {
@@ -2466,11 +2492,9 @@ mod tests {
     /// `RecoveryRequired` に落ちていた。
     #[test]
     fn full_commit_survives_crash_at_every_barrier() {
-        const BARRIERS: u32 = 5; // after_intent / after_tmp_write / after_tmp_sync
-                                 // / after_rename / cleanup:after_vmdirty_unlink
         let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
 
-        for n in 0..=BARRIERS {
+        for &label in FULL_COMMIT_BARRIERS {
             let dir = TempDir::new();
             let zip_path = dir.path().join("cr.zip");
             fs::write(&zip_path, &orig).unwrap();
@@ -2478,7 +2502,7 @@ mod tests {
             {
                 let m = open_spill(&zip_path, 0);
                 m.write("a.bin", 0, b"ZZ").unwrap();
-                fault::arm(n);
+                fault::arm_at(label, 0);
                 let _ = m.commit_full(); // 注入した点で Err になる（= そこで死んだ）
                 fault::disarm();
             }
@@ -2487,27 +2511,27 @@ mod tests {
             let bytes = fs::read(&zip_path).unwrap();
             assert!(
                 Archive::parse(&bytes).is_ok(),
-                "barrier {n}: archive.zip is not a valid ZIP after the crash"
+                "crash at {label}: archive.zip is not a valid ZIP"
             );
 
             // 2) 中身は旧か新のどちらか。中間状態は無い。
             let content = store_entry_bytes(&bytes, "a.bin");
             assert!(
                 content == b"ORIGINAL" || content == b"ZZIGINAL",
-                "barrier {n}: unexpected content {content:?}"
+                "crash at {label}: unexpected content {content:?}"
             );
 
             // 3) 再 open できる（CONFLICT で詰まない）。
             let reopened = FileMount::open_with_options(&zip_path, spill_options(0));
             assert!(
                 reopened.is_ok(),
-                "barrier {n}: reopen failed: {:?}",
+                "crash at {label}: reopen failed: {:?}",
                 reopened.err()
             );
             // 4) 置き去りの archive.zip.new は open が掃除する。
             assert!(
                 !dir.path().join("cr.zip.new").exists(),
-                "barrier {n}: orphan archive.zip.new survived open()"
+                "crash at {label}: orphan archive.zip.new survived open()"
             );
         }
     }
@@ -2516,10 +2540,9 @@ mod tests {
     /// `pre_size` への巻き戻しで旧アーカイブに戻る（ADR 0012 + 0017）。
     #[test]
     fn incremental_commit_survives_crash_at_every_barrier() {
-        const BARRIERS: u32 = 3; // after_intent / after_append_write / after_append_sync
         let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
 
-        for n in 0..=BARRIERS {
+        for &label in INCREMENTAL_COMMIT_BARRIERS {
             let dir = TempDir::new();
             let zip_path = dir.path().join("ic.zip");
             fs::write(&zip_path, &orig).unwrap();
@@ -2527,7 +2550,7 @@ mod tests {
             {
                 let m = open_spill(&zip_path, 0);
                 m.write("a.bin", 0, b"ZZ").unwrap();
-                fault::arm(n);
+                fault::arm_at(label, 0);
                 let _ = m.commit_incremental();
                 fault::disarm();
             }
@@ -2536,7 +2559,7 @@ mod tests {
             let reopened = FileMount::open_with_options(&zip_path, spill_options(0));
             assert!(
                 reopened.is_ok(),
-                "barrier {n}: reopen failed: {:?}",
+                "crash at {label}: reopen failed: {:?}",
                 reopened.err()
             );
             drop(reopened);
@@ -2544,12 +2567,12 @@ mod tests {
             let bytes = fs::read(&zip_path).unwrap();
             assert!(
                 Archive::parse(&bytes).is_ok(),
-                "barrier {n}: archive.zip is not a valid ZIP after the crash"
+                "crash at {label}: archive.zip is not a valid ZIP"
             );
             let content = store_entry_bytes(&bytes, "a.bin");
             assert!(
                 content == b"ORIGINAL" || content == b"ZZIGINAL",
-                "barrier {n}: unexpected content {content:?}"
+                "crash at {label}: unexpected content {content:?}"
             );
         }
     }
