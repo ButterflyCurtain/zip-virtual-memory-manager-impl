@@ -739,21 +739,38 @@ impl FileMount {
         // から rename し、rename 自体も親ディレクトリ fsync で durable にする。これで
         // 「commit が成功を返した ⇒ 新アーカイブは安定ストレージ上」を保証する。fsync
         // 失敗は握りつぶさず伝播する（vmidx はキャッシュなので別途 fsync しない）。
+        // アーカイブへ触れる**前に** INTENT を durable 記録する（ADR 0017）。
+        // rename は size / inode / cd_hash のすべてを変えるので、これが無いと再 open は
+        // 「自分の commit が成功した」と「外部が差し替えた」を区別できない。期待される
+        // 変更後の状態を先に書いておくことで、その区別がつく。
+        let post_cd_hash = {
+            let ar =
+                Archive::parse(&new_zip).map_err(|e| FileMountError::Open(OpenError::Zip(e)))?;
+            hash_cd_block(ar.cd_block())
+        };
+        let sidecar = sidecar_dir(&self.archive_path);
+        fs::create_dir_all(&sidecar)?;
+        write_commit_intent(
+            &sidecar,
+            &CommitIntent {
+                mode: CommitMode::Full,
+                pre_size: self.archive.len() as u64,
+                pre_cd_hash: self.cd_hash,
+                post_size: new_zip.len() as u64,
+                post_cd_hash,
+            },
+        )?;
+
         let tmp = commit_tmp(&self.archive_path);
         durable_replace(&tmp, &self.archive_path, &new_zip)?;
 
-        // commit 成功 → dirty 状態は新 archive に在る。vmdirty を削除し、その削除も
-        // サイドカー dir の fsync で durable にする（設計 commit(): "On success: deletes
-        // vmdirty"）。`vmdirty.bak.*` は forensics 用に残す。
+        // commit point: dirty 状態は新 archive に在る（設計 commit(): "On success:
+        // deletes vmdirty"）。`vmdirty.bak.*` は forensics 用に残す。
         //
-        // 残存ウィンドウ（既知）: アーカイブが durable になった後・vmdirty 削除が durable
-        // になる前にクラッシュすると、再 open 時に「新アーカイブ + 旧 vmdirty」が残り、
-        // 指紋不一致で CONFLICT（RecoveryRequired）に見える。完全な解消は commit epoch /
-        // マーカ方式（別増分）が要る。ここでは窓を最小化するに留める。
-        if self.vmdirty_path.exists() {
-            let _ = fs::remove_file(&self.vmdirty_path);
-            let _ = fsync_parent_dir(&self.vmdirty_path);
-        }
+        // かつてここには「アーカイブ durable 後・vmdirty 削除 durable 前」のクラッシュ窓
+        // （新アーカイブ + 旧 vmdirty が指紋不一致で CONFLICT に見える）が残っていた。
+        // 上の INTENT でこの窓の中のどの状態も判定可能になった（ADR 0017）。
+        finish_commit_cleanup(&self.vmdirty_path, &sidecar);
         Ok(())
     }
 
@@ -844,13 +861,9 @@ impl FileMount {
             f.sync_all()?;
         }
 
-        // 4. commit point: dirty 状態は新アーカイブに在る → vmdirty を捨て、最後に INTENT を
-        //    消す。サイドカー dir を 1 度 fsync して両削除を durable に。
-        if vmdirty_path.exists() {
-            let _ = fs::remove_file(&vmdirty_path);
-        }
-        let _ = fs::remove_file(commit_intent_path(&sidecar));
-        let _ = fsync_parent_dir(&vmdirty_path);
+        // 4. commit point: dirty 状態は新アーカイブに在る → vmdirty を捨て、最後に
+        //    INTENT を消す（順序の理由は [`finish_commit_cleanup`]）。
+        finish_commit_cleanup(&vmdirty_path, &sidecar);
         Ok(())
     }
 
@@ -1078,6 +1091,30 @@ impl CommitIntent {
     fn matches_post(&self, live: (u64, Option<[u8; 16]>)) -> bool {
         live.0 == self.post_size && live.1 == Some(self.post_cd_hash)
     }
+}
+
+/// commit 成功後の後始末。**vmdirty を先に消してその削除を durable にしてから、
+/// INTENT を消す。**
+///
+/// 順序が効くのは、回復が「vmdirty が在るなら INTENT も在る」を前提にできるから。
+/// 逆順（あるいは 1 度の dir fsync にまとめて順序を保証しない形）だと、
+/// 「新アーカイブ + 旧 vmdirty + INTENT 無し」という状態が観測でき、そこでは
+/// 「自分の commit が成功した」と「外部が差し替えた」を区別できず CONFLICT に
+/// 戻ってしまう（ADR 0017 が閉じたはずの窓が再び開く）。
+///
+/// 代償は dir fsync が 1 回増えること。Windows では両方とも no-op なので、
+/// この順序保証は Unix でのみ実効する。
+///
+/// 削除の失敗は握りつぶす（commit 自体は既に成功しており、置き去りは次の open が
+/// 判定して片付けられる）。
+fn finish_commit_cleanup(vmdirty_path: &Path, sidecar: &Path) {
+    if vmdirty_path.exists() {
+        let _ = fs::remove_file(vmdirty_path);
+        let _ = fsync_parent_dir(vmdirty_path);
+    }
+    let intent_path = commit_intent_path(sidecar);
+    let _ = fs::remove_file(&intent_path);
+    let _ = fsync_parent_dir(&intent_path);
 }
 
 /// アーカイブの先頭 `pre_size` バイトが intent の `pre` そのものか。
@@ -2330,6 +2367,107 @@ mod tests {
         assert_eq!(fs::metadata(&zip_path).unwrap().len(), old_len); // ガベージが消えた。
         assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
         assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL"); // 旧 + dirty を復元。
+    }
+
+    /// **クラッシュ窓 b6（ADR 0017）**: FULL commit の `rename` が durable になった
+    /// 後、vmdirty / INTENT の削除が durable になる前のクラッシュ。
+    ///
+    /// 再 open が見るのは「新アーカイブ + 旧 vmdirty」。`rename` は size / inode /
+    /// cd_hash のすべてを変えるので、INTENT が無ければ外部改変と区別がつかず
+    /// CONFLICT にするしかない。INTENT の `post` と一致すれば「自分の commit が
+    /// 成功した」と判定でき、vmdirty を replay せず捨てて CLEAN で開ける。
+    #[test]
+    fn full_commit_window_resolves_clean_with_intent() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("win.zip");
+        let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
+        fs::write(&zip_path, &orig).unwrap();
+        let pre_cd_hash = {
+            let ar = Archive::parse(&orig).unwrap();
+            hash_cd_block(ar.cd_block())
+        };
+
+        // 書いて flush（vmdirty durable）。その中身を控えておく = 旧アーカイブに対して
+        // 記録されたジャーナル。
+        let vpath = vmdirty_path(dir.path(), "win.zip");
+        let stale_vmdirty = {
+            let m = open_spill(&zip_path, 0);
+            m.write("a.bin", 0, b"ZZ").unwrap();
+            m.flush().expect("flush");
+            fs::read(&vpath).unwrap()
+        };
+
+        // FULL commit は成功する（ここまでは通常経路）。
+        {
+            let m = open_spill(&zip_path, 0);
+            m.commit_full().expect("commit");
+        }
+        let committed = fs::read(&zip_path).unwrap();
+        let post_cd_hash = {
+            let ar = Archive::parse(&committed).unwrap();
+            hash_cd_block(ar.cd_block())
+        };
+        assert!(!vpath.exists(), "normal commit removes vmdirty");
+        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
+
+        // 「rename は durable、後始末はまだ」を手で作る。
+        fs::write(&vpath, &stale_vmdirty).unwrap();
+        write_commit_intent(
+            &sidecar_dir(&zip_path),
+            &CommitIntent {
+                mode: CommitMode::Full,
+                pre_size: orig.len() as u64,
+                pre_cd_hash,
+                post_size: committed.len() as u64,
+                post_cd_hash,
+            },
+        )
+        .unwrap();
+
+        // post 一致 → commit 済みと判定。CONFLICT にならず CLEAN で開く。
+        let m2 = FileMount::open(&zip_path).expect("must not require recovery");
+        assert!(!m2.is_dirty());
+        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL");
+        assert!(!vpath.exists(), "stale vmdirty is discarded, not replayed");
+        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
+    }
+
+    /// 逆側: INTENT の `pre` と一致する（= commit は起きなかった）なら、vmdirty は
+    /// 捨てずに回復に使う。
+    #[test]
+    fn full_commit_intent_matching_pre_keeps_vmdirty() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("pre.zip");
+        let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
+        fs::write(&zip_path, &orig).unwrap();
+        let pre_cd_hash = {
+            let ar = Archive::parse(&orig).unwrap();
+            hash_cd_block(ar.cd_block())
+        };
+
+        {
+            let m = open_spill(&zip_path, 0);
+            m.write("a.bin", 0, b"ZZ").unwrap();
+            m.flush().expect("flush");
+        }
+
+        // 「INTENT は durable、rename はまだ」= アーカイブは旧のまま。
+        write_commit_intent(
+            &sidecar_dir(&zip_path),
+            &CommitIntent {
+                mode: CommitMode::Full,
+                pre_size: orig.len() as u64,
+                pre_cd_hash,
+                post_size: 999_999,
+                post_cd_hash: [0xCCu8; 16],
+            },
+        )
+        .unwrap();
+
+        // pre 一致 → commit は起きていない。vmdirty を replay して dirty を復元する。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL");
+        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
     }
 
     /// INTENT が「未完の追記」を主張していても、実アーカイブの先頭 `pre_size`
