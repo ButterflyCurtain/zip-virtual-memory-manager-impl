@@ -2313,6 +2313,69 @@ mod tests {
         assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL"); // 旧 + dirty を復元。
     }
 
+    /// **ADR 0017 で閉じた穴**: 追記の「サイズだけ durable・テール内容は未 durable」
+    /// を模す（ファイル長は `new_len` だが末尾はゼロ）。
+    ///
+    /// 旧判定は `size == new_len && Archive::parse().is_ok()` だった。`find_eocd` は
+    /// **後方走査**なので、ゼロのテールは読み飛ばされて**旧 EOCD** が拾われ、parse が
+    /// 通ってしまう。結果「完了」と誤判定して vmdirty を捨て、書き込みが失われていた。
+    ///
+    /// intent の cd_hash 照合では、この状態は post とも pre とも一致しない
+    /// （長さが pre と違い、cd_hash が post と違う）ので INCREMENTAL の巻き戻しに入り、
+    /// `pre_size` へ truncate して vmdirty から dirty を回復する。
+    #[test]
+    fn incremental_rolls_back_when_tail_is_not_durable() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("tail.zip");
+        let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
+        fs::write(&zip_path, &orig).unwrap();
+        let old_len = orig.len() as u64;
+
+        // 書いて flush（vmdirty durable）、commit せず閉じる。
+        {
+            let m = open_spill(&zip_path, 0);
+            m.write("a.bin", 0, b"ZZ").unwrap();
+            m.flush().expect("flush");
+        }
+
+        // 追記のサイズだけが反映され、中身がゼロのまま残った状態。
+        const TAIL: usize = 40;
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&zip_path).unwrap();
+            f.write_all(&[0u8; TAIL]).unwrap();
+        }
+        // ゼロのテールでも「妥当な ZIP」として parse できてしまうことを確かめる
+        // （旧判定が誤る条件そのもの）。
+        let padded = fs::read(&zip_path).unwrap();
+        assert_eq!(padded.len() as u64, old_len + TAIL as u64);
+        assert!(
+            Archive::parse(&padded).is_ok(),
+            "backward EOCD scan still parses the old archive - this is why size+parse was not enough"
+        );
+
+        let pre_cd_hash = {
+            let ar = Archive::parse(&orig).unwrap();
+            hash_cd_block(ar.cd_block())
+        };
+        write_commit_intent(
+            &sidecar_dir(&zip_path),
+            &CommitIntent {
+                mode: CommitMode::Incremental,
+                pre_size: old_len,
+                pre_cd_hash,
+                post_size: old_len + TAIL as u64, // サイズだけは「完了」に見える
+                post_cd_hash: [0xBBu8; 16],       // 本来の追記後 CD とは一致しない
+            },
+        )
+        .unwrap();
+
+        // 再 open: 巻き戻して dirty を回復する（捨てない）。
+        let m2 = open_spill(&zip_path, 0);
+        assert_eq!(fs::metadata(&zip_path).unwrap().len(), old_len);
+        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
+        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL");
+    }
+
     #[test]
     fn incremental_commit_discards_stale_vmdirty_when_completed() {
         let dir = TempDir::new();
