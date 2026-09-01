@@ -18,7 +18,7 @@
 //! 失われても再構築できる）。クラッシュ安全な durability は後段（M3）。
 
 use crate::archive::{Archive, Bloat};
-use crate::commit::{build_full, build_incremental, CommitError};
+use crate::commit::{appended_cd_block, build_full, build_incremental, CommitError};
 use crate::difflayer::{DiffLayer, UNLIMITED};
 use crate::entrytable::EntryTable;
 use crate::index_build::BuildParams;
@@ -308,30 +308,48 @@ impl FileMount {
         let archive_path = archive_path.as_ref();
         let sidecar = sidecar_dir(archive_path);
 
-        // INCREMENTAL commit の途中クラッシュ回復（mmap を張る前 = truncate 可能）。
-        // `commit.intent` が在る = 末尾追記が走った可能性。完了済み（サイズ一致 + valid
-        // ZIP）なら dirty 状態は新アーカイブに在るので vmdirty を捨てる。未完なら
-        // アーカイブを `old_len` へ truncate して旧（妥当な ZIP）へ戻し、vmdirty は活かす
-        // （ADR 0012 の truncate ロールバック）。INTENT は最後に消すので、どちらの
-        // クラッシュ窓でも disposition を一意に判定できる。
+        // 中断した commit の始末（mmap を張る前 = truncate 可能）。ADR 0017。
+        //
+        // `commit.intent` は「アーカイブを変える前に、変更後に期待される状態を
+        // 書いておく」write-ahead レコード。これがあると、実アーカイブを intent の
+        // pre / post と突き合わせるだけで disposition が一意に決まる:
+        //
+        //   post 一致  → commit は完了した。dirty 状態は新アーカイブに在るので
+        //                vmdirty は stale。replay せず捨てて CLEAN で開く。
+        //   pre 一致   → commit は起きなかった。巻き戻すものは無い（FULL の
+        //                `archive.zip.new` は下の orphan 掃除が消す）。vmdirty は活かす。
+        //   どちらでもない → INCREMENTAL なら追記が途中。`pre_size` へ truncate して
+        //                旧アーカイブへ戻す。FULL なら外部改変なので何も触らず、
+        //                後段の fingerprint 関門で CONFLICT に倒す。
+        //
+        // INTENT を**最後に**消すので、後始末の途中でクラッシュしても判定は変わらない。
         let mut discard_vmdirty_after_commit = false;
         {
             let intent_path = commit_intent_path(&sidecar);
-            if let Some((old_len, new_len)) = read_commit_intent(&intent_path)? {
-                let cur = fs::metadata(archive_path)?.len();
-                let completed = cur == new_len
-                    && fs::read(archive_path)
-                        .map(|b| Archive::parse(&b).is_ok())
-                        .unwrap_or(false);
-                if completed {
+            if let Some(intent) = read_commit_intent(&intent_path)? {
+                let live = live_archive_fingerprint(archive_path)?;
+                let mut resolved = true;
+                if intent.matches_post(live) {
                     discard_vmdirty_after_commit = true;
-                } else {
+                } else if intent.matches_pre(live) {
+                    // 何もしない（vmdirty をそのまま回復に使う）。
+                } else if intent.mode == CommitMode::Incremental {
+                    // 追記が途中で切れている。旧バイト `[0, pre_size)` は書き換えて
+                    // いないので、truncate すれば妥当な旧 ZIP に戻る。
                     let f = fs::OpenOptions::new().write(true).open(archive_path)?;
-                    f.set_len(old_len)?;
+                    f.set_len(intent.pre_size)?;
                     f.sync_all()?;
+                    // 戻した結果が本当に pre なら INTENT を消してよい。違えば
+                    // 説明のつかない状態なので INTENT を残し、CONFLICT に倒す。
+                    resolved = intent.matches_pre(live_archive_fingerprint(archive_path)?);
+                } else {
+                    // FULL でどちらとも一致しない = 外部がアーカイブを差し替えた。
+                    resolved = false;
                 }
-                fs::remove_file(&intent_path)?;
-                let _ = fsync_parent_dir(&intent_path);
+                if resolved {
+                    fs::remove_file(&intent_path)?;
+                    let _ = fsync_parent_dir(&intent_path);
+                }
             }
         }
 
@@ -785,6 +803,25 @@ impl FileMount {
         )?;
         let new_len = old_len + appended.len() as u64;
 
+        // 追記後のアーカイブの cd_hash を、**書く前に**算出しておく（ADR 0017）。
+        // 新しい CD は追記領域の中に丸ごと収まっているので、旧バイト列は要らない。
+        let post_cd_hash = {
+            let cd = appended_cd_block(&appended, old_len).ok_or_else(|| {
+                FileMountError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "build_incremental produced no locatable central directory",
+                ))
+            })?;
+            hash_cd_block(cd)
+        };
+        let intent = CommitIntent {
+            mode: CommitMode::Incremental,
+            pre_size: old_len,
+            pre_cd_hash: self.cd_hash,
+            post_size: new_len,
+            post_cd_hash,
+        };
+
         let archive_path = self.archive_path.clone();
         let vmdirty_path = self.vmdirty_path.clone();
         let sidecar = sidecar_dir(&archive_path);
@@ -792,9 +829,9 @@ impl FileMount {
         // mmap を解放してからファイルを変更する（Windows のマップ中ファイル制約回避）。
         drop(self);
 
-        // 2. INTENT を durable に（追記前 = truncate ロールバックの根拠）。
+        // 2. INTENT を durable に（追記前 = 判定とロールバックの根拠）。
         fs::create_dir_all(&sidecar)?;
-        write_commit_intent(&sidecar, old_len, new_len)?;
+        write_commit_intent(&sidecar, &intent)?;
 
         // 3. アーカイブ末尾へ追記して fsync（pure append なので親 dir fsync は不要、
         //    サイズ + データは sync_all が durable 化）。
@@ -925,48 +962,160 @@ fn compact_tmp(vmdirty_path: &Path) -> PathBuf {
     vmdirty_path.with_file_name(name)
 }
 
-/// INCREMENTAL commit の INTENT ファイル先頭 4 バイト（"VMIC" 相当の識別子）。
+/// commit INTENT ファイル先頭 4 バイト（"VMIC" 相当の識別子）。
 const INTENT_MAGIC: u32 = 0x564D_4943;
 
-/// INCREMENTAL commit の INTENT ファイルパス（`.vmm/commit.intent`）。追記前に
-/// `old_len` / `new_len` を記録し、commit 成功で最後に削除する。回復はこの有無と
-/// 内容で「完了 / 未完」を判定する（ADR 0012）。
+/// INTENT レコードの形式版。
+///
+/// - 1 = ADR 0012。`magic + old_len + new_len` の 20 バイト。INCREMENTAL 専用。
+/// - 2 = ADR 0017。commit **前後**の fingerprint（size + cd_hash）を持ち、FULL も覆う。
+///
+/// version 1 のレコードは読まない（[`read_commit_intent`] が `None` を返す）。
+/// クレートは未公開（`publish = false`）で、INTENT はクラッシュ窓にしか存在しない
+/// 一時ファイルなので、on-disk 互換は保たない。
+const INTENT_VERSION: u16 = 2;
+
+/// version 2 の INTENT レコード長。
+const INTENT_SIZE: usize = 60;
+
+/// commit の書き込みモード。回復時にどの巻き戻しが要るかを決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitMode {
+    /// 新 ZIP を丸ごと書いて `rename` で置き換える。旧アーカイブは触らないので
+    /// 巻き戻しは不要（置き去りの `archive.zip.new` は open で掃除される）。
+    Full,
+    /// 末尾へ追記する。未完なら `pre_size` への truncate で旧アーカイブへ戻す。
+    Incremental,
+}
+
+/// アーカイブを変更する**前**に durable に記録する intent（ADR 0017）。
+///
+/// fingerprint だけでは「自分の commit が成功して archive が変わった」と
+/// 「外部が archive を差し替えた」を区別できない（どちらも size / cd_hash が変わる）。
+/// 変更後に期待される状態を先に書いておくことで、`open()` の判断が 1 ビットの
+/// 一致判定から 3 分岐になる:
+///
+/// - 実アーカイブ == `post` → commit は完了した → vmdirty を捨てて CLEAN で開く
+/// - 実アーカイブ == `pre`  → commit は起きなかった → 通常の回復
+/// - どちらでもない → INCREMENTAL なら追記が途中（`pre_size` へ truncate）、
+///   FULL なら本物の CONFLICT（外部改変）
+///
+/// **窓が無くなるのではなく、窓の中のどの状態も判定可能になる**、という性質の解決。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitIntent {
+    mode: CommitMode,
+    /// commit 前のアーカイブ長。INCREMENTAL の truncate ロールバック先でもある。
+    pre_size: u64,
+    /// commit 前のアーカイブの cd_hash。
+    pre_cd_hash: [u8; 16],
+    /// commit 後に期待されるアーカイブ長。
+    post_size: u64,
+    /// commit 後に期待される cd_hash。
+    post_cd_hash: [u8; 16],
+}
+
+impl CommitIntent {
+    /// `magic(4) + version(2) + mode(2) + pre_size(8) + pre_cd_hash(16)
+    ///  + post_size(8) + post_cd_hash(16) + crc32c(4)` = 60 バイト。
+    fn encode(&self) -> [u8; INTENT_SIZE] {
+        let mut b = [0u8; INTENT_SIZE];
+        b[0..4].copy_from_slice(&INTENT_MAGIC.to_le_bytes());
+        b[4..6].copy_from_slice(&INTENT_VERSION.to_le_bytes());
+        let mode: u16 = match self.mode {
+            CommitMode::Full => 0,
+            CommitMode::Incremental => 1,
+        };
+        b[6..8].copy_from_slice(&mode.to_le_bytes());
+        b[8..16].copy_from_slice(&self.pre_size.to_le_bytes());
+        b[16..32].copy_from_slice(&self.pre_cd_hash);
+        b[32..40].copy_from_slice(&self.post_size.to_le_bytes());
+        b[40..56].copy_from_slice(&self.post_cd_hash);
+        let crc = crc32c::crc32c(&b[0..56]);
+        b[56..60].copy_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    /// 形式・版・CRC がすべて合ったときだけ `Some`。
+    fn decode(b: &[u8]) -> Option<CommitIntent> {
+        if b.len() != INTENT_SIZE {
+            return None;
+        }
+        if u32::from_le_bytes(b[0..4].try_into().ok()?) != INTENT_MAGIC {
+            return None;
+        }
+        if u16::from_le_bytes(b[4..6].try_into().ok()?) != INTENT_VERSION {
+            return None;
+        }
+        if u32::from_le_bytes(b[56..60].try_into().ok()?) != crc32c::crc32c(&b[0..56]) {
+            return None;
+        }
+        let mode = match u16::from_le_bytes(b[6..8].try_into().ok()?) {
+            0 => CommitMode::Full,
+            1 => CommitMode::Incremental,
+            _ => return None,
+        };
+        let mut pre_cd_hash = [0u8; 16];
+        pre_cd_hash.copy_from_slice(&b[16..32]);
+        let mut post_cd_hash = [0u8; 16];
+        post_cd_hash.copy_from_slice(&b[40..56]);
+        Some(CommitIntent {
+            mode,
+            pre_size: u64::from_le_bytes(b[8..16].try_into().ok()?),
+            pre_cd_hash,
+            post_size: u64::from_le_bytes(b[32..40].try_into().ok()?),
+            post_cd_hash,
+        })
+    }
+
+    /// 実アーカイブが commit **前**の状態か。
+    fn matches_pre(&self, live: (u64, Option<[u8; 16]>)) -> bool {
+        live.0 == self.pre_size && live.1 == Some(self.pre_cd_hash)
+    }
+
+    /// 実アーカイブが commit **後**の状態か。
+    fn matches_post(&self, live: (u64, Option<[u8; 16]>)) -> bool {
+        live.0 == self.post_size && live.1 == Some(self.post_cd_hash)
+    }
+}
+
+/// commit INTENT のファイルパス（`.vmm/commit.intent`）。アーカイブを変える前に
+/// 書き、commit 成功で**最後に**削除する。
 fn commit_intent_path(sidecar: &Path) -> PathBuf {
     sidecar.join("commit.intent")
 }
 
-/// INTENT を `magic(4) + old_len(8) + new_len(8)` の 20 バイトで durable に書く
-/// （追記前。ファイル本体 + サイドカー dir を fsync）。
-fn write_commit_intent(sidecar: &Path, old_len: u64, new_len: u64) -> io::Result<()> {
+/// INTENT を durable に書く（アーカイブ変更前。ファイル本体 + サイドカー dir を fsync）。
+fn write_commit_intent(sidecar: &Path, intent: &CommitIntent) -> io::Result<()> {
     let path = commit_intent_path(sidecar);
-    let mut buf = Vec::with_capacity(20);
-    buf.extend_from_slice(&INTENT_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&old_len.to_le_bytes());
-    buf.extend_from_slice(&new_len.to_le_bytes());
     {
         let mut f = File::create(&path)?;
-        f.write_all(&buf)?;
+        f.write_all(&intent.encode())?;
         f.sync_all()?;
     }
     fsync_parent_dir(&path)?;
     Ok(())
 }
 
-/// INTENT を読む。無ければ `None`。壊れ / 部分書き（magic 不一致 / 長さ違い）も
-/// `None` 扱い＝INTENT が durable に書けていない＝追記前のクラッシュで、アーカイブは
-/// 無傷なのでロールバック不要。
-fn read_commit_intent(path: &Path) -> io::Result<Option<(u64, u64)>> {
+/// INTENT を読む。無ければ `None`。壊れ / 部分書き / 旧版（magic・版・長さ・CRC の
+/// いずれか不一致）も `None` 扱い＝INTENT が durable に書けていない＝アーカイブを
+/// 変える前のクラッシュで、アーカイブは無傷なのでロールバック不要。
+fn read_commit_intent(path: &Path) -> io::Result<Option<CommitIntent>> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    if bytes.len() != 20 || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != INTENT_MAGIC {
-        return Ok(None);
-    }
-    let old_len = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
-    let new_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    Ok(Some((old_len, new_len)))
+    Ok(CommitIntent::decode(&bytes))
+}
+
+/// 現在の `archive.zip` の fingerprint（サイズ, cd_hash）。ZIP として parse できない
+/// ときは cd_hash が `None` になり、intent のどちらの記録とも一致しなくなる。
+fn live_archive_fingerprint(path: &Path) -> io::Result<(u64, Option<[u8; 16]>)> {
+    let bytes = fs::read(path)?;
+    let hash = Archive::parse(&bytes)
+        .ok()
+        .map(|ar| hash_cd_block(ar.cd_block()));
+    Ok((bytes.len() as u64, hash))
 }
 
 /// `data` を `tmp` に書き、**fsync してから** `dst` へ rename で原子置換し、親
@@ -2141,7 +2290,21 @@ mod tests {
             let mut f = fs::OpenOptions::new().append(true).open(&zip_path).unwrap();
             f.write_all(&[0xFFu8; 30]).unwrap(); // new_len(=+100) に届かない不完全追記
         }
-        write_commit_intent(&sidecar_dir(&zip_path), old_len, old_len + 100).unwrap();
+        let pre_cd_hash = {
+            let ar = Archive::parse(&orig).unwrap();
+            hash_cd_block(ar.cd_block())
+        };
+        write_commit_intent(
+            &sidecar_dir(&zip_path),
+            &CommitIntent {
+                mode: CommitMode::Incremental,
+                pre_size: old_len,
+                pre_cd_hash,
+                post_size: old_len + 100, // 届かなかった追記後サイズ
+                post_cd_hash: [0xAAu8; 16],
+            },
+        )
+        .unwrap();
 
         // 再 open: INTENT 未完 → アーカイブを old_len へ truncate（旧へ復帰）、vmdirty を replay。
         let m2 = open_spill(&zip_path, 0);
@@ -2162,10 +2325,24 @@ mod tests {
             m.write("a.bin", 0, b"ZZ").unwrap();
             m.commit_incremental().expect("commit");
         }
-        let new_len = fs::metadata(&zip_path).unwrap().len();
+        let committed = fs::read(&zip_path).unwrap();
+        let post_cd_hash = {
+            let ar = Archive::parse(&committed).unwrap();
+            hash_cd_block(ar.cd_block())
+        };
 
         // 「追記完了後・後始末前にクラッシュ」を模す: 完了一致の INTENT + stale vmdirty。
-        write_commit_intent(&sidecar_dir(&zip_path), 0, new_len).unwrap();
+        write_commit_intent(
+            &sidecar_dir(&zip_path),
+            &CommitIntent {
+                mode: CommitMode::Incremental,
+                pre_size: 0,
+                pre_cd_hash: [0u8; 16],
+                post_size: committed.len() as u64,
+                post_cd_hash,
+            },
+        )
+        .unwrap();
         fs::write(vmdirty_path(dir.path(), "cp.zip"), b"stale junk").unwrap();
 
         // 再 open: INTENT 完了判定 → stale vmdirty を捨て INTENT も消し、新アーカイブを CLEAN で開く。

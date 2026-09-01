@@ -399,6 +399,30 @@ pub fn build_incremental(
     Ok(body)
 }
 
+/// [`build_incremental`] が返した追記バイト列から、新しい Central Directory の
+/// バイト列を切り出す。`base` は追記開始オフセット（＝旧アーカイブ長）。
+///
+/// commit **後**のアーカイブの fingerprint（`cd_hash`）を、書き込む**前**に算出する
+/// ために使う（ADR 0017 の commit intent）。追記領域の末尾には正規形の EOCD が
+/// 22 バイトで入っているので、そこから CD の位置と長さを読む。INCREMENTAL では
+/// 新 CD 全体が追記領域に収まるので、旧アーカイブのバイト列は要らない。
+///
+/// 形が合わなければ `None`（この関数が見るのは自分で組み立てた直後のバイト列なので、
+/// `None` は入力不正ではなく内部の不整合を意味する）。
+pub fn appended_cd_block(appended: &[u8], base: u64) -> Option<&[u8]> {
+    const EOCD_LEN: usize = 22;
+    let eocd = appended.len().checked_sub(EOCD_LEN)?;
+    let sig = u32::from_le_bytes(appended[eocd..eocd + 4].try_into().ok()?);
+    if sig != EOCD_SIG {
+        return None;
+    }
+    let cd_size = u32::from_le_bytes(appended[eocd + 12..eocd + 16].try_into().ok()?) as usize;
+    let cd_offset = u32::from_le_bytes(appended[eocd + 16..eocd + 20].try_into().ok()?) as u64;
+    let start = cd_offset.checked_sub(base)? as usize;
+    let end = start.checked_add(cd_size)?;
+    appended.get(start..end)
+}
+
 /// 追記領域へ 1 エントリを書き（LFH+データ）、その**絶対** local header offset
 /// （`base + 追記内位置`）を CD 用に記録する。32 ビット超過は [`CommitError::TooLarge`]。
 fn place_appended(
