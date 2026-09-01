@@ -1733,6 +1733,51 @@ mod tests {
         assert_eq!(m.read("data.bin", 0, 4), Err(ReadError::Stale));
     }
 
+    /// **STALE なマウントは commit してはならない。**
+    ///
+    /// 設計 STALE state: 「A mount in STALE state accepts no further read() or
+    /// write() operations. write() returns ESTALE regardless of Diff Layer state.
+    /// flush() and commit() return ESTALE.」
+    ///
+    /// 実装は STALE を `read()` の入口でしか見ていなかったので、外部改変を**検知
+    /// 済み**のマウントがそのまま commit でき、他人の変更を黙って上書きしていた。
+    #[test]
+    fn stale_mount_must_not_commit_over_external_change() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("st.zip");
+        fs::write(
+            &zip_path,
+            store_zip(&[
+                ("a.bin", b"ORIGINAL"),
+                ("b.bin", b"0123456789abcdef0123456789abcdef"),
+            ]),
+        )
+        .unwrap();
+
+        let m = open_paged(&zip_path);
+        m.write("a.bin", 0, b"ZZ").unwrap(); // dirty にする
+        assert!(!m.is_stale());
+
+        // 外部が別内容へ差し替える（サイズも変わる）。
+        let external = store_zip(&[
+            ("a.bin", b"EXTERNAL"),
+            ("b.bin", b"replaced by someone else!!"),
+        ]);
+        replace_archive(&zip_path, external.clone());
+
+        // 未キャッシュの clean エントリを読む → ミス → 再 stat → STALE。
+        assert_eq!(m.read("b.bin", 16, 4), Err(ReadError::Stale));
+        assert!(m.is_stale());
+
+        // ここで commit できてはいけない。外部の内容がそのまま残ること。
+        let _ = m.commit_full();
+        assert_eq!(
+            fs::read(&zip_path).unwrap(),
+            external,
+            "a STALE mount must not overwrite the externally modified archive"
+        );
+    }
+
     #[test]
     fn estale_interval_zero_disables_check() {
         let dir = TempDir::new();
