@@ -2466,6 +2466,78 @@ mod tests {
         "never:no-crash",
     ];
 
+    // ───────── ジャーナル異常系の決定木（設計 Journal Spec Section 3）─────────
+    //
+    // walk 単体（torn record / CRC 破損 / generation 不一致 / 未知 magic）は
+    // `vmdirty.rs` 側で覆われている。ここで見るのは **`FileMount::open` が決定木
+    // どおりに振る舞うか**、つまり「自動で解決してよい枝」と「呼び出し側に委ねる枝」の
+    // 切り分け。fault injection は要らず、vmdirty を手で置くだけで踏める。
+
+    /// ヘッダの magic が壊れている → 「ファイルが読めない」枝。自動解決してはならず、
+    /// `discard() | abort()` を呼び出し側に提示する（既定ハンドラは Abort）。
+    #[test]
+    fn vmdirty_with_bad_header_magic_defers_to_caller() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("bh.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", b"ORIGINAL")])).unwrap();
+        fs::create_dir_all(sidecar_dir(&zip_path)).unwrap();
+        fs::write(vmdirty_path(dir.path(), "bh.zip"), [0xFFu8; 200]).unwrap();
+
+        match FileMount::open_with_options(&zip_path, spill_options(0)) {
+            Err(FileMountError::RecoveryRequired(r)) => {
+                assert_eq!(r.status, crate::vmdirty::RecoveryStatus::HeaderMagicBad);
+            }
+            other => panic!("expected RecoveryRequired, got {:?}", other.map(|_| ())),
+        }
+        // 勝手に消さない（呼び出し側が discard を選ぶまで残す）。
+        assert!(vmdirty_path(dir.path(), "bh.zip").exists());
+    }
+
+    /// ヘッダが 88 バイトに満たない → 同じく「読めない」枝。
+    #[test]
+    fn vmdirty_with_truncated_header_defers_to_caller() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("th.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", b"ORIGINAL")])).unwrap();
+        fs::create_dir_all(sidecar_dir(&zip_path)).unwrap();
+        fs::write(vmdirty_path(dir.path(), "th.zip"), [0u8; 10]).unwrap();
+
+        match FileMount::open_with_options(&zip_path, spill_options(0)) {
+            Err(FileMountError::RecoveryRequired(r)) => {
+                assert_eq!(r.status, crate::vmdirty::RecoveryStatus::HeaderTruncated);
+            }
+            other => panic!("expected RecoveryRequired, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// ヘッダだけでレコードが 1 件も無い（spill を有効にして開き、何も書かずに
+    /// 落ちた場合がこれ）→ 「stale な空ファイル」枝。**黙って discard** してよい
+    /// 数少ない自動解決のひとつ。
+    #[test]
+    fn header_only_vmdirty_is_silently_discarded() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("ho.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", b"ORIGINAL")])).unwrap();
+
+        // spill 有効で開くと open が vmdirty を作る。何も書かずに落とす。
+        {
+            let _m = open_spill(&zip_path, 0);
+        }
+        let vpath = vmdirty_path(dir.path(), "ho.zip");
+        assert!(vpath.exists(), "opening with spill creates the journal");
+        assert_eq!(
+            fs::metadata(&vpath).unwrap().len(),
+            crate::vmdirty::HEADER_SIZE as u64,
+            "no records were written"
+        );
+
+        // 再 open は質問せずに CLEAN で開き、空ジャーナルを片付ける。
+        let m2 = FileMount::open(&zip_path).expect("must not require a decision");
+        assert!(!m2.is_dirty());
+        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ORIGINAL");
+        assert!(!vpath.exists(), "stale empty journal is discarded");
+    }
+
     /// アーカイブ内の STORE エントリの生バイトを取り出す（`store_zip` /
     /// `build_full` はどちらも STORE で出すので圧縮バイト = 論理内容）。
     fn store_entry_bytes(zip: &[u8], name: &str) -> Vec<u8> {
