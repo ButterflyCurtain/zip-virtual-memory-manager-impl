@@ -111,6 +111,9 @@ pub enum WriteError {
     Read(Box<ReadError>),
     /// Tier 2（vmdirty）への spill / write-hit 書き出しの I/O 失敗。
     Spill(String),
+    /// マウントが STALE（外部からアーカイブが差し替えられた）。設計 STALE state:
+    /// 「write() returns ESTALE regardless of Diff Layer state」。
+    Stale,
 }
 
 impl fmt::Display for WriteError {
@@ -121,6 +124,7 @@ impl fmt::Display for WriteError {
             WriteError::Vmidx(e) => write!(f, "write: {e}"),
             WriteError::Read(e) => write!(f, "write: copy-on-write read failed: {e}"),
             WriteError::Spill(e) => write!(f, "write: tier 2 spill failed: {e}"),
+            WriteError::Stale => write!(f, "write: mount is STALE (archive changed externally)"),
         }
     }
 }
@@ -180,6 +184,8 @@ pub enum EntryError {
     Vmidx(DecodeError),
     /// vmdirty への METADATA 追記（journaling）の I/O 失敗。
     Journal(String),
+    /// マウントが STALE（外部からアーカイブが差し替えられた）。設計 STALE state。
+    Stale,
 }
 
 impl From<ResolveError> for EntryError {
@@ -200,6 +206,7 @@ impl fmt::Display for EntryError {
             EntryError::Unsupported(p) => write!(f, "entry op: unsupported provider {p:?}"),
             EntryError::Vmidx(e) => write!(f, "entry op: {e}"),
             EntryError::Journal(e) => write!(f, "entry op: journal write failed: {e}"),
+            EntryError::Stale => write!(f, "entry op: mount is STALE (archive changed externally)"),
         }
     }
 }

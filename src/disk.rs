@@ -155,6 +155,12 @@ pub enum FileMountError {
     /// [`FileMount::compact`] を DIRTY なマウントで呼んだ（設計: compact() は CLEAN
     /// からのみ。先に [`commit`](FileMount::commit) すること）。
     CompactWhileDirty,
+    /// マウントが STALE（外部からアーカイブが差し替えられた）。設計 STALE state:
+    /// 「flush() and commit() return ESTALE」。**この状態では commit しない** ——
+    /// 自分の Diff Layer は既に他人のものになったアーカイブに対して作られており、
+    /// 書き戻せば外部の変更を黙って上書きすることになる。vmdirty は消さずに残すので、
+    /// 次の open で回復判断ができる。
+    Stale,
     /// vmdirty が存在し、回復の判断が呼び出し側に委ねられた（決定木が Abort、または
     /// ヘッダ破損 / version 非対応 / CONFLICT）。`RecoveryResult` を見て
     /// [`FileMount::open_with_recovery`] でハンドラを与え直す。エントリ操作を含む
@@ -171,6 +177,10 @@ impl fmt::Display for FileMountError {
             FileMountError::CompactWhileDirty => {
                 write!(f, "file mount: compact() requires a clean mount; commit() first")
             }
+            FileMountError::Stale => write!(
+                f,
+                "file mount: mount is STALE (archive changed externally); refusing to write back"
+            ),
             FileMountError::RecoveryRequired(r) => write!(
                 f,
                 "file mount: vmdirty present, recovery decision deferred to caller (status {:?}, last_commit_seq {})",
@@ -530,6 +540,9 @@ impl FileMount {
     /// `archive.zip` は触らず Diff Layer Tier 1 に COW で取り込む。反映は
     /// [`commit`](FileMount::commit) まで遅延する。STALE 後は書けない。
     pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), WriteError> {
+        if self.stale.get() {
+            return Err(WriteError::Stale);
+        }
         let resolved = resolve_entry(&self.entries.borrow(), &self.vmidx_image, path)?;
         let mut t2 = self.tier2.borrow_mut();
         let ctx = EntryCtx {
@@ -545,6 +558,9 @@ impl FileMount {
     /// 空のエントリを作る（設計 create()）。既存（未削除）なら [`EntryError::Exists`]。
     /// spill 有効時は METADATA CREATE を vmdirty に journal する。
     pub fn create(&self, path: &str) -> Result<(), EntryError> {
+        if self.stale.get() {
+            return Err(EntryError::Stale);
+        }
         let mut t2 = self.tier2.borrow_mut();
         entry_create(
             &mut self.entries.borrow_mut(),
@@ -557,6 +573,9 @@ impl FileMount {
 
     /// エントリを削除する（設計 remove()）。存在しなければ [`EntryError::NotFound`]。
     pub fn remove(&self, path: &str) -> Result<(), EntryError> {
+        if self.stale.get() {
+            return Err(EntryError::Stale);
+        }
         let mut t2 = self.tier2.borrow_mut();
         entry_remove(
             &mut self.entries.borrow_mut(),
@@ -570,6 +589,9 @@ impl FileMount {
     /// エントリの論理サイズを変える（設計 truncate()）。存在しなければ
     /// [`EntryError::NotFound`]。
     pub fn truncate(&self, path: &str, new_size: u64) -> Result<(), EntryError> {
+        if self.stale.get() {
+            return Err(EntryError::Stale);
+        }
         let mut t2 = self.tier2.borrow_mut();
         entry_truncate(
             &self.entries.borrow(),
@@ -585,6 +607,9 @@ impl FileMount {
     /// [`EntryError::NotFound`]、`new` が既に存在すれば（同名指定含む）
     /// [`EntryError::Exists`]。spill 有効時は METADATA RENAME を vmdirty に journal する。
     pub fn rename(&self, old: &str, new: &str) -> Result<(), EntryError> {
+        if self.stale.get() {
+            return Err(EntryError::Stale);
+        }
         let mut t2 = self.tier2.borrow_mut();
         entry_rename(
             &mut self.entries.borrow_mut(),
@@ -605,6 +630,9 @@ impl FileMount {
     /// （設計 flush()、STRICT）。spill 無効（Tier 2 無し）なら no-op。flush 後の
     /// クラッシュは [`RecoveryDecision::RecoverCommitted`] で丸ごと復元できる。
     pub fn flush(&self) -> Result<(), FileMountError> {
+        if self.stale.get() {
+            return Err(FileMountError::Stale);
+        }
         if let Some(t2) = self.tier2.borrow_mut().as_mut() {
             t2.flush(&mut self.diff.borrow_mut())?;
         }
@@ -639,6 +667,9 @@ impl FileMount {
     /// 3. 旧 Tier 2 を閉じ（Windows の置換のため）、`vmdirty.compact` → `vmdirty` へ
     ///    rename で原子置換し親 dir を fsync。以降は新世代で続行。
     pub fn compact_journal(&self) -> Result<(), FileMountError> {
+        if self.stale.get() {
+            return Err(FileMountError::Stale);
+        }
         if self.tier2.borrow().is_none() {
             return Ok(());
         }
@@ -706,6 +737,9 @@ impl FileMount {
     /// （fsyncgate）。サイドカー vmidx は更新せず残し（次回 open で fingerprint 不一致なら
     /// 再構築。vmidx はキャッシュなので fsync しない）。
     pub fn commit_full(self) -> Result<(), FileMountError> {
+        if self.stale.get() {
+            return Err(FileMountError::Stale);
+        }
         if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
             return Ok(());
         }
@@ -785,6 +819,9 @@ impl FileMount {
     /// （[`compact_journal`](Self::compact_journal) = 設計 `compactJournal()`）とは別物。
     /// 中身は空 Diff での FULL commit（全エントリを verbatim コピーした正準形を書く）。
     pub fn compact(self) -> Result<(), FileMountError> {
+        if self.stale.get() {
+            return Err(FileMountError::Stale);
+        }
         if !(self.diff.borrow().is_empty() && self.entries.borrow().is_empty()) {
             return Err(FileMountError::CompactWhileDirty);
         }
@@ -804,6 +841,9 @@ impl FileMount {
     /// 4. commit point: vmdirty を削除 → **最後に INTENT を削除**（INTENT を最後に消すことで、
     ///    回復は「完了（vmdirty 破棄）/未完（truncate ロールバック）」を一意に判定できる）。
     pub fn commit_incremental(self) -> Result<(), FileMountError> {
+        if self.stale.get() {
+            return Err(FileMountError::Stale);
+        }
         if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
             return Ok(());
         }
@@ -911,6 +951,9 @@ impl FileMount {
     /// INCREMENTAL を強制したい側は [`commit_incremental`](Self::commit_incremental) を
     /// 直接呼ぶ（設計の `commit_strategy=FULL` / `force_compact` 相当）。マウントを消費する。
     pub fn commit(self) -> Result<CommitOutcome, FileMountError> {
+        if self.stale.get() {
+            return Err(FileMountError::Stale);
+        }
         if self.diff.borrow().is_empty() && self.entries.borrow().is_empty() {
             return Ok(CommitOutcome::Noop);
         }
@@ -1769,8 +1812,16 @@ mod tests {
         assert_eq!(m.read("b.bin", 16, 4), Err(ReadError::Stale));
         assert!(m.is_stale());
 
-        // ここで commit できてはいけない。外部の内容がそのまま残ること。
-        let _ = m.commit_full();
+        // 書き込み系はすべて ESTALE。
+        assert!(matches!(m.write("a.bin", 0, b"QQ"), Err(WriteError::Stale)));
+        assert!(matches!(m.create("new.bin"), Err(EntryError::Stale)));
+        assert!(matches!(m.remove("a.bin"), Err(EntryError::Stale)));
+        assert!(matches!(m.truncate("a.bin", 1), Err(EntryError::Stale)));
+        assert!(matches!(m.rename("a.bin", "c.bin"), Err(EntryError::Stale)));
+        assert!(matches!(m.flush(), Err(FileMountError::Stale)));
+
+        // commit も拒否し、外部の内容がそのまま残ること。
+        assert!(matches!(m.commit_full(), Err(FileMountError::Stale)));
         assert_eq!(
             fs::read(&zip_path).unwrap(),
             external,
