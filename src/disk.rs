@@ -197,6 +197,7 @@ impl std::error::Error for FileMountError {
             FileMountError::Open(e) => Some(e),
             FileMountError::Commit(e) => Some(e),
             FileMountError::CompactWhileDirty => None,
+            FileMountError::Stale => None,
             FileMountError::RecoveryRequired(_) => None,
         }
     }
