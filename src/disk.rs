@@ -327,23 +327,25 @@ impl FileMount {
         {
             let intent_path = commit_intent_path(&sidecar);
             if let Some(intent) = read_commit_intent(&intent_path)? {
-                let live = live_archive_fingerprint(archive_path)?;
+                let bytes = fs::read(archive_path)?;
+                let live = archive_fingerprint(&bytes);
                 let mut resolved = true;
                 if intent.matches_post(live) {
                     discard_vmdirty_after_commit = true;
                 } else if intent.matches_pre(live) {
                     // 何もしない（vmdirty をそのまま回復に使う）。
-                } else if intent.mode == CommitMode::Incremental {
+                } else if intent.mode == CommitMode::Incremental && prefix_is_pre(&bytes, &intent) {
                     // 追記が途中で切れている。旧バイト `[0, pre_size)` は書き換えて
-                    // いないので、truncate すれば妥当な旧 ZIP に戻る。
+                    // いないことを**先に確かめてから** truncate する。確かめずに切ると、
+                    // intent と無関係なアーカイブ（別 commit の結果や外部の差し替え）を
+                    // 壊してしまう。
                     let f = fs::OpenOptions::new().write(true).open(archive_path)?;
                     f.set_len(intent.pre_size)?;
                     f.sync_all()?;
-                    // 戻した結果が本当に pre なら INTENT を消してよい。違えば
-                    // 説明のつかない状態なので INTENT を残し、CONFLICT に倒す。
-                    resolved = intent.matches_pre(live_archive_fingerprint(archive_path)?);
                 } else {
-                    // FULL でどちらとも一致しない = 外部がアーカイブを差し替えた。
+                    // 説明のつかない状態（FULL の外部改変、または INCREMENTAL でも
+                    // 先頭が pre でない）。何も触らず INTENT も残し、後段の
+                    // fingerprint 関門で CONFLICT に倒す。
                     resolved = false;
                 }
                 if resolved {
@@ -1078,6 +1080,23 @@ impl CommitIntent {
     }
 }
 
+/// アーカイブの先頭 `pre_size` バイトが intent の `pre` そのものか。
+///
+/// INCREMENTAL は旧バイト `[0, pre_size)` を一切書き換えないので、未完の追記なら
+/// この前置きは必ず妥当な旧 ZIP になっている。truncate する**前に**これを確かめる
+/// ことで、intent と無関係なアーカイブを切り詰めて壊す事故を防ぐ。
+fn prefix_is_pre(bytes: &[u8], intent: &CommitIntent) -> bool {
+    let Ok(pre_size) = usize::try_from(intent.pre_size) else {
+        return false;
+    };
+    let Some(prefix) = bytes.get(..pre_size) else {
+        return false;
+    };
+    Archive::parse(prefix)
+        .ok()
+        .is_some_and(|ar| hash_cd_block(ar.cd_block()) == intent.pre_cd_hash)
+}
+
 /// commit INTENT のファイルパス（`.vmm/commit.intent`）。アーカイブを変える前に
 /// 書き、commit 成功で**最後に**削除する。
 fn commit_intent_path(sidecar: &Path) -> PathBuf {
@@ -1108,14 +1127,14 @@ fn read_commit_intent(path: &Path) -> io::Result<Option<CommitIntent>> {
     Ok(CommitIntent::decode(&bytes))
 }
 
-/// 現在の `archive.zip` の fingerprint（サイズ, cd_hash）。ZIP として parse できない
-/// ときは cd_hash が `None` になり、intent のどちらの記録とも一致しなくなる。
-fn live_archive_fingerprint(path: &Path) -> io::Result<(u64, Option<[u8; 16]>)> {
-    let bytes = fs::read(path)?;
-    let hash = Archive::parse(&bytes)
+/// アーカイブのバイト列から fingerprint（サイズ, cd_hash）を採る。ZIP として
+/// parse できないときは cd_hash が `None` になり、intent のどちらの記録とも
+/// 一致しなくなる。
+fn archive_fingerprint(bytes: &[u8]) -> (u64, Option<[u8; 16]>) {
+    let hash = Archive::parse(bytes)
         .ok()
         .map(|ar| hash_cd_block(ar.cd_block()));
-    Ok((bytes.len() as u64, hash))
+    (bytes.len() as u64, hash)
 }
 
 /// `data` を `tmp` に書き、**fsync してから** `dst` へ rename で原子置換し、親
@@ -2313,20 +2332,16 @@ mod tests {
         assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL"); // 旧 + dirty を復元。
     }
 
-    /// **ADR 0017 で閉じた穴**: 追記の「サイズだけ durable・テール内容は未 durable」
-    /// を模す（ファイル長は `new_len` だが末尾はゼロ）。
+    /// INTENT が「未完の追記」を主張していても、実アーカイブの先頭 `pre_size`
+    /// バイトが `pre` と一致しなければ **truncate しない**。
     ///
-    /// 旧判定は `size == new_len && Archive::parse().is_ok()` だった。`find_eocd` は
-    /// **後方走査**なので、ゼロのテールは読み飛ばされて**旧 EOCD** が拾われ、parse が
-    /// 通ってしまう。結果「完了」と誤判定して vmdirty を捨て、書き込みが失われていた。
-    ///
-    /// intent の cd_hash 照合では、この状態は post とも pre とも一致しない
-    /// （長さが pre と違い、cd_hash が post と違う）ので INCREMENTAL の巻き戻しに入り、
-    /// `pre_size` へ truncate して vmdirty から dirty を回復する。
+    /// 一致しない相手を切り詰めると、無関係なアーカイブ（別 commit の結果や、
+    /// 外部が差し替えたもの）を壊してしまう。判定のつかない状態は触らずに残し、
+    /// vmdirty の fingerprint 関門で CONFLICT に倒すのが正しい。
     #[test]
-    fn incremental_rolls_back_when_tail_is_not_durable() {
+    fn incremental_rollback_refuses_when_prefix_is_not_pre() {
         let dir = TempDir::new();
-        let zip_path = dir.path().join("tail.zip");
+        let zip_path = dir.path().join("mism.zip");
         let orig = store_zip(&[("a.bin", b"ORIGINAL")]);
         fs::write(&zip_path, &orig).unwrap();
         let old_len = orig.len() as u64;
@@ -2338,20 +2353,11 @@ mod tests {
             m.flush().expect("flush");
         }
 
-        // 追記のサイズだけが反映され、中身がゼロのまま残った状態。
-        const TAIL: usize = 40;
-        {
-            let mut f = fs::OpenOptions::new().append(true).open(&zip_path).unwrap();
-            f.write_all(&[0u8; TAIL]).unwrap();
-        }
-        // ゼロのテールでも「妥当な ZIP」として parse できてしまうことを確かめる
-        // （旧判定が誤る条件そのもの）。
-        let padded = fs::read(&zip_path).unwrap();
-        assert_eq!(padded.len() as u64, old_len + TAIL as u64);
-        assert!(
-            Archive::parse(&padded).is_ok(),
-            "backward EOCD scan still parses the old archive - this is why size+parse was not enough"
-        );
+        // アーカイブが別物に差し替わった（先頭 old_len バイトも pre ではない）。
+        let other = store_zip(&[("a.bin", b"COMPLETELY DIFFERENT CONTENT")]);
+        assert!(other.len() as u64 > old_len);
+        let other_len = other.len() as u64;
+        replace_archive(&zip_path, other);
 
         let pre_cd_hash = {
             let ar = Archive::parse(&orig).unwrap();
@@ -2363,17 +2369,17 @@ mod tests {
                 mode: CommitMode::Incremental,
                 pre_size: old_len,
                 pre_cd_hash,
-                post_size: old_len + TAIL as u64, // サイズだけは「完了」に見える
-                post_cd_hash: [0xBBu8; 16],       // 本来の追記後 CD とは一致しない
+                post_size: old_len + 100,
+                post_cd_hash: [0xBBu8; 16],
             },
         )
         .unwrap();
 
-        // 再 open: 巻き戻して dirty を回復する（捨てない）。
-        let m2 = open_spill(&zip_path, 0);
-        assert_eq!(fs::metadata(&zip_path).unwrap().len(), old_len);
-        assert!(!commit_intent_path(&sidecar_dir(&zip_path)).exists());
-        assert_eq!(m2.read("a.bin", 0, 8).unwrap(), b"ZZIGINAL");
+        // 切り詰められず、INTENT も残り、CONFLICT として上がる。
+        let res = FileMount::open_with_options(&zip_path, spill_options(0));
+        assert!(matches!(res, Err(FileMountError::RecoveryRequired(_))));
+        assert_eq!(fs::metadata(&zip_path).unwrap().len(), other_len);
+        assert!(commit_intent_path(&sidecar_dir(&zip_path)).exists());
     }
 
     #[test]
