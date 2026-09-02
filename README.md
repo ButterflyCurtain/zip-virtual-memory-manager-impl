@@ -13,8 +13,21 @@ repository:
 
 ## Status
 
-Early work in progress. See the design repository above for the full
-specification.
+Work in progress, but the read path, the write path and crash recovery all
+work end to end against real files. 215 tests pass on Windows and Linux.
+
+| Milestone | State |
+| --- | --- |
+| M1 — read core (mmap, seek index, page cache, DEFLATE resume) | done |
+| M2 — minimal write (Diff Layer Tier 1, FULL commit) | done |
+| M3 — durability (spill to `vmdirty`, CRC-32C journal, crash recovery) | done |
+| M4 — append-only INCREMENTAL commit | in progress (dedup remaining) |
+
+Not implemented yet: the `DEFLATE_VMM` and Zstd providers, Zip64 output, and
+the dead-space freelist. Deliberate deviations from the specification are
+recorded in [`docs/SPEC_DIVERGENCE.md`](docs/SPEC_DIVERGENCE.md); the design
+decisions behind the implementation are in
+[`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ---
 
@@ -33,4 +46,16 @@ ZIP アーカイブを仮想メモリのバッキングストアとして扱う
 
 ## 状況
 
-着手したばかりです。仕様の全体像は上記の設計リポジトリを参照してください。
+作りかけですが、読み取り・書き込み・クラッシュ回復までは実ファイル相手に
+end-to-end で動きます。テストは Windows / Linux の両方で 215 件通っています。
+
+| マイルストーン | 状態 |
+| --- | --- |
+| M1 — 読み取りコア（mmap、シーク索引、ページキャッシュ、DEFLATE 中途再開） | 完了 |
+| M2 — 最小書き込み（Diff Layer Tier 1、FULL commit） | 完了 |
+| M3 — 耐久化（`vmdirty` へのスピル、CRC-32C ジャーナル、クラッシュ回復） | 完了 |
+| M4 — append-only な INCREMENTAL commit | 進行中（dedup が残り） |
+
+未実装は `DEFLATE_VMM` / Zstd プロバイダ、Zip64 出力、Dead Space Freelist です。
+仕様から意図的に外した点は [`docs/SPEC_DIVERGENCE.md`](docs/SPEC_DIVERGENCE.md)、
+実装上の設計判断は [`docs/DECISIONS.md`](docs/DECISIONS.md) に記録しています。
