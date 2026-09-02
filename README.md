@@ -53,6 +53,12 @@ Deliberate deviations from the specification are recorded in
 implementation — including decisions that were later corrected — is in
 [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
+## About this project
+
+Built through agentic development with Claude Code. AI assistance was used for
+implementation, tests, review and documentation.
+Design and implementation decisions @ButterflyCurtain
+
 ---
 
 <a id="japanese"></a>
@@ -105,3 +111,8 @@ INCREMENTAL commit と別機構の FULL compaction を採る判断をして、�
 仕様から意図的に外した点は [`docs/SPEC_DIVERGENCE.md`](docs/SPEC_DIVERGENCE.md)、
 実装上の判断は —— 後から訂正したものも含めて ——
 [`docs/DECISIONS.md`](docs/DECISIONS.md) に記録しています。
+
+## 制作について
+
+Claude Code によるエージェント型の開発。AI 支援を利用（実装・テスト・レビュー・文書整備）。
+設計・実装判断 @ButterflyCurtain
