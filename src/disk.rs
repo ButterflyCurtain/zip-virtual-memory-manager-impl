@@ -687,10 +687,10 @@ impl FileMount {
         let tmp = compact_tmp(&self.vmdirty_path);
         let header = new_vmdirty_header(&self.fingerprint, &self.cd_hash, page_size as u32);
         let mut new = Tier2::create(&tmp, &header, self.sync, page_size)?;
-        fault::point("compact:after_new_header")?;
+        fault_point("compact:after_new_header")?;
         // METADATA を先に（RENAME/CREATE/REMOVE + RESIZE。DATA より前の seq）。
         rejournal_recovered(&mut new, &self.diff.borrow(), &self.entries.borrow())?;
-        fault::point("compact:after_rejournal")?;
+        fault_point("compact:after_rejournal")?;
         {
             let old_ref = self.tier2.borrow();
             let old = old_ref.as_ref().expect("tier2 present");
@@ -711,9 +711,9 @@ impl FileMount {
                 new.write_hit(&entry, page, &full, logical)?;
             }
         }
-        fault::point("compact:after_live_pages")?;
+        fault_point("compact:after_live_pages")?;
         new.commit_marker()?; // 新ファイルを durable に締める。
-        fault::point("compact:after_marker")?;
+        fault_point("compact:after_marker")?;
 
         // 3. 旧を閉じてから原子置換。rename が失敗しても tier2 は必ず Some(new) に
         //    残し（None 化しない）、新世代は temp パスのまま journaling を続けられる
@@ -723,7 +723,7 @@ impl FileMount {
         let renamed = fs::rename(&tmp, &self.vmdirty_path);
         *self.tier2.borrow_mut() = Some(new);
         renamed?;
-        fault::point("compact:after_rename")?;
+        fault_point("compact:after_rename")?;
         fsync_parent_dir(&self.vmdirty_path)?;
         Ok(())
     }
