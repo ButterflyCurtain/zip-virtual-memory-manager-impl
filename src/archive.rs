@@ -103,6 +103,17 @@ pub struct CdEntry {
     pub local_header_offset: u64,
     /// メソッドコードから導いたプロバイダ種別。
     pub provider_type: ProviderType,
+    /// 汎用目的ビットフラグ。bit 3 が立っていると、圧縮データの後ろに
+    /// データディスクリプタが続く（サイズは LFH ではなくそこに在る）。
+    pub flags: u16,
+    /// この CD ファイルヘッダの、アーカイブ先頭からのオフセット。
+    ///
+    /// commit がエントリを**再配置**するとき、レコードを合成し直すのではなく
+    /// そのまま運ぶために要る。合成は「知っているフィールド」しか書けず、
+    /// extra field は開かれた拡張点なので、知らないものを黙って捨ててしまう。
+    pub cd_record_offset: u64,
+    /// この CD ファイルヘッダの長さ（46 + name + extra + comment）。
+    pub cd_record_len: u32,
 }
 
 /// mmap された ZIP アーカイブの read-only ビュー。
@@ -331,6 +342,9 @@ fn parse_cd(
             uncompressed_size,
             local_header_offset,
             provider_type: provider_for_method(method),
+            flags: rd_u16(h, 8)?,
+            cd_record_offset: pos as u64,
+            cd_record_len: (var_end - pos) as u32,
         });
         pos = var_end;
     }

@@ -88,24 +88,46 @@ struct EntryPayload {
 /// エントリ（[`record_in_place`]）では元アーカイブの値をそのまま引き継ぐ。
 struct PlacedEntry {
     local_header_offset: u64,
-    method: u16,
-    crc32: u32,
-    comp_size: u64,
-    uncomp_size: u64,
-    name: Vec<u8>,
+    record: PlacedRecord,
+}
+
+/// CD レコードの出し方。
+///
+/// **commit はエントリを「再配置」するのであって「書き直す」のではない。**
+/// 内容が変わっていないエントリは、置かれる場所以外そのまま出す。
+enum PlacedRecord {
+    /// 正規形で合成する（新規 / 変更 / 改名エントリ）。内容が変わっているか
+    /// 名前が変わっているので、レコードを作り直すしかない。
+    Synth {
+        method: u16,
+        crc32: u32,
+        comp_size: u64,
+        uncomp_size: u64,
+        name: Vec<u8>,
+    },
+    /// ソースの CD レコードをそのまま運ぶ（未変更エントリ）。
+    ///
+    /// **列挙ではなく複写である理由**: ZIP の extra field は開かれた拡張点
+    /// （UT / NTFS のタイムスタンプ、Unicode パス、…）。「保存するフィールドの
+    /// 一覧」を書くと、一覧に無いものを黙って捨てる。レコードごと運べば、
+    /// 実装が知らないものも保存される。時刻・パーミッション・コメント・
+    /// version made by も同じ理由でここに含まれる。
+    Verbatim(Vec<u8>),
 }
 
 impl PlacedEntry {
-    /// `lho` に配置した `payload` を、CD 用レコードにする。圧縮サイズは
+    /// `lho` に配置した `payload` を、合成レコードとして控える。圧縮サイズは
     /// `payload.stored` の実長から採る。
-    fn new(lho: u64, payload: &EntryPayload, name: &[u8]) -> PlacedEntry {
+    fn synth(lho: u64, payload: &EntryPayload, name: &[u8]) -> PlacedEntry {
         PlacedEntry {
             local_header_offset: lho,
-            method: payload.method,
-            crc32: payload.crc32,
-            comp_size: payload.stored.len() as u64,
-            uncomp_size: payload.uncomp_size,
-            name: name.to_vec(),
+            record: PlacedRecord::Synth {
+                method: payload.method,
+                crc32: payload.crc32,
+                comp_size: payload.stored.len() as u64,
+                uncomp_size: payload.uncomp_size,
+                name: name.to_vec(),
+            },
         }
     }
 }
@@ -163,6 +185,14 @@ pub fn build_full(
 
         // 通常のソースエントリ（Kind::Source または非 UTF-8 名）。
         let dirty_name = name_utf8.filter(|n| diff.is_dirty(n));
+
+        // 未変更なら再配置で済ませる。合成し直さないので、時刻・パーミッション・
+        // コメント・extra field が保たれる。
+        if dirty_name.is_none() && verbatim_eligible(entry) {
+            place_verbatim(archive, &ar, &mut body, &mut placed, entry)?;
+            continue;
+        }
+
         let payload = if let Some(name) = dirty_name {
             let logical = diff.logical_size(name).unwrap_or(entry.uncompressed_size);
             // ソース読み出しの上限は source high-water（truncate-shrink で縮む）。
@@ -323,7 +353,7 @@ pub fn build_incremental(
             place_appended(&mut body, &mut placed, base, &payload, &entry.name)?;
         } else {
             // 未変更 → 追記せず、元の local header offset で新 CD に載せる。
-            record_in_place(&mut placed, entry)?;
+            record_in_place(archive, &mut placed, entry)?;
         }
     }
 
@@ -437,20 +467,27 @@ fn place_appended(
 
 /// 未変更エントリを元の local header offset のまま新 CD に載せる（追記しない＝
 /// 既存バイトをそのまま再利用）。
-fn record_in_place(placed: &mut Vec<PlacedEntry>, entry: &CdEntry) -> Result<(), CommitError> {
+fn record_in_place(
+    archive: &[u8],
+    placed: &mut Vec<PlacedEntry>,
+    entry: &CdEntry,
+) -> Result<(), CommitError> {
     if entry.local_header_offset > u32::MAX as u64
         || entry.compressed_size > u32::MAX as u64
         || entry.uncompressed_size > u32::MAX as u64
     {
         return Err(CommitError::TooLarge);
     }
+    // 追記コミットでは未変更エントリは 1 バイトも動かない。CD レコードも
+    // そのまま運ぶ（offset の差し替えは同じ値の書き戻しになる）。
+    let rec_at = entry.cd_record_offset as usize;
+    let rec_end = rec_at
+        .checked_add(entry.cd_record_len as usize)
+        .filter(|&e| e <= archive.len())
+        .ok_or(CommitError::Zip(ZipError::Truncated))?;
     placed.push(PlacedEntry {
         local_header_offset: entry.local_header_offset,
-        method: entry.method_code,
-        crc32: entry.crc32,
-        comp_size: entry.compressed_size,
-        uncomp_size: entry.uncompressed_size,
-        name: entry.name.clone(),
+        record: PlacedRecord::Verbatim(archive[rec_at..rec_end].to_vec()),
     });
     Ok(())
 }
@@ -531,10 +568,13 @@ fn write_placed(
     payload: &EntryPayload,
     name: &[u8],
 ) -> Result<(), CommitError> {
-    let entry = PlacedEntry::new(lho, payload, name);
+    let entry = PlacedEntry::synth(lho, payload, name);
+    let PlacedRecord::Synth { comp_size, uncomp_size, .. } = &entry.record else {
+        unreachable!("synth() always builds PlacedRecord::Synth")
+    };
     if entry.local_header_offset > u32::MAX as u64
-        || entry.comp_size > u32::MAX as u64
-        || entry.uncomp_size > u32::MAX as u64
+        || *comp_size > u32::MAX as u64
+        || *uncomp_size > u32::MAX as u64
     {
         return Err(CommitError::TooLarge);
     }
@@ -544,42 +584,113 @@ fn write_placed(
     Ok(())
 }
 
-/// 正規形のローカルファイルヘッダ（extra field なし）を書く。
+/// 未変更エントリを**再配置**する: LFH と圧縮データをバイト範囲のまま複写し、
+/// CD レコードも複写して、置かれた場所だけ差し替える。合成しないので、時刻・
+/// パーミッション・コメント・extra field・version made by が失われない。
+///
+/// 呼び出す前に [`verbatim_eligible`] で適格性を確かめること。
+fn place_verbatim(
+    archive: &[u8],
+    ar: &Archive<'_>,
+    body: &mut Vec<u8>,
+    placed: &mut Vec<PlacedEntry>,
+    entry: &CdEntry,
+) -> Result<(), CommitError> {
+    let rec_at = entry.cd_record_offset as usize;
+    let rec_end = rec_at
+        .checked_add(entry.cd_record_len as usize)
+        .filter(|&e| e <= archive.len())
+        .ok_or(CommitError::Zip(ZipError::Truncated))?;
+    let rec = &archive[rec_at..rec_end];
+
+    // CD の 32 ビット offset 欄が Zip64 番兵だと、差し替え先を書けない
+    // （実値は extra field 側）。Zip64 出力は未対応なので素直に断る。
+    if u32::from_le_bytes(rec[42..46].try_into().unwrap()) == u32::MAX {
+        return Err(CommitError::TooLarge);
+    }
+
+    let lfh_start = entry.local_header_offset as usize;
+    let data_start = ar.data_offset(entry).map_err(CommitError::Zip)? as usize;
+    let data_end = data_start
+        .checked_add(entry.compressed_size as usize)
+        .filter(|&e| e <= archive.len() && e >= lfh_start)
+        .ok_or(CommitError::Zip(ZipError::Truncated))?;
+
+    let lho = body.len() as u64;
+    if lho > u32::MAX as u64 {
+        return Err(CommitError::TooLarge);
+    }
+    body.extend_from_slice(&archive[lfh_start..data_end]);
+    placed.push(PlacedEntry {
+        local_header_offset: lho,
+        record: PlacedRecord::Verbatim(rec.to_vec()),
+    });
+    Ok(())
+}
+
+/// 未変更エントリをレコードごと運べるか。
+///
+/// 汎用目的フラグ bit 3（データディスクリプタ）が立っていると、圧縮データの
+/// 後ろに 12 / 16 バイトのディスクリプタが続き、範囲の終端が CD のサイズからは
+/// 決まらない。その場合は合成側へ倒す（合成は実サイズを LFH に書き、フラグを
+/// 落とすので、出力としては正しくなる）。
+fn verbatim_eligible(entry: &CdEntry) -> bool {
+    entry.flags & 0x0008 == 0
+}
+
+/// 正規形のローカルファイルヘッダ（extra field なし）を書く。合成レコード専用。
 fn write_lfh(out: &mut Vec<u8>, e: &PlacedEntry) {
+    let PlacedRecord::Synth { method, crc32, comp_size, uncomp_size, name } = &e.record else {
+        unreachable!("verbatim entries copy their local header instead")
+    };
     push_u32(out, LFH_SIG);
     push_u16(out, 20); // version needed
     push_u16(out, 0); // flags
-    push_u16(out, e.method);
+    push_u16(out, *method);
     push_u16(out, 0); // mod time
     push_u16(out, 0); // mod date
-    push_u32(out, e.crc32);
-    push_u32(out, e.comp_size as u32);
-    push_u32(out, e.uncomp_size as u32);
-    push_u16(out, e.name.len() as u16);
+    push_u32(out, *crc32);
+    push_u32(out, *comp_size as u32);
+    push_u32(out, *uncomp_size as u32);
+    push_u16(out, name.len() as u16);
     push_u16(out, 0); // extra len
-    out.extend_from_slice(&e.name);
+    out.extend_from_slice(name);
 }
 
-/// 正規形の Central Directory ファイルヘッダ（extra / comment なし）を書く。
+/// Central Directory ファイルヘッダを書く。
+///
+/// 未変更エントリはソースのレコードをそのまま置き、**置かれた場所だけ**を
+/// 差し替える。変更 / 新規 / 改名エントリは正規形で合成する。
 fn write_cdfh(out: &mut Vec<u8>, e: &PlacedEntry) {
-    push_u32(out, CDFH_SIG);
-    push_u16(out, 20); // version made by
-    push_u16(out, 20); // version needed
-    push_u16(out, 0); // flags
-    push_u16(out, e.method);
-    push_u16(out, 0); // mod time
-    push_u16(out, 0); // mod date
-    push_u32(out, e.crc32);
-    push_u32(out, e.comp_size as u32);
-    push_u32(out, e.uncomp_size as u32);
-    push_u16(out, e.name.len() as u16);
-    push_u16(out, 0); // extra len
-    push_u16(out, 0); // comment len
-    push_u16(out, 0); // disk start
-    push_u16(out, 0); // internal attrs
-    push_u32(out, 0); // external attrs
-    push_u32(out, e.local_header_offset as u32);
-    out.extend_from_slice(&e.name);
+    match &e.record {
+        PlacedRecord::Verbatim(rec) => {
+            let at = out.len();
+            out.extend_from_slice(rec);
+            // 変わったのは配置だけ。offset 欄（+42）以外は 1 バイトも触らない。
+            out[at + 42..at + 46]
+                .copy_from_slice(&(e.local_header_offset as u32).to_le_bytes());
+        }
+        PlacedRecord::Synth { method, crc32, comp_size, uncomp_size, name } => {
+            push_u32(out, CDFH_SIG);
+            push_u16(out, 20); // version made by
+            push_u16(out, 20); // version needed
+            push_u16(out, 0); // flags
+            push_u16(out, *method);
+            push_u16(out, 0); // mod time
+            push_u16(out, 0); // mod date
+            push_u32(out, *crc32);
+            push_u32(out, *comp_size as u32);
+            push_u32(out, *uncomp_size as u32);
+            push_u16(out, name.len() as u16);
+            push_u16(out, 0); // extra len
+            push_u16(out, 0); // comment len
+            push_u16(out, 0); // disk start
+            push_u16(out, 0); // internal attrs
+            push_u32(out, 0); // external attrs
+            push_u32(out, e.local_header_offset as u32);
+            out.extend_from_slice(name);
+        }
+    }
 }
 
 #[inline]
