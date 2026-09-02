@@ -2867,6 +2867,22 @@ mod tests {
             assert!(Archive::parse(&bytes).is_ok(), "{name}: self-parse failed");
             fs::write(out.join(name), &bytes).expect("write fixture");
         }
+
+        // メタデータを持つソースを FULL commit したもの。CI のステップが
+        // date_time / external_attr / comment / extra を印字するので、
+        // **第三者の実装から見て**保存されていることが目で確かめられる
+        // （keep.bin は一度も触っていない）。
+        {
+            let dir = TempDir::new();
+            let zip_path = dir.path().join("src.zip");
+            fs::write(&zip_path, store_zip_with_metadata()).unwrap();
+            let m = open_spill(&zip_path, 0);
+            m.write("other.bin", 0, b"ZZ").unwrap();
+            m.commit_full().expect("full commit");
+            let bytes = fs::read(&zip_path).unwrap();
+            assert!(Archive::parse(&bytes).is_ok(), "metadata.zip: self-parse failed");
+            fs::write(out.join("metadata.zip"), &bytes).expect("write fixture");
+        }
     }
 
     /// アーカイブ内の STORE エントリの生バイトを取り出す（`store_zip` /
