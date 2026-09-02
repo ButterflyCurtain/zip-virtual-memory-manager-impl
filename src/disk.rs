@@ -2660,6 +2660,169 @@ mod tests {
         assert!(!vpath.exists(), "stale empty journal is discarded");
     }
 
+    /// メタデータを持つ STORE の ZIP を組む。`store_zip` の正規形フィクスチャでは
+    /// 「失われるものが最初から無い」ので、保存の検証には使えない。
+    ///
+    /// `keep.bin` に mod time / date、Unix パーミッション（external_attr）、
+    /// entry comment、CD の extra field（UT extended timestamp）を持たせる。
+    /// LFH 側の extra は**空にしてある**: CD と LFH で extra 長が食い違うのは
+    /// 合法で、`data_offset` を CD から推測してはいけない理由そのもの。
+    fn store_zip_with_metadata() -> Vec<u8> {
+        const MOD_TIME: u16 = 0x6C21; // 13:33:02
+        const MOD_DATE: u16 = 0x5921; // 2024-09-01
+        const EXTERNAL_ATTR: u32 = 0o100_644 << 16;
+        const COMMENT: &[u8] = b"kept through commit";
+        // UT extended timestamp: id=0x5455, size=5, flags=MOD, mtime
+        const CD_EXTRA: &[u8] = &[0x55, 0x54, 0x05, 0x00, 0x01, 0x40, 0xF3, 0xD3, 0x66];
+
+        let entries: [(&str, &[u8]); 2] =
+            [("keep.bin", b"never modified by the test"), ("other.bin", b"0123456789abcdef")];
+
+        let mut body = Vec::new();
+        let mut cd = Vec::new();
+        for (i, (name, data)) in entries.iter().enumerate() {
+            let rich = i == 0;
+            let lho = body.len() as u32;
+            let nb = name.as_bytes();
+            let crc = crate::commit::crc32(data);
+
+            push32(&mut body, 0x0403_4b50);
+            push16(&mut body, 20); // version needed
+            push16(&mut body, 0); // flags
+            push16(&mut body, 0); // method = STORE
+            push16(&mut body, if rich { MOD_TIME } else { 0 });
+            push16(&mut body, if rich { MOD_DATE } else { 0 });
+            push32(&mut body, crc);
+            push32(&mut body, data.len() as u32);
+            push32(&mut body, data.len() as u32);
+            push16(&mut body, nb.len() as u16);
+            push16(&mut body, 0); // LFH extra len = 0（CD とわざと食い違わせる）
+            body.extend_from_slice(nb);
+            body.extend_from_slice(data);
+
+            let extra: &[u8] = if rich { CD_EXTRA } else { &[] };
+            let comment: &[u8] = if rich { COMMENT } else { &[] };
+            push32(&mut cd, 0x0201_4b50);
+            push16(&mut cd, 0x031E); // version made by: Unix, 3.0
+            push16(&mut cd, 20);
+            push16(&mut cd, 0); // flags
+            push16(&mut cd, 0); // method
+            push16(&mut cd, if rich { MOD_TIME } else { 0 });
+            push16(&mut cd, if rich { MOD_DATE } else { 0 });
+            push32(&mut cd, crc);
+            push32(&mut cd, data.len() as u32);
+            push32(&mut cd, data.len() as u32);
+            push16(&mut cd, nb.len() as u16);
+            push16(&mut cd, extra.len() as u16);
+            push16(&mut cd, comment.len() as u16);
+            push16(&mut cd, 0); // disk start
+            push16(&mut cd, 0); // internal attrs
+            push32(&mut cd, if rich { EXTERNAL_ATTR } else { 0 });
+            push32(&mut cd, lho);
+            cd.extend_from_slice(nb);
+            cd.extend_from_slice(extra);
+            cd.extend_from_slice(comment);
+        }
+        let cd_offset = body.len() as u32;
+        let cd_size = cd.len() as u32;
+        body.extend_from_slice(&cd);
+        push32(&mut body, 0x0605_4b50);
+        push16(&mut body, 0);
+        push16(&mut body, 0);
+        push16(&mut body, entries.len() as u16);
+        push16(&mut body, entries.len() as u16);
+        push32(&mut body, cd_size);
+        push32(&mut body, cd_offset);
+        push16(&mut body, 0);
+        body
+    }
+
+    /// Central Directory レコードのうち、`CdEntry` が捨てているフィールド。
+    #[derive(Debug, PartialEq, Eq)]
+    struct CdMeta {
+        version_made_by: u16,
+        flags: u16,
+        mod_time: u16,
+        mod_date: u16,
+        internal_attr: u16,
+        external_attr: u32,
+        extra: Vec<u8>,
+        comment: Vec<u8>,
+    }
+
+    /// 出力 ZIP の CD から `name` のメタデータを生で読む。`Archive` はこれらを
+    /// parse せず捨てるので、テストは CD レコードを直接見るしかない。
+    fn cd_meta(zip: &[u8], name: &str) -> CdMeta {
+        let rd16 = |o: usize| u16::from_le_bytes(zip[o..o + 2].try_into().unwrap());
+        let rd32 = |o: usize| u32::from_le_bytes(zip[o..o + 4].try_into().unwrap());
+
+        // EOCD を後方走査で見つける（comment_len が末尾に届くものだけ採る）。
+        let eocd = (0..=zip.len() - 22)
+            .rev()
+            .find(|&o| rd32(o) == 0x0605_4b50 && o + 22 + rd16(o + 20) as usize == zip.len())
+            .expect("EOCD");
+        let cd_offset = rd32(eocd + 16) as usize;
+        let count = rd16(eocd + 10) as usize;
+
+        let mut pos = cd_offset;
+        for _ in 0..count {
+            assert_eq!(rd32(pos), 0x0201_4b50, "CD signature");
+            let name_len = rd16(pos + 28) as usize;
+            let extra_len = rd16(pos + 30) as usize;
+            let comment_len = rd16(pos + 32) as usize;
+            let rec_name = &zip[pos + 46..pos + 46 + name_len];
+            if rec_name == name.as_bytes() {
+                let extra_at = pos + 46 + name_len;
+                return CdMeta {
+                    version_made_by: rd16(pos + 4),
+                    flags: rd16(pos + 8),
+                    mod_time: rd16(pos + 12),
+                    mod_date: rd16(pos + 14),
+                    internal_attr: rd16(pos + 36),
+                    external_attr: rd32(pos + 38),
+                    extra: zip[extra_at..extra_at + extra_len].to_vec(),
+                    comment: zip[extra_at + extra_len..extra_at + extra_len + comment_len].to_vec(),
+                };
+            }
+            pos += 46 + name_len + extra_len + comment_len;
+        }
+        panic!("entry {name} not found in central directory");
+    }
+
+    /// **FULL commit はエントリを「再配置」するのであって「書き直す」のではない。**
+    ///
+    /// 変更していないエントリの CD レコードは、置かれる場所以外そのまま出てこな
+    /// ければならない。実装は正規形のレコードを合成し直しているので、タイムスタンプ・
+    /// Unix パーミッション・エントリコメント・extra field・version made by が
+    /// すべて失われる。一度 `commit_full()` / `compact()` を通すだけで、触っても
+    /// いないエントリのメタデータが消える。
+    ///
+    /// 保存すべきフィールドを列挙するのではなくレコードごと運ぶのが正しい形。
+    /// extra field は開かれた拡張点で、列挙は「知らないもの」を黙って捨てるため。
+    #[test]
+    fn full_commit_preserves_unmodified_entry_metadata() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("meta.zip");
+        fs::write(&zip_path, store_zip_with_metadata()).unwrap();
+
+        let before = cd_meta(&fs::read(&zip_path).unwrap(), "keep.bin");
+        // フィクスチャが実際に「失うものを持っている」ことを先に確かめる。
+        assert_ne!(before.mod_date, 0, "fixture must carry a timestamp");
+        assert_ne!(before.external_attr, 0, "fixture must carry permissions");
+        assert!(!before.extra.is_empty(), "fixture must carry an extra field");
+        assert!(!before.comment.is_empty(), "fixture must carry a comment");
+
+        let m = open_spill(&zip_path, 0);
+        m.write("other.bin", 0, b"ZZ").unwrap(); // keep.bin には触らない
+        m.commit_full().expect("commit");
+
+        let after = cd_meta(&fs::read(&zip_path).unwrap(), "keep.bin");
+        assert_eq!(
+            after, before,
+            "an unmodified entry must come through a FULL commit unchanged apart from its offset"
+        );
+    }
+
     /// **第三者ツールでの検証用フィクスチャ**を `target/zip-compat/` に書き出す。
     ///
     /// このクレートのテストは全て自前の `Archive::parse` を通しており、言えるのは
