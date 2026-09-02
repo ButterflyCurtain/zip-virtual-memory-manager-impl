@@ -463,7 +463,7 @@ impl FileMount {
 
         // spill 有効で、まだ Tier 2 が無ければ空の vmdirty を作る。
         if tier2.is_none() && options.dirty_limit != UNLIMITED {
-            fs::create_dir_all(&sidecar)?;
+            create_sidecar_dir(&sidecar)?;
             let header = new_vmdirty_header(&fingerprint, &cd_hash, page_size as u32);
             tier2 = Some(Tier2::create(&vmdirty_path, &header, options.sync, page_size)?);
         }
@@ -784,7 +784,7 @@ impl FileMount {
             hash_cd_block(ar.cd_block())
         };
         let sidecar = sidecar_dir(&self.archive_path);
-        fs::create_dir_all(&sidecar)?;
+        create_sidecar_dir(&sidecar)?;
         write_commit_intent(
             &sidecar,
             &CommitIntent {
@@ -892,7 +892,7 @@ impl FileMount {
         drop(self);
 
         // 2. INTENT を durable に（追記前 = 判定とロールバックの根拠）。
-        fs::create_dir_all(&sidecar)?;
+        create_sidecar_dir(&sidecar)?;
         write_commit_intent(&sidecar, &intent)?;
 
         fault_point("inc:after_intent")?;
@@ -1313,6 +1313,24 @@ fn durable_replace(tmp: &Path, dst: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// サイドカーディレクトリを作り、**その作成自体を durable にする**。
+///
+/// 設計 SIDECAR FILES / Directory creation and durability:
+/// 「The first open() creates the sidecar directory with mkdir() and makes the
+/// creation durable by fsync()ing the parent directory **before any sidecar file
+/// is written**」。mkdir が durable でないまま中身を書くと、クラッシュ後に
+/// 「ディレクトリごと消えたのに中のファイルは在る」という状態を FS が見せうる。
+///
+/// 既に在るときは何もしない（fsync も省く）。commit のたびに呼ばれる経路が
+/// あるので、無駄な fsync を避ける。Windows では `fsync_parent_dir` が no-op。
+fn create_sidecar_dir(sidecar: &Path) -> io::Result<()> {
+    if sidecar.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(sidecar)?;
+    fsync_parent_dir(sidecar)
+}
+
 /// `path` の親ディレクトリを fsync して、その中で起きた rename / unlink を durable
 /// にする（POSIX のディレクトリ耐久性）。Windows ではディレクトリハンドルへの
 /// flush は一般に行えない / 意味を持たないので no-op（rename の原子性に委ねる）。
@@ -1332,7 +1350,7 @@ fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
 /// vmidx 像を `vmidx.tmp` に書いて `vmidx` へ rename（Section 6.3 a/b）。vmidx は
 /// 失われても再構築できるキャッシュなので、ここは fsync しない（Section 6.3 c）。
 fn write_sidecar_index(sidecar: &Path, vmidx_path: &Path, image: &[u8]) -> io::Result<()> {
-    fs::create_dir_all(sidecar)?;
+    create_sidecar_dir(sidecar)?;
     let tmp = sidecar.join("vmidx.tmp");
     fs::write(&tmp, image)?;
     fs::rename(&tmp, vmidx_path)?;

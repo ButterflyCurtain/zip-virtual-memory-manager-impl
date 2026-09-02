@@ -1128,6 +1128,10 @@ intent の書き込み自体にもクラッシュ点はあるが、その範囲�
    上の 3 分岐にする。
 5. Journal Spec の provenance 節: 「Fingerprint mismatches → CONFLICT」を
    「→ intent を参照し、どちらの fingerprint とも一致しないときだけ CONFLICT」へ。
+5b. commit() FLOW の vmidx 更新ステップ: 「modified entries only + fingerprint
+   refresh」は **FULL path では成立しない**（全オフセットが動く）。FULL は
+   「vmidx を stale のまま残し、次の open で再構築させる」が正しい。INCREMENTAL に
+   限って追記分の拡張 + refresh が成立する、と書き分ける（上記「別件」2）。
 6. BACKGROUND COMMIT の「after RENAME」段落を intent の言葉で書き直す。
    **「冪等だから replay してよい」という主張は落とす**（上記 (C) の理由により、
    エントリ操作がある今は成り立たない）。
@@ -1183,9 +1187,19 @@ maintenance 節の追加（同 `406f558`、ADR 0014）がある。本件は後�
 1. **orphan `archive.new.zip` が `open()` で削除されない。** 仕様は本体・Journal Spec の
    2 箇所で「無ければ silently remove」と要求している。`vmdirty.compact` の掃除は
    実装済みだが `.new` だけ抜けている。1 行修正で済む。
-2. commit 後に vmidx の fingerprint を更新しない（仕様は refresh を要求）。vmidx は
-   cache なので安全側だが、次回 open で索引全体を作り直すコストを払っている。
-3. `.vmm` の `mkdir` 後に親 dir fsync をしていない（仕様は要求）。
+2. ~~commit 後に vmidx の fingerprint を更新しない（仕様は refresh を要求）~~
+   → **仕様側の欠陥であり、実装は正しい**（2026-09-02 に確認）。仕様は commit()
+   FLOW で「Update vmidx **for modified entries only**, and refresh the vmidx
+   header fingerprint」と書くが、**FULL commit は全エントリのローカルヘッダ
+   オフセットを動かす**（未変更エントリも verbatim コピーだが、前のエントリの
+   サイズが変われば配置は変わる）。これを FULL で実行すると、移動したオフセットを
+   指したまま「このアーカイブに一致する」と主張する vmidx ができ、読み取りが
+   ゴミを返す。現在の実装（stale のまま残し、次の open で不一致を検出して再構築）は
+   正しく安全で、遅いだけ。**この項目は「実装が追いつくべき」から「設計リポ側の
+   編集」へ移す**（下記 5b）。INCREMENTAL では未変更エントリのオフセットが不変なので、
+   そちらに限れば仕様の手順は成立する。
+3. ~~`.vmm` の `mkdir` 後に親 dir fsync をしていない（仕様は要求）~~ → 完了。
+   `create_sidecar_dir` に括り出し、新規作成時のみ親 dir を fsync する。
 4. compaction の `rename` 失敗時、実装は temp パスへジャーナリングを続ける
    （仕様は沈黙）。その後のクラッシュで書き込みが失われる。
 
