@@ -632,7 +632,7 @@ fn deflate(data: &[u8]) -> Result<Vec<u8>, CommitError> {
 /// ZIP 標準のエントリ CRC-32（ISO-HDLC、反転多項式 0xEDB88320）。zlib の
 /// `crc32()` と一致する。**ジャーナル / vmidx の CRC-32C（Castagnoli）とは別物**
 /// なので混同しないこと（IMPLEMENTATION_NOTES）。
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let table = crc_table();
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {

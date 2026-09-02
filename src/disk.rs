@@ -1604,6 +1604,13 @@ mod tests {
 
     /// STORE エントリだけの最小 ZIP を組む（ファイル I/O 経路の検証用。DEFLATE の
     /// 解凍は mount のテストで検証済み）。
+    /// STORE のみの最小 ZIP を手で組む。
+    ///
+    /// **CRC-32 は必ず本物を入れること。** かつてここは 0 を書いており、その結果
+    /// このリポジトリのテストは一度も「第三者が読める妥当な ZIP」を作っていなかった
+    /// （自前の parser は CRC を見ないので誰も気づかなかった）。未変更エントリは
+    /// commit で verbatim コピーされるので、0 はそのまま出力へ運ばれ、Python の
+    /// `zipfile.testzip()` に弾かれる。CI の third-party ステップがそれを捕まえる。
     fn store_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut body = Vec::new();
         let mut cd = Vec::new();
@@ -1617,7 +1624,7 @@ mod tests {
             push16(&mut body, 0); // method = STORE
             push16(&mut body, 0);
             push16(&mut body, 0);
-            push32(&mut body, 0);
+            push32(&mut body, crate::commit::crc32(data));
             push32(&mut body, data.len() as u32);
             push32(&mut body, data.len() as u32);
             push16(&mut body, nb.len() as u16);
@@ -1632,7 +1639,7 @@ mod tests {
             push16(&mut cd, 0);
             push16(&mut cd, 0);
             push16(&mut cd, 0);
-            push32(&mut cd, 0);
+            push32(&mut cd, crate::commit::crc32(data));
             push32(&mut cd, data.len() as u32);
             push32(&mut cd, data.len() as u32);
             push16(&mut cd, nb.len() as u16);
