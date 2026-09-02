@@ -775,6 +775,313 @@ fn crc_table() -> &'static [u32; 256] {
 mod tests {
     use super::*;
 
+    use crate::difflayer::DiffLayer;
+    use crate::entrytable::EntryTable;
+
+    // ───────────────────── フィクスチャ ─────────────────────
+    //
+    // `build_full` / `build_incremental` を**直に**叩くための ZIP 組み立て。
+    // これまでこのモジュールの単体テストは `crc32` と `deflate` のヘルパだけで、
+    // 出力の組み立て自体は `disk.rs` 経由の間接カバレッジしか無かった。実際に
+    // 欠陥が出た場所でもあるので、契約をここで直接押さえる。
+
+    /// フィクスチャの 1 エントリ。既定は「メタデータの無い STORE エントリ」。
+    struct Fx {
+        name: Vec<u8>,
+        data: Vec<u8>,
+        mod_time: u16,
+        mod_date: u16,
+        external_attr: u32,
+        extra: Vec<u8>,
+        comment: Vec<u8>,
+        /// 汎用目的フラグ。bit 3 を立てるとデータディスクリプタ付きになる。
+        flags: u16,
+        /// CD の local header offset 欄を Zip64 番兵にし、実値を extra へ入れる。
+        zip64_offset: bool,
+    }
+
+    impl Fx {
+        fn new(name: &[u8], data: &[u8]) -> Fx {
+            Fx {
+                name: name.to_vec(),
+                data: data.to_vec(),
+                mod_time: 0,
+                mod_date: 0,
+                external_attr: 0,
+                extra: Vec::new(),
+                comment: Vec::new(),
+                flags: 0,
+                zip64_offset: false,
+            }
+        }
+        fn rich(mut self) -> Fx {
+            self.mod_time = 0x6C21;
+            self.mod_date = 0x5921;
+            self.external_attr = 0o100_644 << 16;
+            // UT extended timestamp
+            self.extra = vec![0x55, 0x54, 0x05, 0x00, 0x01, 0x40, 0xF3, 0xD3, 0x66];
+            self.comment = b"carried through".to_vec();
+            self
+        }
+    }
+
+    /// STORE のみの ZIP を組む。CRC-32 は必ず本物を入れる（0 を書くと第三者の
+    /// リーダに弾かれる。`disk.rs` の `store_zip` で実際に踏んだ罠）。
+    fn build_zip(entries: &[Fx]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut cd = Vec::new();
+        for e in entries {
+            let lho = body.len() as u32;
+            let crc = crc32(&e.data);
+            let dd = e.flags & 0x0008 != 0;
+
+            push_u32(&mut body, LFH_SIG);
+            push_u16(&mut body, 20);
+            push_u16(&mut body, e.flags);
+            push_u16(&mut body, 0); // STORE
+            push_u16(&mut body, e.mod_time);
+            push_u16(&mut body, e.mod_date);
+            // データディスクリプタ付きなら LFH の crc / サイズは 0。
+            push_u32(&mut body, if dd { 0 } else { crc });
+            push_u32(&mut body, if dd { 0 } else { e.data.len() as u32 });
+            push_u32(&mut body, if dd { 0 } else { e.data.len() as u32 });
+            push_u16(&mut body, e.name.len() as u16);
+            push_u16(&mut body, 0); // LFH extra は空（CD と食い違わせる）
+            body.extend_from_slice(&e.name);
+            body.extend_from_slice(&e.data);
+            if dd {
+                push_u32(&mut body, 0x0807_4b50); // ディスクリプタ署名
+                push_u32(&mut body, crc);
+                push_u32(&mut body, e.data.len() as u32);
+                push_u32(&mut body, e.data.len() as u32);
+            }
+
+            let mut extra = e.extra.clone();
+            if e.zip64_offset {
+                // Zip64 extended information: offset のみ番兵にする。
+                extra.extend_from_slice(&0x0001u16.to_le_bytes());
+                extra.extend_from_slice(&8u16.to_le_bytes());
+                extra.extend_from_slice(&(lho as u64).to_le_bytes());
+            }
+            push_u32(&mut cd, CDFH_SIG);
+            push_u16(&mut cd, 0x031E); // version made by: Unix
+            push_u16(&mut cd, 20);
+            push_u16(&mut cd, e.flags);
+            push_u16(&mut cd, 0);
+            push_u16(&mut cd, e.mod_time);
+            push_u16(&mut cd, e.mod_date);
+            push_u32(&mut cd, crc);
+            push_u32(&mut cd, e.data.len() as u32);
+            push_u32(&mut cd, e.data.len() as u32);
+            push_u16(&mut cd, e.name.len() as u16);
+            push_u16(&mut cd, extra.len() as u16);
+            push_u16(&mut cd, e.comment.len() as u16);
+            push_u16(&mut cd, 0);
+            push_u16(&mut cd, 0);
+            push_u32(&mut cd, e.external_attr);
+            push_u32(&mut cd, if e.zip64_offset { u32::MAX } else { lho });
+            cd.extend_from_slice(&e.name);
+            cd.extend_from_slice(&extra);
+            cd.extend_from_slice(&e.comment);
+        }
+        let cd_offset = body.len() as u32;
+        let cd_size = cd.len() as u32;
+        body.extend_from_slice(&cd);
+        push_u32(&mut body, EOCD_SIG);
+        push_u16(&mut body, 0);
+        push_u16(&mut body, 0);
+        push_u16(&mut body, entries.len() as u16);
+        push_u16(&mut body, entries.len() as u16);
+        push_u32(&mut body, cd_size);
+        push_u32(&mut body, cd_offset);
+        push_u16(&mut body, 0);
+        body
+    }
+
+    /// CD レコードを、名前をキーに「オフセット欄を除いたバイト列」で取り出す。
+    /// 再配置の検証は「置かれた場所以外は 1 バイトも変わらない」なので、
+    /// 比較からオフセットだけ抜く。
+    fn cd_record_without_offset(zip: &[u8], name: &[u8]) -> Vec<u8> {
+        let ar = Archive::parse(zip).expect("valid zip");
+        let e = ar.entries().iter().find(|e| e.name == name).expect("entry");
+        let at = e.cd_record_offset as usize;
+        let mut rec = zip[at..at + e.cd_record_len as usize].to_vec();
+        rec[42..46].fill(0);
+        rec
+    }
+
+    /// エントリの LFH からデータ末尾までのバイト列。
+    fn lfh_and_data(zip: &[u8], name: &[u8]) -> Vec<u8> {
+        let ar = Archive::parse(zip).expect("valid zip");
+        let e = ar.entries().iter().find(|e| e.name == name).expect("entry");
+        let start = e.local_header_offset as usize;
+        let end = ar.data_offset(e).unwrap() as usize + e.compressed_size as usize;
+        zip[start..end].to_vec()
+    }
+
+    fn clean() -> (DiffLayer, EntryTable) {
+        (DiffLayer::new(8), EntryTable::new())
+    }
+
+    // ───────────────────── 再配置の契約 ─────────────────────
+
+    /// **commit はエントリを再配置するのであって書き直すのではない。**
+    /// dirty が無ければ、全エントリの CD レコードと LFH+データは、置かれる場所を
+    /// 除いてバイト単位で一致しなければならない。
+    #[test]
+    fn full_commit_relocates_records_byte_for_byte() {
+        let src = build_zip(&[
+            Fx::new(b"a.bin", b"first entry").rich(),
+            Fx::new(b"b.bin", b"second entry"),
+            Fx::new(b"c.bin", b"third entry").rich(),
+        ]);
+        let (diff, table) = clean();
+        let out = build_full(&src, &[], &diff, &table).expect("build_full");
+
+        for name in [&b"a.bin"[..], b"b.bin", b"c.bin"] {
+            assert_eq!(
+                cd_record_without_offset(&out, name),
+                cd_record_without_offset(&src, name),
+                "{}: central directory record was rewritten",
+                String::from_utf8_lossy(name)
+            );
+            assert_eq!(
+                lfh_and_data(&out, name),
+                lfh_and_data(&src, name),
+                "{}: local header or data was rewritten",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// エントリ順序はソースの順を保つ。順序が保たれることが、clean な
+    /// アーカイブに対する `compact()` の再現性の前提になる。
+    #[test]
+    fn full_commit_keeps_source_entry_order() {
+        let src = build_zip(&[
+            Fx::new(b"z.bin", b"z"),
+            Fx::new(b"a.bin", b"a"),
+            Fx::new(b"m.bin", b"m"),
+        ]);
+        let (diff, table) = clean();
+        let out = build_full(&src, &[], &diff, &table).expect("build_full");
+
+        let ar = Archive::parse(&out).unwrap();
+        let names: Vec<&[u8]> = ar.entries().iter().map(|e| e.name.as_slice()).collect();
+        assert_eq!(names, vec![&b"z.bin"[..], b"a.bin", b"m.bin"]);
+    }
+
+    /// clean なアーカイブへの FULL commit は冪等 —— 2 回通しても同じバイト列。
+    /// 再配置が「置き場所以外触らない」なら、これは自動的に成り立つ。
+    #[test]
+    fn full_commit_of_a_clean_archive_is_idempotent() {
+        let src = build_zip(&[Fx::new(b"a.bin", b"one").rich(), Fx::new(b"b.bin", b"two")]);
+        let (diff, table) = clean();
+        let once = build_full(&src, &[], &diff, &table).expect("first");
+        let twice = build_full(&once, &[], &diff, &table).expect("second");
+        assert_eq!(once, twice, "compaction of a clean archive must be stable");
+    }
+
+    /// 非 UTF-8 のエントリ名（CP437 など）はオーバーレイの対象外だが、
+    /// 再配置は通らなければならない。名前も中身も変わらないこと。
+    #[test]
+    fn full_commit_carries_non_utf8_entry_names() {
+        let name: &[u8] = &[0x83, 0x86, 0x81, 0x5B, 0x83, 0x55, 0x2E, 0x62, 0x69, 0x6E];
+        assert!(std::str::from_utf8(name).is_err(), "fixture name must not be UTF-8");
+        let src = build_zip(&[Fx::new(name, b"shift-jis named entry").rich()]);
+        let (diff, table) = clean();
+        let out = build_full(&src, &[], &diff, &table).expect("build_full");
+
+        assert_eq!(cd_record_without_offset(&out, name), cd_record_without_offset(&src, name));
+        assert_eq!(lfh_and_data(&out, name), lfh_and_data(&src, name));
+    }
+
+    // ───────────────────── 再配置できない場合 ─────────────────────
+
+    /// データディスクリプタ付き（汎用フラグ bit 3）は範囲コピーの終端が CD から
+    /// 決まらないので合成へ倒れる。**出力は妥当でなければならない**: サイズと
+    /// CRC が実体と合い、bit 3 は落ちていること。
+    #[test]
+    fn data_descriptor_entry_falls_back_to_synthesis() {
+        let mut fx = Fx::new(b"dd.bin", b"written with a data descriptor");
+        fx.flags = 0x0008;
+        let src = build_zip(&[fx]);
+        let (diff, table) = clean();
+        let out = build_full(&src, &[], &diff, &table).expect("build_full");
+
+        let ar = Archive::parse(&out).unwrap();
+        let e = ar.entries().iter().find(|e| e.name == b"dd.bin").expect("entry");
+        assert_eq!(e.flags & 0x0008, 0, "data descriptor flag must be cleared");
+        assert_eq!(e.uncompressed_size, b"written with a data descriptor".len() as u64);
+        assert_eq!(e.crc32, crc32(b"written with a data descriptor"));
+        assert_eq!(
+            ar.entry_data(e).unwrap(),
+            b"written with a data descriptor",
+            "the descriptor bytes must not leak into the entry data"
+        );
+    }
+
+    /// CD の 32 ビット offset 欄が Zip64 番兵のエントリは、差し替え先を書けない
+    /// （実値は extra field 側）。Zip64 出力は未対応なので素直に断る。
+    #[test]
+    fn zip64_offset_sentinel_is_rejected_rather_than_corrupted() {
+        let mut fx = Fx::new(b"big.bin", b"pretends to live past 4 GiB");
+        fx.zip64_offset = true;
+        let src = build_zip(&[fx]);
+        // フィクスチャ自体は読める（番兵は extra から解決される）。
+        assert!(Archive::parse(&src).is_ok());
+
+        let (diff, table) = clean();
+        match build_full(&src, &[], &diff, &table) {
+            Err(CommitError::TooLarge) => {}
+            other => panic!("expected TooLarge, got {:?}", other.map(|v| v.len())),
+        }
+    }
+
+    // ───────────────────── INCREMENTAL ─────────────────────
+
+    /// 追記コミットでは未変更エントリは 1 バイトも動かない。dirty が無ければ
+    /// 追記されるのは新しい CD と EOCD だけで、レコードはそのまま運ばれる。
+    #[test]
+    fn incremental_appends_only_a_directory_when_nothing_is_dirty() {
+        let src = build_zip(&[Fx::new(b"a.bin", b"one").rich(), Fx::new(b"b.bin", b"two")]);
+        let (diff, table) = clean();
+        let appended = build_incremental(&src, &[], &diff, &table).expect("build_incremental");
+
+        let mut out = src.clone();
+        out.extend_from_slice(&appended);
+        for name in [&b"a.bin"[..], b"b.bin"] {
+            assert_eq!(
+                cd_record_without_offset(&out, name),
+                cd_record_without_offset(&src, name),
+                "{}: record was rewritten by an append-only commit",
+                String::from_utf8_lossy(name)
+            );
+            let ar_out = Archive::parse(&out).unwrap();
+            let ar_src = Archive::parse(&src).unwrap();
+            let eo = ar_out.entries().iter().find(|e| e.name == name).unwrap();
+            let es = ar_src.entries().iter().find(|e| e.name == name).unwrap();
+            assert_eq!(eo.local_header_offset, es.local_header_offset, "entry moved");
+        }
+    }
+
+    /// `appended_cd_block` は追記領域から新しい Central Directory を切り出す。
+    /// commit intent の post 指紋を「書く前に」算出するのに使う（ADR 0017）。
+    #[test]
+    fn appended_cd_block_locates_the_new_directory() {
+        let src = build_zip(&[Fx::new(b"a.bin", b"one"), Fx::new(b"b.bin", b"two")]);
+        let (diff, table) = clean();
+        let appended = build_incremental(&src, &[], &diff, &table).expect("build_incremental");
+
+        let cd = appended_cd_block(&appended, src.len() as u64).expect("cd block");
+
+        // 切り出した範囲が、実際に出来上がるアーカイブの CD と一致すること。
+        let mut out = src.clone();
+        out.extend_from_slice(&appended);
+        let ar = Archive::parse(&out).unwrap();
+        assert_eq!(cd, ar.cd_block());
+    }
+
     #[test]
     fn crc32_matches_known_vector() {
         // "123456789" の CRC-32 (ISO-HDLC) は 0xCBF43926（標準チェック値）。
