@@ -986,8 +986,10 @@ mod tests {
     /// 再配置は通らなければならない。名前も中身も変わらないこと。
     #[test]
     fn full_commit_carries_non_utf8_entry_names() {
+        // Shift-JIS の「ユーザ.bin」。UTF-8 として不正であることはコンパイラが
+        // 静的に判定できる（`invalid_from_utf8` lint が実行時 assert を拒む）ので、
+        // ここでは確かめ直さない。
         let name: &[u8] = &[0x83, 0x86, 0x81, 0x5B, 0x83, 0x55, 0x2E, 0x62, 0x69, 0x6E];
-        assert!(std::str::from_utf8(name).is_err(), "fixture name must not be UTF-8");
         let src = build_zip(&[Fx::new(name, b"shift-jis named entry").rich()]);
         let (diff, table) = clean();
         let out = build_full(&src, &[], &diff, &table).expect("build_full");
