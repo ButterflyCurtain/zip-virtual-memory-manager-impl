@@ -687,8 +687,10 @@ impl FileMount {
         let tmp = compact_tmp(&self.vmdirty_path);
         let header = new_vmdirty_header(&self.fingerprint, &self.cd_hash, page_size as u32);
         let mut new = Tier2::create(&tmp, &header, self.sync, page_size)?;
+        fault::point("compact:after_new_header")?;
         // METADATA を先に（RENAME/CREATE/REMOVE + RESIZE。DATA より前の seq）。
         rejournal_recovered(&mut new, &self.diff.borrow(), &self.entries.borrow())?;
+        fault::point("compact:after_rejournal")?;
         {
             let old_ref = self.tier2.borrow();
             let old = old_ref.as_ref().expect("tier2 present");
@@ -709,7 +711,9 @@ impl FileMount {
                 new.write_hit(&entry, page, &full, logical)?;
             }
         }
+        fault::point("compact:after_live_pages")?;
         new.commit_marker()?; // 新ファイルを durable に締める。
+        fault::point("compact:after_marker")?;
 
         // 3. 旧を閉じてから原子置換。rename が失敗しても tier2 は必ず Some(new) に
         //    残し（None 化しない）、新世代は temp パスのまま journaling を続けられる
@@ -719,6 +723,7 @@ impl FileMount {
         let renamed = fs::rename(&tmp, &self.vmdirty_path);
         *self.tier2.borrow_mut() = Some(new);
         renamed?;
+        fault::point("compact:after_rename")?;
         fsync_parent_dir(&self.vmdirty_path)?;
         Ok(())
     }
@@ -2994,6 +2999,97 @@ mod tests {
                 "crash at {label}: unexpected content {content:?}"
             );
         }
+    }
+
+    /// ジャーナル compaction が通る耐久性バリア（実行順）。
+    const COMPACT_BARRIERS: &[&str] = &[
+        "compact:after_new_header",
+        "compact:after_rejournal",
+        "compact:after_live_pages",
+        "compact:after_marker",
+        "compact:after_rename",
+        "never:no-crash",
+    ];
+
+    /// **クラッシュ注入: ジャーナル compaction**（設計 Journal Spec Section 10）。
+    ///
+    /// compaction は「旧ジャーナルを触らずに新世代を temp へ組み、原子的に
+    /// 置き換える」手順なので、どの点で死んでも **dirty セッションは失われない**
+    /// はずである。rename の前なら旧ジャーナルが、後なら新ジャーナルが recovery
+    /// basis になる。COMMIT MARKER は rename より前に書かれるので、置き換わった
+    /// 場合も必ずマーカ付きで、標準の回復プロトコルがそのまま通る
+    /// （"No special recovery case is required"）。
+    ///
+    /// あわせて、中断が残した `vmdirty.compact` が次の open で黙って掃除される
+    /// ことも見る。
+    #[test]
+    fn journal_compaction_survives_crash_at_every_barrier() {
+        for &label in COMPACT_BARRIERS {
+            let dir = TempDir::new();
+            let zip_path = dir.path().join("cj.zip");
+            fs::write(&zip_path, store_zip(&[("a.bin", b"ORIGINAL")])).unwrap();
+
+            {
+                let m = open_spill(&zip_path, 0); // 上限 0 = 書けば即 spill
+                m.write("a.bin", 0, b"ZZ").unwrap();
+                // 同じページを何度も書いて dead レコードを積む（compaction の前提）。
+                m.write("a.bin", 2, b"YY").unwrap();
+                m.write("a.bin", 4, b"XX").unwrap();
+                m.flush().expect("flush");
+
+                fault::arm_at(label, 0);
+                let _ = m.compact_journal();
+                fault::disarm();
+            }
+
+            // 再 open: どの点で死んでも dirty は回復できる。
+            let m2 = FileMount::open_with_options(&zip_path, spill_options(0));
+            let m2 = match m2 {
+                Ok(m) => m,
+                Err(e) => panic!("crash at {label}: reopen failed: {e:?}"),
+            };
+            assert_eq!(
+                m2.read("a.bin", 0, 8).unwrap(),
+                b"ZZYYXXAL",
+                "crash at {label}: dirty state was lost or corrupted"
+            );
+
+            // 中断が残した temp は open が掃除する。
+            let sidecar = sidecar_dir(&zip_path);
+            assert!(
+                !compact_tmp(&sidecar.join("vmdirty")).exists(),
+                "crash at {label}: orphan vmdirty.compact survived open()"
+            );
+        }
+    }
+
+    /// compaction が実際にジャーナルを縮めること（クラッシュ無しの経路）。
+    /// 上のテストは「壊れない」を見るだけなので、目的を果たしていることは別に見る。
+    #[test]
+    fn journal_compaction_shrinks_the_journal() {
+        let dir = TempDir::new();
+        let zip_path = dir.path().join("shrink.zip");
+        fs::write(&zip_path, store_zip(&[("a.bin", b"ORIGINAL")])).unwrap();
+
+        let m = open_spill(&zip_path, 0);
+        // 同じ 1 ページを繰り返し書く → 旧レコードが dead として積み上がる。
+        for i in 0..24u8 {
+            m.write("a.bin", 0, &[b'A' + (i % 26)]).unwrap();
+        }
+        m.flush().expect("flush");
+
+        let vpath = vmdirty_path(dir.path(), "shrink.zip");
+        let before = fs::metadata(&vpath).unwrap().len();
+        assert!(m.should_compact_journal(), "dead > live should trigger");
+
+        m.compact_journal().expect("compact");
+        let after = fs::metadata(&vpath).unwrap().len();
+        assert!(
+            after < before,
+            "compaction must shrink the journal: {before} -> {after}"
+        );
+        // 中身は保たれる。
+        assert_eq!(m.read("a.bin", 0, 8).unwrap(), b"XRIGINAL");
     }
 
     /// **クラッシュ窓 b6（ADR 0017）**: FULL commit の `rename` が durable になった
