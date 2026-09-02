@@ -2653,6 +2653,52 @@ mod tests {
         assert!(!vpath.exists(), "stale empty journal is discarded");
     }
 
+    /// **第三者ツールでの検証用フィクスチャ**を `target/zip-compat/` に書き出す。
+    ///
+    /// このクレートのテストは全て自前の `Archive::parse` を通しており、言えるのは
+    /// 「自分が書いたものを自分で読める」ことだけ。設計が約束しているのは
+    /// 「普通の展開ソフトで開ける」ことなので、CI が Python の `zipfile` で
+    /// これらを開き、全メンバを読み出せることを確かめる（ワークフローの
+    /// "third-party ZIP compatibility" ステップ）。
+    ///
+    /// commit の実経路（FULL / INCREMENTAL）が出したバイト列をそのまま置く。
+    /// エントリは 4 種類そろえる: 未変更 / 変更 / 新規（DEFLATE で出る）/ 改名。
+    #[test]
+    fn emit_third_party_compat_fixtures() {
+        let out = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target/zip-compat"));
+        fs::create_dir_all(out).expect("create fixture dir");
+
+        for (name, full) in [("full.zip", true), ("incremental.zip", false)] {
+            let dir = TempDir::new();
+            let zip_path = dir.path().join("src.zip");
+            fs::write(
+                &zip_path,
+                store_zip(&[
+                    ("untouched.bin", b"this entry is never modified"),
+                    ("modified.bin", b"0123456789abcdef"),
+                    ("renamed-from.bin", b"renamed but not modified"),
+                ]),
+            )
+            .unwrap();
+
+            let m = open_spill(&zip_path, 0);
+            m.write("modified.bin", 0, b"ZZ").unwrap();
+            m.create("created.bin").unwrap();
+            m.write("created.bin", 0, b"a brand new entry").unwrap();
+            m.rename("renamed-from.bin", "renamed-to.bin").unwrap();
+            if full {
+                m.commit_full().expect("full commit");
+            } else {
+                m.commit_incremental().expect("incremental commit");
+            }
+
+            let bytes = fs::read(&zip_path).unwrap();
+            // 自前 parser でも一応通ること（第三者チェックは CI 側）。
+            assert!(Archive::parse(&bytes).is_ok(), "{name}: self-parse failed");
+            fs::write(out.join(name), &bytes).expect("write fixture");
+        }
+    }
+
     /// アーカイブ内の STORE エントリの生バイトを取り出す（`store_zip` /
     /// `build_full` はどちらも STORE で出すので圧縮バイト = 論理内容）。
     fn store_entry_bytes(zip: &[u8], name: &str) -> Vec<u8> {

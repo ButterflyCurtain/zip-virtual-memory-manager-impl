@@ -56,6 +56,41 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
+      # このクレートのテストは全て自前の parser を通るので、「自分が書いたものを
+      # 自分で読める」ことしか言えない。設計が約束しているのは「普通の展開ソフトで
+      # 開ける」こと。cargo test が target/zip-compat/ へ吐いた実 commit 出力を、
+      # 第三者の実装（Python の zipfile）で開いて全メンバを読み出す。
+      - name: third-party ZIP compatibility
+        shell: python
+        run: |
+          import pathlib, sys, zipfile
+
+          out = pathlib.Path("target/zip-compat")
+          zips = sorted(out.glob("*.zip"))
+          if not zips:
+              sys.exit("no fixtures in target/zip-compat - did the test run?")
+
+          failed = False
+          for z in zips:
+              with zipfile.ZipFile(z) as zf:
+                  bad = zf.testzip()
+                  if bad is not None:
+                      print(f"{z.name}: first bad member reported by testzip(): {bad}")
+                      failed = True
+                      continue
+                  for info in zf.infolist():
+                      data = zf.read(info.filename)
+                      if len(data) != info.file_size:
+                          print(f"{z.name}: {info.filename} short read")
+                          failed = True
+                  print(f"{z.name}: OK - {len(zf.infolist())} entries, "
+                        f"names={[i.filename for i in zf.infolist()]}")
+                  for info in zf.infolist():
+                      print(f"    {info.filename}: date_time={info.date_time} "
+                            f"external_attr={info.external_attr:#o} "
+                            f"comment={info.comment!r} extra={len(info.extra)}B")
+          sys.exit(1 if failed else 0)
+
   # clippy はブロッキング（ADR 0015 A-5 で既存指摘 28 件を解消済み）。
   # rustc の「警告なし」基準（HANDOFF）と揃えて、以降の劣化をここで止める。
   clippy:
